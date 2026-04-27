@@ -1,0 +1,25 @@
+# News ingestion
+newsapi-python==0.2.7
+feedparser==6.0.11
+
+# Sentiment analysis
+anthropic==0.40.0
+
+# Market data & price confirmation
+yfinance==0.2.51
+pandas==2.2.3
+pandas-ta==0.3.14b
+
+# Order execution
+trading212-connector==1.0
+
+# Scheduling
+APScheduler==3.10.4
+
+# Storage
+# sqlite3 is built into Python — no install needed
+
+# Utilities
+python-dotenv==1.0.1
+requests==2.32.3
+pytz==2024.2
