@@ -55,7 +55,7 @@ def news_cycle() -> None:
     """
     logger.info("── News cycle starting ──────────────────────────────────")
 
-    news_items = fetch_all_news(cfg.watchlist, lookback_hours=1)
+    news_items = fetch_all_news(lookback_hours=1)
     if not news_items:
         logger.info("No new articles found.")
         return
@@ -120,7 +120,7 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("  MOMENTUM TRADER STARTING")
     logger.info("  Mode: %s", cfg.trading_mode.upper())
-    logger.info("  Watchlist: %s", ", ".join(cfg.watchlist))
+    logger.info("  Blocklist: %s", ", ".join(cfg.blocklist) if cfg.blocklist else "none")
     logger.info("=" * 60)
 
     # Validate config and initialise DB

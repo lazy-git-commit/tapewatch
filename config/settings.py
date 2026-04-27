@@ -46,9 +46,9 @@ class Settings:
     news_poll_interval_minutes: int = field(
         default_factory=lambda: int(os.getenv("NEWS_POLL_INTERVAL_MINUTES", "5"))
     )
-    watchlist: list[str] = field(
+    blocklist: list[str] = field(
         default_factory=lambda: [
-            t.strip() for t in os.getenv("WATCHLIST", "").split(",") if t.strip()
+            t.strip() for t in os.getenv("BLOCKLIST", "").split(",") if t.strip()
         ]
     )
 

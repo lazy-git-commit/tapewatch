@@ -54,11 +54,11 @@ from config.settings import cfg
 ```
 `cfg.validate()` raises `EnvironmentError` on startup if any API key is missing.
 
-### Watchlist format
+### Ticker detection and blocklist
 
-Tickers must be Trading 212 instrument codes (e.g. `AAPL_US_EQ`). Update both:
-1. `WATCHLIST` in `.env` — controls which tickers are monitored
-2. `TICKER_COMPANY_MAP` in `news/fetcher.py` — maps tickers to company names for RSS keyword matching
+There is no watchlist — the system fetches broad market news and detects tickers by matching company name keywords against `COMPANY_TICKER_MAP` in `news/fetcher.py`. To expand coverage, add rows to that dict.
+
+`BLOCKLIST` in `.env` is a comma-separated list of Trading 212 instrument codes (e.g. `TSLA_US_EQ`) to permanently exclude. Leave it empty to allow all detected tickers.
 
 ### Demo vs live mode
 
