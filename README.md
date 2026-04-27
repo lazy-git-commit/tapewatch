@@ -53,20 +53,24 @@ Key settings to review in `.env`:
 | Variable | Default | Notes |
 |---|---|---|
 | `TRADING_MODE` | `demo` | **Keep as `demo` until you're confident** |
-| `WATCHLIST` | `AAPL_US_EQ,...` | Trading 212 equity instrument codes |
+| `BLOCKLIST` | `` | Comma-separated Trading 212 codes to never trade |
 | `MIN_SENTIMENT_CONFIDENCE` | `7` | Raise to 8–9 to be more selective |
 | `TAKE_PROFIT_PCT` | `5.0` | Sell when up this % |
 | `STOP_LOSS_PCT` | `2.0` | Sell when down this % |
 | `TIME_STOP_MINUTES` | `60` | Sell after this many minutes regardless |
 | `MAX_POSITION_SIZE_PCT` | `5.0` | Max % of portfolio per trade |
 
-### 4. Add your watchlist tickers
+### 4. Configure your blocklist (optional)
 
-Edit `WATCHLIST` in `.env` with Trading 212 equity instrument codes.
-You can find these in the Trading 212 app — they follow the pattern `TICKER_US_EQ` for US stocks.
+The system scans broad market news and automatically detects tickers via company name matching —
+no watchlist needed. If there are companies you never want to trade, add their Trading 212
+instrument codes to `BLOCKLIST` in `.env`:
 
-Also update `TICKER_COMPANY_MAP` in `news/fetcher.py` to map your tickers to company names
-(used for RSS feed keyword matching).
+```
+BLOCKLIST=TSLA_US_EQ,META_US_EQ
+```
+
+To add a company to the detection pool, add a row to `COMPANY_TICKER_MAP` in `news/fetcher.py`.
 
 ### 5. Run the tests
 
@@ -145,6 +149,9 @@ momentum_trader/
 
 **Add more news sources**: Edit `news/fetcher.py` — add new RSS feed URLs to `RSS_FEEDS`
 or implement a new fetch function and call it from `fetch_all_news()`.
+
+**Add more companies**: Add rows to `COMPANY_TICKER_MAP` in `news/fetcher.py` to expand
+the set of companies the system can detect in headlines.
 
 **Tune your strategy**: All parameters are in `.env`. Start conservative and adjust based
 on your trade log after 20–30 trades.
