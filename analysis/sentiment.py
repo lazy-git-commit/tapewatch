@@ -72,7 +72,7 @@ Classify the likely short-term price impact on {item.ticker}."""
 
     try:
         response = _get_client().messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=256,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],

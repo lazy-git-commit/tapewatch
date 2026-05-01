@@ -41,7 +41,7 @@ The system runs two APScheduler background jobs from `main.py`:
 ### Key data contracts
 
 - `news/fetcher.py` produces `NewsItem` dataclasses (ticker, headline, body, source, published_at).
-- `analysis/sentiment.py` consumes `NewsItem` and produces `SentimentResult` (ticker, sentiment, confidence, is_actionable). Calls Claude API (`claude-sonnet-4-20250514`) and expects a raw JSON response — markdown fence stripping is handled.
+- `analysis/sentiment.py` consumes `NewsItem` and produces `SentimentResult` (ticker, sentiment, confidence, is_actionable). Calls Claude API (`claude-sonnet-4-5`) and expects a raw JSON response — markdown fence stripping is handled.
 - `market/price_check.py` uses yfinance to confirm price moved ≥ `MIN_PRICE_MOVE_PCT` with a volume spike before a buy is placed.
 - `trading/executor.py` wraps `trading212-connector`. In demo mode (`cfg.is_live == False`) it logs simulated orders without hitting the API. Sell orders use a negative quantity to the Trading 212 API.
 - `storage/database.py` manages a SQLite DB (path from `DB_PATH`) with three tables: `news_signals`, `trades`, `portfolio_snapshots`. All DB access goes through the `get_conn()` context manager.
