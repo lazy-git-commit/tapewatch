@@ -140,7 +140,7 @@ def fetch_newsapi(lookback_hours: int = 1) -> list[NewsItem]:
                     published_at=published_at,
                 )
             )
-        logger.debug("NewsAPI: %d relevant articles after blocklist filter", len(items))
+        logger.info("NewsAPI: %d total articles, %d matched known tickers", len(response.get("articles", [])), len(items))
         return items
     except Exception as exc:
         logger.warning("NewsAPI fetch failed: %s", exc)
@@ -180,7 +180,7 @@ def fetch_rss(lookback_hours: int = 1) -> list[NewsItem]:
         except Exception as exc:
             logger.warning("RSS fetch failed (%s): %s", feed_url, exc)
 
-    logger.debug("RSS: %d relevant articles after blocklist filter", len(items))
+    logger.info("RSS: %d articles matched known tickers", len(items))
     return items
 
 
