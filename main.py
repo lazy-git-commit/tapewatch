@@ -34,13 +34,10 @@ from reporting.report import generate_report
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("trader.log"),
-    ],
+    format="%(levelname)-8s  %(name)s — %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
