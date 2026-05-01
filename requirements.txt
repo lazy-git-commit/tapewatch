@@ -8,7 +8,7 @@ anthropic==0.40.0
 # Market data & price confirmation
 yfinance==0.2.51
 pandas==2.2.3
-pandas-ta==0.3.14b
+pandas-ta==0.4.71b0
 
 # Order execution
 trading212-connector==1.0
