@@ -12,11 +12,14 @@ Returns a list of NewsItem dataclasses.
 """
 
 import logging
+import socket
 import feedparser
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from newsapi import NewsApiClient
 from config.settings import cfg
+
+_TIMEOUT = 10  # seconds for all outbound network calls
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +118,7 @@ def fetch_newsapi(lookback_hours: int = 1) -> list[NewsItem]:
             category="business",
             language="en",
             page_size=100,
+            timeout=_TIMEOUT,
         )
         items = []
         for article in response.get("articles", []):
@@ -152,6 +156,8 @@ def fetch_rss(lookback_hours: int = 1) -> list[NewsItem]:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     items = []
 
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(_TIMEOUT)
     for feed_url in RSS_FEEDS:
         try:
             feed = feedparser.parse(feed_url)
@@ -180,6 +186,7 @@ def fetch_rss(lookback_hours: int = 1) -> list[NewsItem]:
         except Exception as exc:
             logger.warning("RSS fetch failed (%s): %s", feed_url, exc)
 
+    socket.setdefaulttimeout(old_timeout)
     logger.info("RSS: %d articles matched known tickers", len(items))
     return items
 
