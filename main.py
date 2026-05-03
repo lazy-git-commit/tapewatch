@@ -19,6 +19,7 @@ import logging
 import signal
 import sys
 import time
+import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -128,7 +129,7 @@ def main() -> None:
     print(generate_report())
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
-    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler = BackgroundScheduler(timezone=pytz.utc)
 
     scheduler.add_job(
         news_cycle,
