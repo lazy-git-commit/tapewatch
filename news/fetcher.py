@@ -114,12 +114,14 @@ def fetch_newsapi(lookback_hours: int = 1) -> list[NewsItem]:
     )
 
     try:
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(_TIMEOUT)
         response = client.get_top_headlines(
             category="business",
             language="en",
             page_size=100,
-            timeout=_TIMEOUT,
         )
+        socket.setdefaulttimeout(old_timeout)
         items = []
         for article in response.get("articles", []):
             headline = article.get("title", "")
