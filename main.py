@@ -136,7 +136,6 @@ def main() -> None:
         trigger=IntervalTrigger(minutes=cfg.news_poll_interval_minutes),
         id="news_cycle",
         name="News → Sentiment → Buy",
-        next_run_time=None,   # don't run immediately at startup
         misfire_grace_time=60,
     )
 
