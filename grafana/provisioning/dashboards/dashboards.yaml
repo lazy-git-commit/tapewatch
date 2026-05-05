@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: momentum-trader
+    orgId: 1
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 60
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
