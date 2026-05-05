@@ -3,8 +3,9 @@ trading/executor.py
 ────────────────────
 Wraps trading212-connector to execute buy and sell orders.
 
-In DEMO mode:  connects to Trading 212's paper trading environment.
-In LIVE mode:  connects to your real ISA account — use with care.
+In DEMO mode:  calls the Trading 212 practice account API. Position sizing
+               uses DEMO_PORTFOLIO_VALUE from .env instead of the API balance.
+In LIVE mode:  calls your real ISA account — use with care.
 
 Position sizing: each trade uses at most cfg.max_position_size_pct of
 the portfolio's total value, capped to available cash.
@@ -34,11 +35,17 @@ def _get_client() -> Client:
 
 
 def get_portfolio_value() -> float | None:
-    """Fetch the total account value (cash + positions) from Trading 212."""
+    """
+    Return the total account value.
+    In demo mode uses DEMO_PORTFOLIO_VALUE from config to avoid needing
+    a funded practice account.
+    """
+    if not cfg.is_live:
+        return cfg.demo_portfolio_value
+
     try:
         client = _get_client()
         account = client.get_account_cash()
-        # trading212-connector returns a dict with 'total' key
         return float(account.get("total", 0))
     except Exception as exc:
         logger.error("Failed to fetch portfolio value: %s", exc)
@@ -46,7 +53,13 @@ def get_portfolio_value() -> float | None:
 
 
 def get_available_cash() -> float | None:
-    """Fetch available cash balance."""
+    """
+    Return available cash.
+    In demo mode uses DEMO_PORTFOLIO_VALUE as the available balance.
+    """
+    if not cfg.is_live:
+        return cfg.demo_portfolio_value
+
     try:
         client = _get_client()
         account = client.get_account_cash()
@@ -92,21 +105,12 @@ def calculate_quantity(ticker: str, price: float) -> float | None:
 
 
 def buy(ticker: str, price: float) -> OrderResult:
-    """
-    Place a market buy order for the calculated position size.
-    """
+    """Place a market buy order for the calculated position size."""
     quantity = calculate_quantity(ticker, price)
     if quantity is None:
         return OrderResult(
             success=False, ticker=ticker, quantity=0,
             price=price, order_id=None, error="Could not calculate position size",
-        )
-
-    if not cfg.is_live:
-        logger.info("[DEMO] Simulated BUY: %s × %.6f @ £%.4f", ticker, quantity, price)
-        return OrderResult(
-            success=True, ticker=ticker, quantity=quantity,
-            price=price, order_id="DEMO-ORDER", error=None,
         )
 
     try:
@@ -130,19 +134,7 @@ def buy(ticker: str, price: float) -> OrderResult:
 
 
 def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult:
-    """
-    Place a market sell order for an open position.
-    """
-    if not cfg.is_live:
-        logger.info(
-            "[DEMO] Simulated SELL: %s × %.6f @ £%.4f | reason=%s",
-            ticker, quantity, price, reason,
-        )
-        return OrderResult(
-            success=True, ticker=ticker, quantity=quantity,
-            price=price, order_id="DEMO-ORDER", error=None,
-        )
-
+    """Place a market sell order for an open position."""
     try:
         client = _get_client()
         order = client.equity_order_market(
