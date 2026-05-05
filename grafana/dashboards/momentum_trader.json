@@ -1,6 +1,6 @@
 {
   "__requires": [
-    { "type": "datasource", "id": "frser-sqlite-datasource", "version": "3.4.0" }
+    { "type": "datasource", "id": "frser-sqlite-datasource", "version": "4.0.3" }
   ],
   "uid": "momentum-trader-v1",
   "title": "Momentum Trader",
