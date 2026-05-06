@@ -88,11 +88,8 @@ def calculate_quantity(ticker: str, price: float) -> float | None:
         available_cash,
     )
 
-    if max_spend < price:
-        logger.warning(
-            "Insufficient funds: max spend £%.2f < price £%.2f for %s",
-            max_spend, price, ticker,
-        )
+    if max_spend <= 0:
+        logger.warning("No funds available to buy %s", ticker)
         return None
 
     # Trading 212 supports fractional shares — round to 6 decimal places
