@@ -5,7 +5,7 @@ Entry point for the momentum trader.
 
 Starts two scheduled jobs:
   1. news_cycle  — runs every cfg.news_poll_interval_minutes minutes
-                   fetches news → sentiment → price check → buy
+                   fetches Benzinga signals → price check → buy
   2. monitor_job — runs every 60 seconds
                    checks open positions → sell if exit condition met
 
@@ -26,7 +26,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 from config.settings import cfg
 from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade
 from news.fetcher import fetch_all_news
-from analysis.sentiment import analyse_batch
 from market.price_check import confirm_price_signal
 from trading.executor import buy
 from monitor.position_monitor import monitor_positions
@@ -46,10 +45,9 @@ def news_cycle() -> None:
     """
     The main trading pipeline — runs on a schedule.
 
-      1. Fetch news for all watchlist tickers
-      2. Run sentiment analysis via Claude
-      3. Confirm price movement via yfinance
-      4. Execute a buy via Trading 212 if all criteria are met
+      1. Fetch signals from Benzinga (WIIM + general news)
+      2. Confirm price movement via yfinance
+      3. Execute a buy via Trading 212 if confirmed
     """
     logger.info("── News cycle starting ──────────────────────────────────")
 
@@ -58,48 +56,42 @@ def news_cycle() -> None:
         logger.info("No new articles found.")
         return
 
-    sentiments = analyse_batch(news_items)
-    actionable = [s for s in sentiments if s.is_actionable]
+    logger.info("%d article(s) to evaluate.", len(news_items))
 
-    if not actionable:
-        logger.info("No actionable signals from %d articles.", len(sentiments))
-        return
-
-    logger.info("%d actionable signal(s) found.", len(actionable))
-
-    for signal in actionable:
+    for item in news_items:
+        source_tag = "WIIM" if item.is_wiim else "news"
         logger.info(
-            "Signal: [%s] %s | confidence=%d | %s",
-            signal.ticker, signal.sentiment, signal.confidence, signal.reason,
+            "Signal [%s][%s]: %s",
+            item.ticker, source_tag, item.headline,
         )
 
         # Save signal to DB
         signal_id = save_signal(
-            ticker=signal.ticker,
-            headline=signal.headline,
-            source="newsapi/rss",
-            sentiment=signal.sentiment,
-            confidence=signal.confidence,
+            ticker=item.ticker,
+            headline=item.headline,
+            source=item.source,
+            sentiment="BULLISH",
+            confidence=9 if item.is_wiim else 7,
         )
 
         # Price confirmation
-        confirmation = confirm_price_signal(signal.ticker)
+        confirmation = confirm_price_signal(item.ticker)
         if confirmation is None or not confirmation.is_confirmed:
             reason = confirmation.reason if confirmation else "price data unavailable"
-            logger.info("Price not confirmed for %s: %s", signal.ticker, reason)
+            logger.info("Price not confirmed for %s: %s", item.ticker, reason)
             continue
 
-        logger.info("Price confirmed for %s: %s", signal.ticker, confirmation.reason)
+        logger.info("Price confirmed for %s: %s", item.ticker, confirmation.reason)
 
         # Execute buy
-        result = buy(signal.ticker, confirmation.current_price)
+        result = buy(item.ticker, confirmation.current_price)
         if not result.success:
-            logger.error("Buy order failed for %s: %s", signal.ticker, result.error)
+            logger.error("Buy order failed for %s: %s", item.ticker, result.error)
             continue
 
         # Record trade in DB
         trade_id = open_trade(
-            ticker=signal.ticker,
+            ticker=item.ticker,
             signal_id=signal_id,
             quantity=result.quantity,
             buy_price=result.price,
@@ -108,7 +100,7 @@ def news_cycle() -> None:
 
         logger.info(
             "Trade #%d opened: %s × %.6f @ £%.4f",
-            trade_id, signal.ticker, result.quantity, result.price,
+            trade_id, item.ticker, result.quantity, result.price,
         )
 
     logger.info("── News cycle complete ──────────────────────────────────")
@@ -135,7 +127,7 @@ def main() -> None:
         news_cycle,
         trigger=IntervalTrigger(minutes=cfg.news_poll_interval_minutes),
         id="news_cycle",
-        name="News → Sentiment → Buy",
+        name="News → Price Check → Buy",
         misfire_grace_time=60,
     )
 

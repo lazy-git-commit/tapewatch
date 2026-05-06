@@ -1,9 +1,5 @@
 # News ingestion
-newsapi-python==0.2.7
-feedparser==6.0.11
-
-# Sentiment analysis
-anthropic==0.40.0
+requests==2.32.3
 
 # Market data & price confirmation
 yfinance==0.2.51
@@ -21,5 +17,4 @@ APScheduler==3.10.4
 
 # Utilities
 python-dotenv==1.0.1
-requests==2.32.3
 pytz==2024.2
