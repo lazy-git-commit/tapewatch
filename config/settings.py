@@ -16,6 +16,7 @@ load_dotenv()
 class Settings:
     # ── API Keys ──────────────────────────────────────────────────────────────
     trading212_api_key: str = field(default_factory=lambda: os.getenv("TRADING212_API_KEY", ""))
+    trading212_api_key_id: str = field(default_factory=lambda: os.getenv("TRADING212_API_KEY_ID", ""))
     benzinga_api_key: str = field(default_factory=lambda: os.getenv("BENZINGA_API_KEY", ""))
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
 
@@ -63,6 +64,8 @@ class Settings:
         missing = []
         if not self.trading212_api_key:
             missing.append("TRADING212_API_KEY")
+        if not self.trading212_api_key_id:
+            missing.append("TRADING212_API_KEY_ID")
         if not self.benzinga_api_key:
             missing.append("BENZINGA_API_KEY")
         if missing:

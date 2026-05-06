@@ -6,8 +6,7 @@ yfinance==1.3.0
 pandas==2.3.2
 pandas-ta==0.4.71b0
 
-# Order execution
-trading212-connector==1.0
+# Order execution — Trading 212 REST API called directly via requests
 
 # Scheduling
 APScheduler==3.10.4
