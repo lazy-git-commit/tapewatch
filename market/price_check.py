@@ -12,31 +12,29 @@ A signal is confirmed when:
 import logging
 import yfinance as yf
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from config.settings import cfg
 
 logger = logging.getLogger(__name__)
 
-
-def is_market_open() -> bool:
-    """Return True if the US stock market is currently open (Mon–Fri, 14:30–21:00 UTC)."""
-    now = datetime.now(timezone.utc)
-    if now.weekday() >= 5:  # Saturday=5, Sunday=6
-        return False
-    market_open = now.replace(hour=14, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=21, minute=0, second=0, microsecond=0)
-    return market_open <= now < market_close
-
-# yfinance logs its own fetch errors at ERROR level — suppress them since
-# we handle missing data ourselves with return None / our own warnings
+# Suppress yfinance's own error logs — we handle missing data ourselves
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
-# Trading 212 instrument codes use suffixes — map to yfinance tickers
-# yfinance uses standard Yahoo Finance tickers (e.g. AAPL, TSLA)
+
 def _to_yf_ticker(t212_ticker: str) -> str:
     """Strip Trading 212 suffix to get a yfinance-compatible ticker."""
-    # e.g. "AAPL_US_EQ" → "AAPL"
     return t212_ticker.split("_")[0]
+
+
+def is_market_open() -> bool:
+    """
+    Check market state via yfinance. Returns True only during regular
+    trading hours (marketState == 'REGULAR').
+    """
+    try:
+        state = yf.Ticker("SPY").info.get("marketState", "CLOSED")
+        return state == "REGULAR"
+    except Exception:
+        return False
 
 
 @dataclass
@@ -50,7 +48,7 @@ class PriceConfirmation:
     avg_volume: int
     volume_ratio: float
     is_confirmed: bool
-    reason: str         # human-readable explanation
+    reason: str
 
 
 def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
@@ -65,10 +63,13 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
     try:
         stock = yf.Ticker(yf_ticker)
 
-        # 1-day intraday data at 5-minute resolution
         intraday = stock.history(period="1d", interval="5m")
         if intraday.empty:
-            logger.warning("No intraday data for %s", yf_ticker)
+            market_state = stock.info.get("marketState", "UNKNOWN")
+            logger.warning(
+                "No intraday data for %s — market state: %s",
+                yf_ticker, market_state,
+            )
             return None
 
         open_price = float(intraday["Open"].iloc[0])
@@ -77,15 +78,10 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
 
         # Volume: compare today's cumulative volume to 20-day daily average
         daily = stock.history(period="21d", interval="1d")
-        if len(daily) >= 2:
-            avg_volume = int(daily["Volume"].iloc[:-1].mean())  # exclude today
-        else:
-            avg_volume = 0
-
+        avg_volume = int(daily["Volume"].iloc[:-1].mean()) if len(daily) >= 2 else 0
         current_volume = int(intraday["Volume"].sum())
         volume_ratio = (current_volume / avg_volume) if avg_volume > 0 else 0.0
 
-        # Confirmation criteria
         price_ok = price_move_pct >= cfg.min_price_move_pct
         volume_ok = volume_ratio >= 1.5
 
@@ -97,7 +93,6 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                 f"with {volume_ratio:.1f}× average volume"
             )
         elif price_ok:
-            # Accept on price alone but warn — volume is a weaker signal
             is_confirmed = True
             reason = (
                 f"Price +{price_move_pct:.2f}% from open but low volume "
@@ -110,7 +105,11 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                 f"(threshold: +{cfg.min_price_move_pct}%) — not confirmed"
             )
 
-        result = PriceConfirmation(
+        logger.info(
+            "Price check [%s]: %.2f%% move, %.1f× volume — confirmed=%s",
+            yf_ticker, price_move_pct, volume_ratio, is_confirmed,
+        )
+        return PriceConfirmation(
             ticker=t212_ticker,
             yf_ticker=yf_ticker,
             current_price=current_price,
@@ -123,12 +122,6 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
             reason=reason,
         )
 
-        logger.info(
-            "Price check [%s]: %.2f%% move, %.1f× volume — confirmed=%s",
-            yf_ticker, price_move_pct, volume_ratio, is_confirmed,
-        )
-        return result
-
     except Exception as exc:
         logger.error("Price check failed for %s: %s", yf_ticker, exc)
         return None
@@ -138,8 +131,7 @@ def get_current_price(t212_ticker: str) -> float | None:
     """Fast lookup of the latest price for an open position monitor."""
     yf_ticker = _to_yf_ticker(t212_ticker)
     try:
-        ticker = yf.Ticker(yf_ticker)
-        data = ticker.history(period="1d", interval="1m")
+        data = yf.Ticker(yf_ticker).history(period="1d", interval="1m")
         if data.empty:
             return None
         return float(data["Close"].iloc[-1])
