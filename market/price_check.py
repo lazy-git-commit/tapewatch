@@ -12,9 +12,24 @@ A signal is confirmed when:
 import logging
 import yfinance as yf
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from config.settings import cfg
 
 logger = logging.getLogger(__name__)
+
+
+def is_market_open() -> bool:
+    """Return True if the US stock market is currently open (Mon–Fri, 14:30–21:00 UTC)."""
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    market_open = now.replace(hour=14, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=21, minute=0, second=0, microsecond=0)
+    return market_open <= now < market_close
+
+# yfinance logs its own fetch errors at ERROR level — suppress them since
+# we handle missing data ourselves with return None / our own warnings
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 # Trading 212 instrument codes use suffixes — map to yfinance tickers
 # yfinance uses standard Yahoo Finance tickers (e.g. AAPL, TSLA)

@@ -26,7 +26,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from config.settings import cfg
 from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade
 from news.fetcher import fetch_all_news
-from market.price_check import confirm_price_signal
+from market.price_check import confirm_price_signal, is_market_open
 from trading.executor import buy
 from monitor.position_monitor import monitor_positions
 from reporting.report import generate_report
@@ -50,6 +50,10 @@ def news_cycle() -> None:
       3. Execute a buy via Trading 212 if confirmed
     """
     logger.info("── News cycle starting ──────────────────────────────────")
+
+    if not is_market_open():
+        logger.info("Market is closed — skipping cycle.")
+        return
 
     news_items = fetch_all_news(lookback_hours=1)
     if not news_items:
