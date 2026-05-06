@@ -49,6 +49,7 @@ def init_db() -> None:
 
         CREATE TABLE IF NOT EXISTS trades (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode            TEXT    NOT NULL DEFAULT 'demo',  -- demo / live
             ticker          TEXT    NOT NULL,
             signal_id       INTEGER REFERENCES news_signals(id),
             quantity        REAL    NOT NULL,
@@ -69,6 +70,13 @@ def init_db() -> None:
             snapshot_at TEXT    NOT NULL
         );
         """)
+    # Migration: add mode column to existing databases
+    with get_conn() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()]
+        if "mode" not in cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN mode TEXT NOT NULL DEFAULT 'demo'")
+            logger.info("Migrated trades table: added mode column")
+
     logger.info("Database initialised at %s", cfg.db_path)
 
 
@@ -111,9 +119,9 @@ def open_trade(
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO trades
-               (ticker, signal_id, quantity, buy_price, buy_time, status)
-               VALUES (?, ?, ?, ?, ?, 'open')""",
-            (ticker, signal_id, quantity, buy_price, datetime.utcnow().isoformat()),
+               (mode, ticker, signal_id, quantity, buy_price, buy_time, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'open')""",
+            (cfg.trading_mode, ticker, signal_id, quantity, buy_price, datetime.utcnow().isoformat()),
         )
         logger.info("Trade opened: %s × %.4f @ £%.4f", ticker, quantity, buy_price)
         return cur.lastrowid

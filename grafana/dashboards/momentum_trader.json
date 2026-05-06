@@ -8,6 +8,24 @@
   "timezone": "browser",
   "refresh": "1m",
   "time": { "from": "now-7d", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "mode",
+        "label": "Mode",
+        "type": "custom",
+        "query": "demo,live",
+        "current": { "text": "demo", "value": "demo" },
+        "options": [
+          { "text": "demo", "value": "demo", "selected": true },
+          { "text": "live", "value": "live", "selected": false }
+        ],
+        "hide": 0,
+        "includeAll": false,
+        "multi": false
+      }
+    ]
+  },
   "panels": [
     {
       "id": 1,
@@ -17,7 +35,7 @@
       "datasource": { "type": "frser-sqlite-datasource", "uid": "trader-sqlite" },
       "targets": [
         {
-          "rawQuery": "SELECT ticker, quantity, buy_price, buy_time, ROUND((JULIANDAY('now') - JULIANDAY(buy_time)) * 1440, 0) AS age_minutes FROM trades WHERE status = 'open' ORDER BY buy_time DESC",
+          "rawQuery": "SELECT ticker, quantity, buy_price, buy_time, ROUND((JULIANDAY('now') - JULIANDAY(buy_time)) * 1440, 0) AS age_minutes FROM trades WHERE status = 'open' AND mode = '$mode' ORDER BY buy_time DESC",
           "queryType": "table",
           "refId": "A"
         }
@@ -51,7 +69,7 @@
       },
       "targets": [
         {
-          "rawQuery": "SELECT ROUND(100.0 * SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS win_rate_pct FROM trades WHERE status = 'closed'",
+          "rawQuery": "SELECT ROUND(100.0 * SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS win_rate_pct FROM trades WHERE status = 'closed' AND mode = '$mode'",
           "queryType": "table",
           "refId": "A"
         }
@@ -84,7 +102,7 @@
       },
       "targets": [
         {
-          "rawQuery": "SELECT ROUND(SUM(profit_loss), 2) AS total_pnl FROM trades WHERE status = 'closed'",
+          "rawQuery": "SELECT ROUND(SUM(profit_loss), 2) AS total_pnl FROM trades WHERE status = 'closed' AND mode = '$mode'",
           "queryType": "table",
           "refId": "A"
         }
@@ -105,7 +123,7 @@
       },
       "targets": [
         {
-          "rawQuery": "SELECT COUNT(*) AS total_trades FROM trades WHERE status = 'closed'",
+          "rawQuery": "SELECT COUNT(*) AS total_trades FROM trades WHERE status = 'closed' AND mode = '$mode'",
           "queryType": "table",
           "refId": "A"
         }
@@ -138,7 +156,7 @@
       "datasource": { "type": "frser-sqlite-datasource", "uid": "trader-sqlite" },
       "targets": [
         {
-          "rawQuery": "SELECT ticker, ROUND(buy_price, 4) AS buy_price, ROUND(sell_price, 4) AS sell_price, ROUND(quantity, 4) AS quantity, ROUND(profit_loss, 2) AS pnl_gbp, ROUND(profit_loss_pct, 2) AS pnl_pct, exit_reason, sell_time FROM trades WHERE status = 'closed' ORDER BY sell_time DESC LIMIT 100",
+          "rawQuery": "SELECT ticker, ROUND(buy_price, 4) AS buy_price, ROUND(sell_price, 4) AS sell_price, ROUND(quantity, 4) AS quantity, ROUND(profit_loss, 2) AS pnl_gbp, ROUND(profit_loss_pct, 2) AS pnl_pct, exit_reason, sell_time FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
           "queryType": "table",
           "refId": "A"
         }
