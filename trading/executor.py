@@ -112,10 +112,7 @@ def buy(ticker: str, price: float) -> OrderResult:
 
     try:
         client = _get_client()
-        order = client.equity_order_market(
-            ticker=ticker,
-            quantity=quantity,
-        )
+        order = client.place_market_order(quantity=quantity, ticker=ticker)
         order_id = str(order.get("id", ""))
         logger.info("BUY executed: %s × %.6f | order_id=%s", ticker, quantity, order_id)
         return OrderResult(
@@ -134,10 +131,7 @@ def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult
     """Place a market sell order for an open position."""
     try:
         client = _get_client()
-        order = client.equity_order_market(
-            ticker=ticker,
-            quantity=-quantity,   # negative = sell
-        )
+        order = client.place_market_order(quantity=-quantity, ticker=ticker)  # negative = sell
         order_id = str(order.get("id", ""))
         logger.info(
             "SELL executed: %s × %.6f | reason=%s | order_id=%s",
