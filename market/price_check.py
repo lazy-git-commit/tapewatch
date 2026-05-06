@@ -27,11 +27,12 @@ def _to_yf_ticker(t212_ticker: str) -> str:
 
 def is_market_open() -> bool:
     """
-    Check market state via yfinance. Returns True only during regular
-    trading hours (marketState == 'REGULAR').
+    Check market state via yfinance fast_info. Returns True only during
+    regular trading hours (market_state == 'REGULAR').
+    fast_info is a lightweight call — much more reliable than .info.
     """
     try:
-        state = yf.Ticker("SPY").info.get("marketState", "CLOSED")
+        state = yf.Ticker("SPY").fast_info.get("market_state", "CLOSED")
         return state == "REGULAR"
     except Exception:
         return False
@@ -65,7 +66,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
 
         intraday = stock.history(period="1d", interval="5m")
         if intraday.empty:
-            market_state = stock.info.get("marketState", "UNKNOWN")
+            market_state = stock.fast_info.get("market_state", "UNKNOWN")
             logger.warning(
                 "No intraday data for %s — market state: %s",
                 yf_ticker, market_state,
