@@ -31,7 +31,8 @@ class OrderResult:
 
 def _get_client() -> Client:
     """Return a configured Trading 212 client in the correct mode."""
-    return Client(cfg.trading212_api_key)
+    domain = "live.trading212.com" if cfg.is_live else "demo.trading212.com"
+    return Client(cfg.trading212_api_key, domain=domain)
 
 
 def get_portfolio_value() -> float | None:
