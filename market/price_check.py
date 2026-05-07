@@ -144,8 +144,9 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
             )
 
         logger.info(
-            "Price check [%s]: recent=%+.2f%% day=%+.2f%% volume=%.1f× — confirmed=%s",
-            yf_ticker, recent_move_pct, day_move_pct, volume_ratio, is_confirmed,
+            "Price check [%s]: recent=%+.2f%% day=%+.2f%% volume=%.1f× — %s",
+            yf_ticker, recent_move_pct, day_move_pct, volume_ratio,
+            "approved" if is_confirmed else "rejected",
         )
         return PriceConfirmation(
             ticker=t212_ticker,
