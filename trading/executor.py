@@ -105,10 +105,10 @@ def calculate_quantity(ticker: str, price: float) -> float | None:
         logger.warning("No funds available to buy %s", ticker)
         return None
 
-    # Trading 212 supports fractional shares — round to 6 decimal places
-    quantity = round(max_spend / price, 6)
+    # Trading 212 allows at most 4 decimal places for fractional quantities
+    quantity = round(max_spend / price, 4)
     logger.info(
-        "Position size for %s: £%.2f → %.6f shares @ £%.4f",
+        "Position size for %s: £%.2f → %.4f shares @ £%.4f",
         ticker, max_spend, quantity, price,
     )
     return quantity
