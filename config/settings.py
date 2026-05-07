@@ -17,6 +17,8 @@ class Settings:
     # ── API Keys ──────────────────────────────────────────────────────────────
     trading212_api_key: str = field(default_factory=lambda: os.getenv("TRADING212_API_KEY", ""))
     trading212_api_key_id: str = field(default_factory=lambda: os.getenv("TRADING212_API_KEY_ID", ""))
+    trading212_demo_api_key: str = field(default_factory=lambda: os.getenv("TRADING212_DEMO_API_KEY", ""))
+    trading212_demo_api_key_id: str = field(default_factory=lambda: os.getenv("TRADING212_DEMO_API_KEY_ID", ""))
     benzinga_api_key: str = field(default_factory=lambda: os.getenv("BENZINGA_API_KEY", ""))
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
 
@@ -68,10 +70,16 @@ class Settings:
     def validate(self) -> None:
         """Raise if any required key is missing."""
         missing = []
-        if not self.trading212_api_key:
-            missing.append("TRADING212_API_KEY")
-        if not self.trading212_api_key_id:
-            missing.append("TRADING212_API_KEY_ID")
+        if self.is_live:
+            if not self.trading212_api_key:
+                missing.append("TRADING212_API_KEY")
+            if not self.trading212_api_key_id:
+                missing.append("TRADING212_API_KEY_ID")
+        else:
+            if not self.trading212_demo_api_key:
+                missing.append("TRADING212_DEMO_API_KEY")
+            if not self.trading212_demo_api_key_id:
+                missing.append("TRADING212_DEMO_API_KEY_ID")
         if not self.benzinga_api_key:
             missing.append("BENZINGA_API_KEY")
         if missing:

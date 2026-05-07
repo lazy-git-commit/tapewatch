@@ -29,7 +29,11 @@ def _base_url() -> str:
 
 
 def _auth_header() -> dict:
-    credentials = f"{cfg.trading212_api_key_id}:{cfg.trading212_api_key}"
+    if cfg.is_live:
+        key_id, key = cfg.trading212_api_key_id, cfg.trading212_api_key
+    else:
+        key_id, key = cfg.trading212_demo_api_key_id, cfg.trading212_demo_api_key
+    credentials = f"{key_id}:{key}"
     encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
     return {"Authorization": f"Basic {encoded}"}
 
