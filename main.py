@@ -24,7 +24,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config.settings import cfg
-from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade
+from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded
 from news.fetcher import fetch_all_news
 from market.price_check import confirm_price_signal, is_market_open
 from trading.executor import buy
@@ -68,6 +68,11 @@ def news_cycle() -> None:
             "Signal [%s][%s]: %s",
             item.ticker, source_tag, item.headline,
         )
+
+        # Skip if already holding or bought in the last 24 hours
+        if was_recently_traded(item.ticker):
+            logger.info("Skipping %s — already traded within the last 24 hours", item.ticker)
+            continue
 
         # Save signal to DB
         signal_id = save_signal(

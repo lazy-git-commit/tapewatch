@@ -168,6 +168,21 @@ def get_open_trades() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def was_recently_traded(ticker: str, hours: int = 24) -> bool:
+    """Return True if this ticker has an open trade or was bought within the last `hours`."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM trades
+               WHERE ticker = ?
+               AND mode = ?
+               AND (status = 'open'
+                    OR buy_time >= datetime('now', ? || ' hours'))
+               LIMIT 1""",
+            (ticker, cfg.trading_mode, f"-{hours}"),
+        ).fetchone()
+        return row is not None
+
+
 # ── Portfolio snapshots ───────────────────────────────────────────────────────
 
 def save_snapshot(total_value: float, cash: Optional[float] = None) -> None:
