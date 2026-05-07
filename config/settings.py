@@ -31,7 +31,13 @@ class Settings:
         default_factory=lambda: int(os.getenv("MIN_SENTIMENT_CONFIDENCE", "7"))
     )
     min_price_move_pct: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PRICE_MOVE_PCT", "1.5"))
+        default_factory=lambda: float(os.getenv("MIN_PRICE_MOVE_PCT", "0.5"))
+    )
+    momentum_window_minutes: int = field(
+        default_factory=lambda: int(os.getenv("MOMENTUM_WINDOW_MINUTES", "30"))
+    )
+    max_day_drop_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_DAY_DROP_PCT", "3.0"))
     )
     max_position_size_pct: float = field(
         default_factory=lambda: float(os.getenv("MAX_POSITION_SIZE_PCT", "5.0"))

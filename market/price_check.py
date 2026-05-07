@@ -4,12 +4,17 @@ market/price_check.py
 Fetches live price data via yfinance and checks whether a signal is confirmed
 by actual price movement and elevated volume.
 
-A signal is confirmed when:
-  1. The current price is >= cfg.min_price_move_pct above the day's open
-  2. Current volume is > 1.5× the 20-day average volume (volume confirmation)
+A signal is confirmed when ALL of the following hold:
+  1. Recent momentum  — price is up >= cfg.min_price_move_pct over the last
+                        cfg.momentum_window_minutes minutes
+  2. Volume spike     — today's cumulative volume > 1.5× the 20-day average
+  3. No dead-cat bounce — stock is not down more than cfg.max_day_drop_pct
+                          from today's open (guards against buying a brief
+                          bounce inside a larger intraday sell-off)
 """
 
 import logging
+from datetime import datetime, timezone, timedelta
 import yfinance as yf
 from dataclasses import dataclass
 from config.settings import cfg
@@ -33,12 +38,10 @@ def is_market_open() -> bool:
     which vary across yfinance versions.
     """
     try:
-        from datetime import datetime, timezone, timedelta
         data = yf.Ticker("SPY").history(period="1d", interval="1m")
         if data.empty:
             return False
         last_ts = data.index[-1]
-        # Normalise to UTC-aware datetime
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=timezone.utc)
         else:
@@ -55,7 +58,8 @@ class PriceConfirmation:
     yf_ticker: str
     current_price: float
     open_price: float
-    price_move_pct: float
+    day_move_pct: float       # price vs today's open (used for dead-cat guard)
+    recent_move_pct: float    # price vs cfg.momentum_window_minutes ago
     current_volume: int
     avg_volume: int
     volume_ratio: float
@@ -65,7 +69,7 @@ class PriceConfirmation:
 
 def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
     """
-    Check whether a ticker is experiencing the kind of price movement that
+    Check whether a ticker is experiencing active upward momentum that
     corroborates a bullish news signal.
 
     Returns None if data cannot be fetched.
@@ -83,9 +87,21 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
             )
             return None
 
-        open_price = float(intraday["Open"].iloc[0])
         current_price = float(intraday["Close"].iloc[-1])
-        price_move_pct = ((current_price - open_price) / open_price) * 100
+        open_price = float(intraday["Open"].iloc[0])
+        day_move_pct = ((current_price - open_price) / open_price) * 100
+
+        # Recent momentum: find the bar closest to momentum_window_minutes ago
+        window = timedelta(minutes=cfg.momentum_window_minutes)
+        now_ts = intraday.index[-1]
+        cutoff_ts = now_ts - window
+        past_bars = intraday[intraday.index <= cutoff_ts]
+        if past_bars.empty:
+            # Market just opened — fewer bars than the window; use open price
+            past_price = open_price
+        else:
+            past_price = float(past_bars["Close"].iloc[-1])
+        recent_move_pct = ((current_price - past_price) / past_price) * 100
 
         # Volume: compare today's cumulative volume to 20-day daily average
         daily = stock.history(period="21d", interval="1d")
@@ -93,39 +109,51 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         current_volume = int(intraday["Volume"].sum())
         volume_ratio = (current_volume / avg_volume) if avg_volume > 0 else 0.0
 
-        price_ok = price_move_pct >= cfg.min_price_move_pct
+        # ── Evaluate conditions ───────────────────────────────────────────────
+        momentum_ok = recent_move_pct >= cfg.min_price_move_pct
         volume_ok = volume_ratio >= 1.5
+        dead_cat = day_move_pct < -cfg.max_day_drop_pct
 
-        if price_ok and volume_ok:
-            is_confirmed = True
-            reason = (
-                f"Price +{price_move_pct:.2f}% from open "
-                f"(threshold: +{cfg.min_price_move_pct}%) "
-                f"with {volume_ratio:.1f}× average volume"
-            )
-        elif price_ok:
-            is_confirmed = True
-            reason = (
-                f"Price +{price_move_pct:.2f}% from open but low volume "
-                f"({volume_ratio:.1f}× avg) — weak confirmation"
-            )
-        else:
+        if dead_cat:
             is_confirmed = False
             reason = (
-                f"Price only +{price_move_pct:.2f}% from open "
-                f"(threshold: +{cfg.min_price_move_pct}%) — not confirmed"
+                f"Dead-cat bounce guard: stock is down {day_move_pct:.2f}% on the day "
+                f"(max allowed drop: -{cfg.max_day_drop_pct}%) — skipping"
+            )
+        elif not momentum_ok:
+            is_confirmed = False
+            reason = (
+                f"Insufficient recent momentum: +{recent_move_pct:.2f}% "
+                f"over last {cfg.momentum_window_minutes} min "
+                f"(threshold: +{cfg.min_price_move_pct}%)"
+            )
+        elif momentum_ok and volume_ok:
+            is_confirmed = True
+            reason = (
+                f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
+                f"with {volume_ratio:.1f}× average volume "
+                f"(day: {day_move_pct:+.2f}%)"
+            )
+        else:
+            # Momentum present but volume weak — still confirm, flag as weak
+            is_confirmed = True
+            reason = (
+                f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
+                f"but low volume ({volume_ratio:.1f}× avg) — weak confirmation "
+                f"(day: {day_move_pct:+.2f}%)"
             )
 
         logger.info(
-            "Price check [%s]: %.2f%% move, %.1f× volume — confirmed=%s",
-            yf_ticker, price_move_pct, volume_ratio, is_confirmed,
+            "Price check [%s]: recent=+%.2f%% day=%+.2f%% volume=%.1f× — confirmed=%s",
+            yf_ticker, recent_move_pct, day_move_pct, volume_ratio, is_confirmed,
         )
         return PriceConfirmation(
             ticker=t212_ticker,
             yf_ticker=yf_ticker,
             current_price=current_price,
             open_price=open_price,
-            price_move_pct=price_move_pct,
+            day_move_pct=day_move_pct,
+            recent_move_pct=recent_move_pct,
             current_volume=current_volume,
             avg_volume=avg_volume,
             volume_ratio=volume_ratio,

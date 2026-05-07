@@ -57,7 +57,9 @@ Key settings in `.env`:
 | `TRADING_MODE` | `demo` | **Keep as `demo` until confident** |
 | `DEMO_PORTFOLIO_VALUE` | `500.0` | Simulated balance for position sizing in demo mode (GBP) |
 | `BLOCKLIST` | `` | Comma-separated Trading 212 codes to never trade (e.g. `TSLA_US_EQ`) |
-| `MIN_PRICE_MOVE_PCT` | `1.5` | Price must be up this % from open to confirm a signal |
+| `MIN_PRICE_MOVE_PCT` | `0.5` | Price must be up this % over the momentum window to confirm a signal |
+| `MOMENTUM_WINDOW_MINUTES` | `30` | How far back to measure recent price momentum |
+| `MAX_DAY_DROP_PCT` | `3.0` | Reject signal if stock is down more than this % from today's open (dead-cat bounce guard) |
 | `MAX_POSITION_SIZE_PCT` | `5.0` | Max % of portfolio per trade |
 | `TAKE_PROFIT_PCT` | `5.0` | Sell when up this % |
 | `STOP_LOSS_PCT` | `2.0` | Sell when down this % |
