@@ -82,10 +82,10 @@ def news_cycle() -> None:
         confirmation = confirm_price_signal(item.ticker)
         if confirmation is None or not confirmation.is_confirmed:
             reason = confirmation.reason if confirmation else "price data unavailable"
-            logger.info("Price not confirmed for %s: %s", item.ticker, reason)
+            logger.info("Signal rejected for %s: %s", item.ticker, reason)
             continue
 
-        logger.info("Price confirmed for %s: %s", item.ticker, confirmation.reason)
+        logger.info("Signal approved for %s — placing buy order: %s", item.ticker, confirmation.reason)
 
         # Execute buy
         result = buy(item.ticker, confirmation.current_price)
