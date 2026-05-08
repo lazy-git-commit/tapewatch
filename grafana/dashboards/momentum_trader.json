@@ -143,7 +143,7 @@
       "targets": [
         {
           "rawQuery": "SELECT CAST(strftime('%s', snapshot_at) AS INTEGER) * 1000 AS time, total_value FROM portfolio_snapshots ORDER BY snapshot_at ASC",
-          "queryType": "time series",
+          "queryType": "table",
           "refId": "A"
         }
       ]
