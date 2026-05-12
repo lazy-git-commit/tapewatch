@@ -65,7 +65,7 @@ class Settings:
     )
 
     # ── Storage ───────────────────────────────────────────────────────────────
-    db_path: str = field(default_factory=lambda: os.getenv("DB_PATH", "./trader.db"))
+    db_url: str = field(default_factory=lambda: os.getenv("DB_URL", "postgresql://<db-user>:<db-password>@localhost:5432/momentum_trader"))
 
     def validate(self) -> None:
         """Raise if any required key is missing."""

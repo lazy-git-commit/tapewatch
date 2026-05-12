@@ -6,7 +6,6 @@ Run directly:  python -m reporting.report
 Or call generate_report() programmatically.
 """
 
-import sqlite3
 import logging
 from datetime import datetime
 from storage.database import get_conn

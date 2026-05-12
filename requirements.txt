@@ -12,7 +12,7 @@ pandas-ta==0.4.71b0
 APScheduler==3.10.4
 
 # Storage
-# sqlite3 is built into Python — no install needed
+psycopg2-binary==2.9.10
 
 # Utilities
 python-dotenv==1.0.1
