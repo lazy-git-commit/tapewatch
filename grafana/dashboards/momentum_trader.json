@@ -36,7 +36,7 @@
       "targets": [
         {
           "rawQuery": "SELECT ticker, quantity, buy_price, buy_time, ROUND((JULIANDAY('now') - JULIANDAY(buy_time)) * 1440, 0) AS age_minutes FROM trades WHERE status = 'open' AND mode = '$mode' ORDER BY buy_time DESC",
-          "queryType": "table",
+          "queryType": "raw",
           "refId": "A"
         }
       ]
@@ -70,7 +70,7 @@
       "targets": [
         {
           "rawQuery": "SELECT ROUND(100.0 * SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS win_rate_pct FROM trades WHERE status = 'closed' AND mode = '$mode'",
-          "queryType": "table",
+          "queryType": "raw",
           "refId": "A"
         }
       ]
@@ -103,7 +103,7 @@
       "targets": [
         {
           "rawQuery": "SELECT ROUND(SUM(profit_loss), 2) AS total_pnl FROM trades WHERE status = 'closed' AND mode = '$mode'",
-          "queryType": "table",
+          "queryType": "raw",
           "refId": "A"
         }
       ]
@@ -124,7 +124,7 @@
       "targets": [
         {
           "rawQuery": "SELECT COUNT(*) AS total_trades FROM trades WHERE status = 'closed' AND mode = '$mode'",
-          "queryType": "table",
+          "queryType": "raw",
           "refId": "A"
         }
       ]
@@ -143,7 +143,7 @@
       "targets": [
         {
           "rawQuery": "SELECT CAST(strftime('%s', snapshot_at) AS INTEGER) * 1000 AS time, total_value FROM portfolio_snapshots ORDER BY snapshot_at ASC",
-          "queryType": "table",
+          "queryType": "raw",
           "refId": "A"
         }
       ]
@@ -157,7 +157,7 @@
       "targets": [
         {
           "rawQuery": "SELECT ticker, ROUND(buy_price, 4) AS buy_price, ROUND(sell_price, 4) AS sell_price, ROUND(quantity, 4) AS quantity, ROUND(profit_loss, 2) AS pnl_gbp, ROUND(profit_loss_pct, 2) AS pnl_pct, exit_reason, sell_time FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
-          "queryType": "table",
+          "queryType": "raw",
           "refId": "A"
         }
       ]
@@ -171,7 +171,7 @@
       "targets": [
         {
           "rawQuery": "SELECT created_at, ticker, sentiment, confidence, acted_on, headline, source FROM news_signals ORDER BY created_at DESC LIMIT 200",
-          "queryType": "table",
+          "queryType": "raw",
           "refId": "A"
         }
       ]
