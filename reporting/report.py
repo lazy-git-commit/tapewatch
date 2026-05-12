@@ -16,13 +16,11 @@ logger = logging.getLogger(__name__)
 def generate_report() -> str:
     """Return a plain-text performance report from all closed trades."""
     with get_conn() as conn:
-        trades = conn.execute(
-            """SELECT * FROM trades WHERE status = 'closed' ORDER BY sell_time DESC"""
-        ).fetchall()
-
-        open_trades = conn.execute(
-            """SELECT * FROM trades WHERE status = 'open'"""
-        ).fetchall()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM trades WHERE status = 'closed' ORDER BY sell_time DESC")
+            trades = cur.fetchall()
+            cur.execute("SELECT * FROM trades WHERE status = 'open'")
+            open_trades = cur.fetchall()
 
     if not trades and not open_trades:
         return "No trades recorded yet."
