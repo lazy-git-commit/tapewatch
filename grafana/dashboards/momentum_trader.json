@@ -99,7 +99,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(SUM(profit_loss)::numeric, 2) AS total_pnl FROM trades WHERE status = 'closed' AND mode = '$mode'",
+          "rawSql": "SELECT ROUND(SUM(CASE WHEN sell_net_gbp IS NOT NULL AND buy_net_gbp IS NOT NULL THEN sell_net_gbp - buy_net_gbp ELSE profit_loss END)::numeric, 2) AS total_pnl FROM trades WHERE status = 'closed' AND mode = '$mode'",
           "format": "table",
           "refId": "A"
         }

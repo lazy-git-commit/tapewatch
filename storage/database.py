@@ -170,7 +170,7 @@ def close_trade(
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT buy_price, quantity FROM trades WHERE id = %s", (trade_id,)
+                "SELECT buy_price, quantity, buy_net_gbp FROM trades WHERE id = %s", (trade_id,)
             )
             row = cur.fetchone()
             if not row:
@@ -179,8 +179,15 @@ def close_trade(
 
             buy_price = row["buy_price"]
             quantity = row["quantity"]
-            pnl = (sell_price - buy_price) * quantity
-            pnl_pct = ((sell_price - buy_price) / buy_price) * 100
+            buy_net_gbp_stored = row["buy_net_gbp"]
+
+            # Use real GBP cash flows when available; fall back to USD price diff
+            if sell_net_gbp is not None and buy_net_gbp_stored is not None:
+                pnl = sell_net_gbp - buy_net_gbp_stored
+                pnl_pct = (pnl / abs(buy_net_gbp_stored)) * 100
+            else:
+                pnl = (sell_price - buy_price) * quantity
+                pnl_pct = ((sell_price - buy_price) / buy_price) * 100
 
             cur.execute(
                 """UPDATE trades SET
