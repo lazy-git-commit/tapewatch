@@ -38,50 +38,52 @@ def init_db() -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-            CREATE TABLE IF NOT EXISTS news_signals (
-                id           SERIAL PRIMARY KEY,
-                article_id   TEXT,
-                ticker       TEXT    NOT NULL,
-                headline     TEXT    NOT NULL,
-                source       TEXT,
-                sentiment    TEXT    NOT NULL,
-                confidence   INTEGER NOT NULL,
-                acted_on     INTEGER NOT NULL DEFAULT 0,
-                published_at TEXT,
-                fetched_at   TEXT    NOT NULL,
-                created_at   TEXT    NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS trades (
-                id              SERIAL PRIMARY KEY,
-                mode            TEXT    NOT NULL DEFAULT 'demo',
-                ticker          TEXT    NOT NULL,
-                signal_id       INTEGER REFERENCES news_signals(id),
-                quantity        REAL    NOT NULL,
-                buy_price       REAL    NOT NULL,
-                sell_price      REAL,
-                buy_time        TEXT    NOT NULL,
-                sell_time       TEXT,
-                exit_reason     TEXT,
-                profit_loss     REAL,
-                profit_loss_pct REAL,
-                status          TEXT    NOT NULL DEFAULT 'open',
-                buy_order_id    TEXT,
-                sell_order_id   TEXT,
-                buy_net_gbp     REAL,
-                sell_net_gbp    REAL,
-                buy_fx_rate     REAL,
-                sell_fx_rate    REAL,
-                buy_fees_gbp    REAL,
-                sell_fees_gbp   REAL
-            );
-
-            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
-                id          SERIAL PRIMARY KEY,
-                total_value REAL    NOT NULL,
-                cash        REAL,
-                snapshot_at TEXT    NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS news_signals (
+                    id           SERIAL PRIMARY KEY,
+                    article_id   TEXT,
+                    ticker       TEXT    NOT NULL,
+                    headline     TEXT    NOT NULL,
+                    source       TEXT,
+                    sentiment    TEXT    NOT NULL,
+                    confidence   INTEGER NOT NULL,
+                    acted_on     INTEGER NOT NULL DEFAULT 0,
+                    published_at TEXT,
+                    fetched_at   TEXT    NOT NULL,
+                    created_at   TEXT    NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id              SERIAL PRIMARY KEY,
+                    mode            TEXT    NOT NULL DEFAULT 'demo',
+                    ticker          TEXT    NOT NULL,
+                    signal_id       INTEGER REFERENCES news_signals(id),
+                    quantity        REAL    NOT NULL,
+                    buy_price       REAL    NOT NULL,
+                    sell_price      REAL,
+                    buy_time        TEXT    NOT NULL,
+                    sell_time       TEXT,
+                    exit_reason     TEXT,
+                    profit_loss     REAL,
+                    profit_loss_pct REAL,
+                    status          TEXT    NOT NULL DEFAULT 'open',
+                    buy_order_id    TEXT,
+                    sell_order_id   TEXT,
+                    buy_net_gbp     REAL,
+                    sell_net_gbp    REAL,
+                    buy_fx_rate     REAL,
+                    sell_fx_rate    REAL,
+                    buy_fees_gbp    REAL,
+                    sell_fees_gbp   REAL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                    id          SERIAL PRIMARY KEY,
+                    total_value REAL    NOT NULL,
+                    cash        REAL,
+                    snapshot_at TEXT    NOT NULL
+                )
             """)
     logger.info("Database initialised at %s", cfg.db_url.split("@")[-1])
 
