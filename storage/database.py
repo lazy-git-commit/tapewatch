@@ -62,7 +62,15 @@ def init_db() -> None:
                 exit_reason     TEXT,
                 profit_loss     REAL,
                 profit_loss_pct REAL,
-                status          TEXT    NOT NULL DEFAULT 'open'
+                status          TEXT    NOT NULL DEFAULT 'open',
+                buy_order_id    TEXT,
+                sell_order_id   TEXT,
+                buy_net_gbp     REAL,
+                sell_net_gbp    REAL,
+                buy_fx_rate     REAL,
+                sell_fx_rate    REAL,
+                buy_fees_gbp    REAL,
+                sell_fees_gbp   REAL
             );
 
             CREATE TABLE IF NOT EXISTS portfolio_snapshots (
@@ -72,6 +80,20 @@ def init_db() -> None:
                 snapshot_at TEXT    NOT NULL
             );
             """)
+        # Add new columns to existing tables without dropping data
+        for col, definition in [
+            ("buy_order_id",  "TEXT"),
+            ("sell_order_id", "TEXT"),
+            ("buy_net_gbp",   "REAL"),
+            ("sell_net_gbp",  "REAL"),
+            ("buy_fx_rate",   "REAL"),
+            ("sell_fx_rate",  "REAL"),
+            ("buy_fees_gbp",  "REAL"),
+            ("sell_fees_gbp", "REAL"),
+        ]:
+            cur.execute(
+                f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col} {definition}"
+            )
     logger.info("Database initialised at %s", cfg.db_url.split("@")[-1])
 
 
@@ -112,16 +134,23 @@ def open_trade(
     signal_id: int,
     quantity: float,
     buy_price: float,
+    buy_order_id: str | None = None,
+    buy_net_gbp: float | None = None,
+    buy_fx_rate: float | None = None,
+    buy_fees_gbp: float | None = None,
 ) -> int:
     """Record an opening buy. Returns the trade id."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO trades
-                   (mode, ticker, signal_id, quantity, buy_price, buy_time, status)
-                   VALUES (%s, %s, %s, %s, %s, %s, 'open')
+                   (mode, ticker, signal_id, quantity, buy_price, buy_time, status,
+                    buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp)
+                   VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s)
                    RETURNING id""",
-                (cfg.trading_mode, ticker, signal_id, quantity, buy_price, datetime.utcnow().isoformat()),
+                (cfg.trading_mode, ticker, signal_id, quantity, buy_price,
+                 datetime.utcnow().isoformat(),
+                 buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp),
             )
             row_id = cur.fetchone()["id"]
             logger.info("Trade opened: %s × %.4f @ £%.4f", ticker, quantity, buy_price)
@@ -132,6 +161,10 @@ def close_trade(
     trade_id: int,
     sell_price: float,
     exit_reason: str,
+    sell_order_id: str | None = None,
+    sell_net_gbp: float | None = None,
+    sell_fx_rate: float | None = None,
+    sell_fees_gbp: float | None = None,
 ) -> None:
     """Record the close of an open trade and calculate P&L."""
     with get_conn() as conn:
@@ -152,9 +185,11 @@ def close_trade(
             cur.execute(
                 """UPDATE trades SET
                    sell_price = %s, sell_time = %s, exit_reason = %s,
-                   profit_loss = %s, profit_loss_pct = %s, status = 'closed'
+                   profit_loss = %s, profit_loss_pct = %s, status = 'closed',
+                   sell_order_id = %s, sell_net_gbp = %s, sell_fx_rate = %s, sell_fees_gbp = %s
                    WHERE id = %s""",
-                (sell_price, datetime.utcnow().isoformat(), exit_reason, pnl, pnl_pct, trade_id),
+                (sell_price, datetime.utcnow().isoformat(), exit_reason, pnl, pnl_pct,
+                 sell_order_id, sell_net_gbp, sell_fx_rate, sell_fees_gbp, trade_id),
             )
             logger.info(
                 "Trade %d closed: reason=%s P&L=£%.2f (%.2f%%)",

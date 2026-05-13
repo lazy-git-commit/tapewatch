@@ -153,7 +153,7 @@
       "datasource": { "type": "postgres", "uid": "trader-postgres" },
       "targets": [
         {
-          "rawSql": "SELECT ticker, ROUND(buy_price::numeric, 4) AS buy_price, ROUND(sell_price::numeric, 4) AS sell_price, ROUND(quantity::numeric, 4) AS quantity, ROUND(profit_loss::numeric, 2) AS pnl_gbp, ROUND(profit_loss_pct::numeric, 2) AS pnl_pct, exit_reason, sell_time FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
+          "rawSql": "SELECT ticker, ROUND(quantity::numeric, 4) AS quantity, ROUND(buy_price::numeric, 4) AS buy_price_usd, ROUND(buy_net_gbp::numeric, 2) AS buy_total_gbp, ROUND(buy_fees_gbp::numeric, 2) AS buy_fees_gbp, ROUND(buy_fx_rate::numeric, 4) AS buy_fx_rate, ROUND(sell_price::numeric, 4) AS sell_price_usd, ROUND(sell_net_gbp::numeric, 2) AS sell_total_gbp, ROUND(sell_fees_gbp::numeric, 2) AS sell_fees_gbp, ROUND(sell_fx_rate::numeric, 4) AS sell_fx_rate, ROUND(profit_loss::numeric, 2) AS pnl_gbp, ROUND(profit_loss_pct::numeric, 2) AS pnl_pct, exit_reason, sell_time FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
           "format": "table",
           "refId": "A"
         }

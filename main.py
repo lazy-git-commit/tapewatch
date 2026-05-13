@@ -104,6 +104,10 @@ def news_cycle() -> None:
             signal_id=signal_id,
             quantity=result.quantity,
             buy_price=result.price,
+            buy_order_id=result.order_id,
+            buy_net_gbp=result.net_gbp,
+            buy_fx_rate=result.fx_rate,
+            buy_fees_gbp=result.fees_gbp,
         )
         mark_signal_acted_on(signal_id)
 

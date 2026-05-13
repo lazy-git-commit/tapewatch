@@ -14,8 +14,9 @@ the portfolio's total value, capped to available cash.
 
 import base64
 import logging
+import time
 import requests
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from config.settings import cfg
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,35 @@ class OrderResult:
     price: float
     order_id: str | None
     error: str | None
+    net_gbp: float | None = None
+    fx_rate: float | None = None
+    fees_gbp: float | None = None
+
+
+def _fetch_fill(order_id: str) -> dict | None:
+    """Poll history/orders until the given order appears with a fill. Returns the fill dict or None."""
+    for _ in range(6):
+        time.sleep(2)
+        try:
+            data = _get("/equity/history/orders?limit=20")
+            for item in data.get("items", []):
+                if str(item.get("order", {}).get("id")) == order_id and "fill" in item:
+                    return item["fill"]
+        except Exception as exc:
+            logger.warning("Failed to fetch fill for order %s: %s", order_id, exc)
+    return None
+
+
+def _parse_fill(fill: dict) -> tuple[float | None, float | None, float | None, float | None]:
+    """Extract (filled_price, net_gbp, fx_rate, fees_gbp) from a Trading 212 fill dict."""
+    if not fill:
+        return None, None, None, None
+    filled_price = fill.get("price")
+    impact = fill.get("walletImpact", {})
+    net_gbp = impact.get("netValue")
+    fx_rate = impact.get("fxRate")
+    fees_gbp = sum(abs(t.get("quantity", 0)) for t in impact.get("taxes", []))
+    return filled_price, net_gbp, fx_rate, fees_gbp
 
 
 def get_portfolio_value() -> float | None:
@@ -125,10 +155,18 @@ def buy(ticker: str, price: float) -> OrderResult:
     try:
         order = _post("/equity/orders/market", {"quantity": quantity, "ticker": ticker})
         order_id = str(order.get("id", ""))
-        logger.info("BUY executed: %s × %.6f | order_id=%s", ticker, quantity, order_id)
+        fill = _fetch_fill(order_id)
+        filled_price, net_gbp, fx_rate, fees_gbp = _parse_fill(fill)
+        actual_price = filled_price if filled_price is not None else price
+        logger.info(
+            "BUY executed: %s × %.4f @ £%.4f | net=£%.2f fx=%.4f fees=£%.2f | order_id=%s",
+            ticker, quantity, actual_price,
+            net_gbp or 0, fx_rate or 0, fees_gbp or 0, order_id,
+        )
         return OrderResult(
             success=True, ticker=ticker, quantity=quantity,
-            price=price, order_id=order_id, error=None,
+            price=actual_price, order_id=order_id, error=None,
+            net_gbp=net_gbp, fx_rate=fx_rate, fees_gbp=fees_gbp,
         )
     except Exception as exc:
         logger.error("BUY failed for %s: %s", ticker, exc)
@@ -142,13 +180,18 @@ def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult
     try:
         order = _post("/equity/orders/market", {"quantity": -quantity, "ticker": ticker})
         order_id = str(order.get("id", ""))
+        fill = _fetch_fill(order_id)
+        filled_price, net_gbp, fx_rate, fees_gbp = _parse_fill(fill)
+        actual_price = filled_price if filled_price is not None else price
         logger.info(
-            "SELL executed: %s × %.6f | reason=%s | order_id=%s",
-            ticker, quantity, reason, order_id,
+            "SELL executed: %s × %.4f @ £%.4f | net=£%.2f fx=%.4f fees=£%.2f | reason=%s | order_id=%s",
+            ticker, quantity, actual_price,
+            net_gbp or 0, fx_rate or 0, fees_gbp or 0, reason, order_id,
         )
         return OrderResult(
             success=True, ticker=ticker, quantity=quantity,
-            price=price, order_id=order_id, error=None,
+            price=actual_price, order_id=order_id, error=None,
+            net_gbp=net_gbp, fx_rate=fx_rate, fees_gbp=fees_gbp,
         )
     except Exception as exc:
         logger.error("SELL failed for %s: %s", ticker, exc)

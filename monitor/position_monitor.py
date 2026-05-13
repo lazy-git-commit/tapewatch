@@ -100,7 +100,13 @@ def monitor_positions() -> None:
         result = sell(ticker, quantity, current_price, reason)
 
         if result.success:
-            close_trade(trade_id, current_price, reason)
+            close_trade(
+                trade_id, result.price, reason,
+                sell_order_id=result.order_id,
+                sell_net_gbp=result.net_gbp,
+                sell_fx_rate=result.fx_rate,
+                sell_fees_gbp=result.fees_gbp,
+            )
         else:
             logger.error(
                 "Sell order FAILED for trade %d (%s): %s",
