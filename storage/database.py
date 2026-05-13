@@ -80,20 +80,20 @@ def init_db() -> None:
                 snapshot_at TEXT    NOT NULL
             );
             """)
-        # Add new columns to existing tables without dropping data
-        for col, definition in [
-            ("buy_order_id",  "TEXT"),
-            ("sell_order_id", "TEXT"),
-            ("buy_net_gbp",   "REAL"),
-            ("sell_net_gbp",  "REAL"),
-            ("buy_fx_rate",   "REAL"),
-            ("sell_fx_rate",  "REAL"),
-            ("buy_fees_gbp",  "REAL"),
-            ("sell_fees_gbp", "REAL"),
-        ]:
-            cur.execute(
-                f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col} {definition}"
-            )
+            # Add new columns to existing tables without dropping data
+            for col, definition in [
+                ("buy_order_id",  "TEXT"),
+                ("sell_order_id", "TEXT"),
+                ("buy_net_gbp",   "REAL"),
+                ("sell_net_gbp",  "REAL"),
+                ("buy_fx_rate",   "REAL"),
+                ("sell_fx_rate",  "REAL"),
+                ("buy_fees_gbp",  "REAL"),
+                ("sell_fees_gbp", "REAL"),
+            ]:
+                cur.execute(
+                    f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col} {definition}"
+                )
     logger.info("Database initialised at %s", cfg.db_url.split("@")[-1])
 
 
