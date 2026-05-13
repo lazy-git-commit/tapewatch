@@ -98,8 +98,6 @@ def _parse_fill(fill: dict) -> tuple[float | None, float | None, float | None, f
 
 
 def get_portfolio_value() -> float | None:
-    if not cfg.is_live:
-        return cfg.demo_portfolio_value
     try:
         data = _get("/equity/account/cash")
         return float(data.get("total", 0))
@@ -109,8 +107,6 @@ def get_portfolio_value() -> float | None:
 
 
 def get_available_cash() -> float | None:
-    if not cfg.is_live:
-        return cfg.demo_portfolio_value
     try:
         data = _get("/equity/account/cash")
         return float(data.get("free", 0))

@@ -24,9 +24,6 @@ class Settings:
 
     # ── Trading Mode ──────────────────────────────────────────────────────────
     trading_mode: str = field(default_factory=lambda: os.getenv("TRADING_MODE", "demo"))
-    demo_portfolio_value: float = field(
-        default_factory=lambda: float(os.getenv("DEMO_PORTFOLIO_VALUE", "10000.0"))
-    )
 
     # ── Strategy Settings ─────────────────────────────────────────────────────
     min_sentiment_confidence: int = field(
