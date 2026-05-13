@@ -83,30 +83,6 @@ def init_db() -> None:
                 snapshot_at TEXT    NOT NULL
             );
             """)
-        # Run migrations in a fresh cursor — the CREATE TABLE cursor closes
-        # after executing multiple statements in a single execute() call.
-        with conn.cursor() as cur:
-            for col, definition in [
-                ("buy_order_id",  "TEXT"),
-                ("sell_order_id", "TEXT"),
-                ("buy_net_gbp",   "REAL"),
-                ("sell_net_gbp",  "REAL"),
-                ("buy_fx_rate",   "REAL"),
-                ("sell_fx_rate",  "REAL"),
-                ("buy_fees_gbp",  "REAL"),
-                ("sell_fees_gbp", "REAL"),
-            ]:
-                cur.execute(
-                    f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col} {definition}"
-                )
-            for col, definition in [
-                ("article_id",   "TEXT"),
-                ("published_at", "TEXT"),
-                ("fetched_at",   "TEXT"),
-            ]:
-                cur.execute(
-                    f"ALTER TABLE news_signals ADD COLUMN IF NOT EXISTS {col} {definition}"
-                )
     logger.info("Database initialised at %s", cfg.db_url.split("@")[-1])
 
 
