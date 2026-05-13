@@ -83,7 +83,9 @@ def init_db() -> None:
                 snapshot_at TEXT    NOT NULL
             );
             """)
-            # Add new columns to existing tables without dropping data
+        # Run migrations in a fresh cursor — the CREATE TABLE cursor closes
+        # after executing multiple statements in a single execute() call.
+        with conn.cursor() as cur:
             for col, definition in [
                 ("buy_order_id",  "TEXT"),
                 ("sell_order_id", "TEXT"),
