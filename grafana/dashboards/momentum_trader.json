@@ -167,7 +167,7 @@
       "datasource": { "type": "postgres", "uid": "trader-postgres" },
       "targets": [
         {
-          "rawSql": "SELECT created_at, ticker, sentiment, confidence, acted_on, headline, source FROM news_signals ORDER BY created_at DESC LIMIT 200",
+          "rawSql": "SELECT published_at, fetched_at, ticker, sentiment, confidence, acted_on, headline, source FROM news_signals ORDER BY fetched_at DESC LIMIT 200",
           "format": "table",
           "refId": "A"
         }

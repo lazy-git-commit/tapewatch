@@ -39,14 +39,17 @@ def init_db() -> None:
         with conn.cursor() as cur:
             cur.execute("""
             CREATE TABLE IF NOT EXISTS news_signals (
-                id          SERIAL PRIMARY KEY,
-                ticker      TEXT    NOT NULL,
-                headline    TEXT    NOT NULL,
-                source      TEXT,
-                sentiment   TEXT    NOT NULL,
-                confidence  INTEGER NOT NULL,
-                acted_on    INTEGER NOT NULL DEFAULT 0,
-                created_at  TEXT    NOT NULL
+                id           SERIAL PRIMARY KEY,
+                article_id   TEXT,
+                ticker       TEXT    NOT NULL,
+                headline     TEXT    NOT NULL,
+                source       TEXT,
+                sentiment    TEXT    NOT NULL,
+                confidence   INTEGER NOT NULL,
+                acted_on     INTEGER NOT NULL DEFAULT 0,
+                published_at TEXT,
+                fetched_at   TEXT    NOT NULL,
+                created_at   TEXT    NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS trades (
@@ -94,10 +97,28 @@ def init_db() -> None:
                 cur.execute(
                     f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col} {definition}"
                 )
+            for col, definition in [
+                ("article_id",   "TEXT"),
+                ("published_at", "TEXT"),
+                ("fetched_at",   "TEXT"),
+            ]:
+                cur.execute(
+                    f"ALTER TABLE news_signals ADD COLUMN IF NOT EXISTS {col} {definition}"
+                )
     logger.info("Database initialised at %s", cfg.db_url.split("@")[-1])
 
 
 # ── News signals ──────────────────────────────────────────────────────────────
+
+def is_article_seen(article_id: str) -> bool:
+    """Return True if this Benzinga article id has already been processed."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM news_signals WHERE article_id = %s LIMIT 1", (article_id,)
+            )
+            return cur.fetchone() is not None
+
 
 def save_signal(
     ticker: str,
@@ -105,16 +126,22 @@ def save_signal(
     source: str,
     sentiment: str,
     confidence: int,
+    article_id: str | None = None,
+    published_at: str | None = None,
+    fetched_at: str | None = None,
 ) -> int:
     """Insert a news signal. Returns the new row id."""
+    now = datetime.utcnow().isoformat()
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO news_signals
-                   (ticker, headline, source, sentiment, confidence, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s)
+                   (article_id, ticker, headline, source, sentiment, confidence,
+                    published_at, fetched_at, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
-                (ticker, headline, source, sentiment, confidence, datetime.utcnow().isoformat()),
+                (article_id, ticker, headline, source, sentiment, confidence,
+                 published_at, fetched_at or now, now),
             )
             return cur.fetchone()["id"]
 

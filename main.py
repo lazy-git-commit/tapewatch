@@ -19,12 +19,13 @@ import logging
 import signal
 import sys
 import time
+from datetime import datetime
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config.settings import cfg
-from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded
+from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded, is_article_seen
 from news.fetcher import fetch_all_news
 from market.price_check import confirm_price_signal, is_market_open
 from trading.executor import buy
@@ -55,7 +56,8 @@ def news_cycle() -> None:
         logger.info("Market is closed — skipping cycle.")
         return
 
-    news_items = fetch_all_news(lookback_hours=1)
+    fetched_at = datetime.utcnow().isoformat()
+    news_items = fetch_all_news(lookback_minutes=5)
     if not news_items:
         logger.info("No new articles found.")
         return
@@ -69,6 +71,11 @@ def news_cycle() -> None:
             item.ticker, source_tag, item.headline,
         )
 
+        # Skip articles already processed in a previous cycle
+        if is_article_seen(item.article_id):
+            logger.debug("Skipping %s — article %s already processed", item.ticker, item.article_id)
+            continue
+
         # Skip if already holding or bought in the last 24 hours
         if was_recently_traded(item.ticker):
             logger.info("Skipping %s — already traded within the last 24 hours", item.ticker)
@@ -81,6 +88,9 @@ def news_cycle() -> None:
             source=item.source,
             sentiment="BULLISH",
             confidence=9 if item.is_wiim else 7,
+            article_id=item.article_id,
+            published_at=item.published_at.isoformat(),
+            fetched_at=fetched_at,
         )
 
         # Price confirmation
@@ -138,10 +148,10 @@ def main() -> None:
 
     scheduler.add_job(
         news_cycle,
-        trigger=IntervalTrigger(minutes=cfg.news_poll_interval_minutes),
+        trigger=IntervalTrigger(minutes=1),
         id="news_cycle",
         name="News → Price Check → Buy",
-        misfire_grace_time=60,
+        misfire_grace_time=30,
     )
 
     scheduler.add_job(
@@ -157,10 +167,7 @@ def main() -> None:
     news_cycle()
 
     scheduler.start()
-    logger.info(
-        "Scheduler running. News cycle every %d min. Press Ctrl+C to stop.",
-        cfg.news_poll_interval_minutes,
-    )
+    logger.info("Scheduler running. News cycle every 1 min. Press Ctrl+C to stop.")
 
     # Keep the main thread alive; handle Ctrl+C gracefully
     def _shutdown(sig, frame):

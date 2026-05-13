@@ -32,6 +32,7 @@ _TIMEOUT = 10
 
 @dataclass
 class NewsItem:
+    article_id: str
     ticker: str
     headline: str
     body: str
@@ -40,9 +41,9 @@ class NewsItem:
     is_wiim: bool  # True = Why Is It Moving signal
 
 
-def _parse_articles(xml_text: str, lookback_hours: int) -> list[dict]:
+def _parse_articles(xml_text: str, lookback_minutes: int) -> list[dict]:
     """Parse Benzinga XML response into a list of article dicts."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
     articles = []
     try:
         root = ET.fromstring(xml_text)
@@ -92,16 +93,17 @@ def _fetch(params: dict) -> str:
         return ""
 
 
-def fetch_wiim(lookback_hours: int = 1) -> list[NewsItem]:
+def fetch_wiim(lookback_minutes: int = 5) -> list[NewsItem]:
     """Fetch Why Is It Moving articles — stocks already confirmed moving."""
     xml = _fetch({"channels": "WIIM", "pageSize": 100})
     items = []
-    for article in _parse_articles(xml, lookback_hours):
+    for article in _parse_articles(xml, lookback_minutes):
         for ticker in article["tickers"]:
             t212_ticker = f"{ticker}_US_EQ"
             if t212_ticker in cfg.blocklist:
                 continue
             items.append(NewsItem(
+                article_id=article["id"],
                 ticker=t212_ticker,
                 headline=article["title"],
                 body=article["body"],
@@ -113,16 +115,17 @@ def fetch_wiim(lookback_hours: int = 1) -> list[NewsItem]:
     return items
 
 
-def fetch_news(lookback_hours: int = 1) -> list[NewsItem]:
+def fetch_news(lookback_minutes: int = 5) -> list[NewsItem]:
     """Fetch general market news for early signals."""
     xml = _fetch({"pageSize": 100})
     items = []
-    for article in _parse_articles(xml, lookback_hours):
+    for article in _parse_articles(xml, lookback_minutes):
         for ticker in article["tickers"]:
             t212_ticker = f"{ticker}_US_EQ"
             if t212_ticker in cfg.blocklist:
                 continue
             items.append(NewsItem(
+                article_id=article["id"],
                 ticker=t212_ticker,
                 headline=article["title"],
                 body=article["body"],
@@ -134,7 +137,7 @@ def fetch_news(lookback_hours: int = 1) -> list[NewsItem]:
     return items
 
 
-def fetch_all_news(lookback_hours: int = 1) -> list[NewsItem]:
+def fetch_all_news(lookback_minutes: int = 5) -> list[NewsItem]:
     """
     Fetch from both WIIM and general news, deduplicate by headline,
     and prioritise WIIM signals (they appear first in results).
@@ -142,7 +145,7 @@ def fetch_all_news(lookback_hours: int = 1) -> list[NewsItem]:
     seen: set[str] = set()
     results: list[NewsItem] = []
 
-    for item in fetch_wiim(lookback_hours) + fetch_news(lookback_hours):
+    for item in fetch_wiim(lookback_minutes) + fetch_news(lookback_minutes):
         key = item.headline.strip().lower()
         if key not in seen:
             seen.add(key)

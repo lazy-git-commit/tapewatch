@@ -74,11 +74,13 @@ class TestSentimentParsing:
         from news.fetcher import NewsItem
         from datetime import datetime, timezone
         return NewsItem(
+            article_id="test-001",
             ticker="AAPL_US_EQ",
             headline="Apple reports record quarterly earnings",
             body="Apple beat analyst estimates by 20% with record services revenue.",
             source="test",
             published_at=datetime.now(timezone.utc),
+            is_wiim=False,
         )
 
     @patch("analysis.sentiment._get_client")
