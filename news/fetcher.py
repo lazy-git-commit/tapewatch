@@ -1,33 +1,29 @@
 """
 news/fetcher.py
 ───────────────
-Fetches actionable trading signals from two Benzinga endpoints:
+Fetches real-time financial news from finlight.me and filters to
+positive/bullish signals for US equities.
 
-  1. WIIM (Why Is It Moving) — articles that explain a current price move.
-     These are the highest-quality signals: Benzinga has already determined
-     the stock is moving and why.
+Finlight provides built-in sentiment (positive/neutral/negative) and a
+confidence score (0–1), so no separate Claude sentiment call is needed.
 
-  2. General News — broad market news filtered to known tickers.
-     Used as a secondary source for early signals before WIIM is published.
-
-Both endpoints return XML. Tickers are extracted directly from the
-<stocks> tags — no keyword matching needed.
-
-Signals are filtered against the blocklist and deduplicated by article id.
+Rate limit: 10,000 requests/month on the current plan. The monthly
+request count is tracked in the DB; fetching is halted gracefully if
+the limit is reached to avoid a hard API error.
 """
 
 import logging
 import requests
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 from config.settings import cfg
+from storage.database import get_api_request_count, increment_api_request_count
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL = "https://api.benzinga.com/api/v2/news"
+_BASE_URL = "https://api.finlight.me/v2/articles"
 _TIMEOUT = 10
+_MONTHLY_LIMIT = 10_000
 
 
 @dataclass
@@ -38,123 +34,106 @@ class NewsItem:
     body: str
     source: str
     published_at: datetime
-    is_wiim: bool  # True = Why Is It Moving signal
+    sentiment: str    # "positive" | "neutral" | "negative"
+    confidence: float  # 0.0–1.0 as returned by finlight
 
 
-def _parse_articles(xml_text: str, lookback_minutes: int) -> list[dict]:
-    """Parse Benzinga XML response into a list of article dicts."""
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
-    articles = []
+def _fetch(lookback_minutes: int) -> list[dict]:
+    """POST to finlight.me and return raw article dicts."""
+    since = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+    payload = {
+        "from": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "language": "en",
+        "countries": ["US"],
+        "pageSize": 100,
+    }
     try:
-        root = ET.fromstring(xml_text)
-        for item in root.findall("item"):
-            created_str = item.findtext("created", "")
-            try:
-                published_at = parsedate_to_datetime(created_str)
-                if published_at.tzinfo is None:
-                    published_at = published_at.replace(tzinfo=timezone.utc)
-            except Exception:
-                published_at = datetime.now(timezone.utc)
-
-            if published_at < cutoff:
-                continue
-
-            tickers = [
-                s.findtext("name", "").strip()
-                for s in item.findall("./stocks/item")
-                if s.findtext("sector", "") == "Equity"
-            ]
-            channels = [c.findtext("name", "") for c in item.findall("./channels/item")]
-
-            articles.append({
-                "id": item.findtext("id", ""),
-                "title": item.findtext("title", ""),
-                "body": item.findtext("teaser", "") or item.findtext("body", ""),
-                "tickers": tickers,
-                "channels": channels,
-                "published_at": published_at,
-                "is_wiim": "WIIM" in channels,
-            })
-    except ET.ParseError as exc:
-        logger.warning("Benzinga XML parse error: %s", exc)
-    return articles
-
-
-def _fetch(params: dict) -> str:
-    """Make a single Benzinga API request and return raw XML."""
-    params["token"] = cfg.benzinga_api_key
-    params["displayOutput"] = "abstract"
-    try:
-        response = requests.get(_BASE_URL, params=params, timeout=_TIMEOUT)
-        response.raise_for_status()
-        return response.text
+        resp = requests.post(
+            _BASE_URL,
+            json=payload,
+            headers={"X-API-KEY": cfg.finlight_api_key},
+            timeout=_TIMEOUT,
+        )
+        if resp.status_code == 429:
+            logger.error("Finlight rate limit hit (429) — monthly quota exhausted")
+            return []
+        resp.raise_for_status()
+        increment_api_request_count()
+        return resp.json().get("articles", [])
     except requests.RequestException as exc:
-        logger.warning("Benzinga API request failed: %s", exc)
-        return ""
+        logger.warning("Finlight API request failed: %s", exc)
+        return []
 
 
-def fetch_wiim(lookback_minutes: int = 5) -> list[NewsItem]:
-    """Fetch Why Is It Moving articles — stocks already confirmed moving."""
-    xml = _fetch({"channels": "WIIM", "pageSize": 100})
-    items = []
-    for article in _parse_articles(xml, lookback_minutes):
-        for ticker in article["tickers"]:
-            t212_ticker = f"{ticker}_US_EQ"
-            if t212_ticker in cfg.blocklist:
-                continue
-            items.append(NewsItem(
-                article_id=article["id"],
-                ticker=t212_ticker,
-                headline=article["title"],
-                body=article["body"],
-                source="Benzinga WIIM",
-                published_at=article["published_at"],
-                is_wiim=True,
-            ))
-    logger.info("Benzinga WIIM: %d signals", len(items))
-    return items
-
-
-def fetch_news(lookback_minutes: int = 5) -> list[NewsItem]:
-    """Fetch general market news for early signals."""
-    xml = _fetch({"pageSize": 100})
-    items = []
-    for article in _parse_articles(xml, lookback_minutes):
-        for ticker in article["tickers"]:
-            t212_ticker = f"{ticker}_US_EQ"
-            if t212_ticker in cfg.blocklist:
-                continue
-            items.append(NewsItem(
-                article_id=article["id"],
-                ticker=t212_ticker,
-                headline=article["title"],
-                body=article["body"],
-                source="Benzinga News",
-                published_at=article["published_at"],
-                is_wiim=False,
-            ))
-    logger.info("Benzinga News: %d articles matched", len(items))
-    return items
-
-
-def fetch_all_news(lookback_minutes: int = 5) -> list[NewsItem]:
+def fetch_all_news(lookback_minutes: int = 5) -> list["NewsItem"]:
     """
-    Fetch from both WIIM and general news, deduplicate by headline,
-    and prioritise WIIM signals (they appear first in results).
+    Fetch recent US equity news from finlight.me.
+    Returns only positive-sentiment articles with tickers, deduplicated by article id.
+    Stops fetching if the monthly request limit is reached.
     """
-    seen: set[str] = set()
+    used = get_api_request_count()
+    if used >= _MONTHLY_LIMIT:
+        logger.error(
+            "Finlight monthly limit reached (%d/%d) — skipping fetch until next month",
+            used, _MONTHLY_LIMIT,
+        )
+        return []
+
+    remaining = _MONTHLY_LIMIT - used
+    logger.info("Finlight requests used this month: %d/%d", used, _MONTHLY_LIMIT)
+    if remaining <= 50:
+        logger.warning("Finlight quota nearly exhausted — %d requests remaining", remaining)
+
+    articles = _fetch(lookback_minutes)
+    if not articles:
+        return []
+
+    seen_ids: set[str] = set()
     results: list[NewsItem] = []
 
-    for item in fetch_wiim(lookback_minutes) + fetch_news(lookback_minutes):
-        key = item.headline.strip().lower()
-        if key not in seen:
-            seen.add(key)
-            results.append(item)
+    for article in articles:
+        sentiment = article.get("sentiment", "neutral").lower()
+        if sentiment != "positive":
+            continue
 
-    wiim_count = sum(1 for i in results if i.is_wiim)
+        companies = article.get("companies", [])
+        tickers = [
+            c["ticker"]
+            for c in companies
+            if c.get("ticker") and c.get("country") == "US"
+        ]
+        if not tickers:
+            continue
+
+        article_id = article.get("link", article.get("title", ""))
+        if article_id in seen_ids:
+            continue
+        seen_ids.add(article_id)
+
+        try:
+            published_at = datetime.fromisoformat(
+                article.get("publishDate", "").replace("Z", "+00:00")
+            )
+        except (ValueError, AttributeError):
+            published_at = datetime.now(timezone.utc)
+
+        for ticker in tickers:
+            t212_ticker = f"{ticker}_US_EQ"
+            if t212_ticker in cfg.blocklist:
+                continue
+            results.append(NewsItem(
+                article_id=article_id,
+                ticker=t212_ticker,
+                headline=article.get("title", ""),
+                body=article.get("summary") or "",
+                source=article.get("source", "finlight"),
+                published_at=published_at,
+                sentiment=sentiment,
+                confidence=float(article.get("confidence", 0.0)),
+            ))
+
     logger.info(
-        "Fetched %d unique news items (%d WIIM, %d general) across %d tickers",
-        len(results), wiim_count, len(results) - wiim_count,
-        len({i.ticker for i in results}),
+        "Finlight: %d positive article(s) → %d ticker signal(s)",
+        len(seen_ids), len(results),
     )
     return results

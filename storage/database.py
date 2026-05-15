@@ -85,6 +85,13 @@ def init_db() -> None:
                     snapshot_at TEXT    NOT NULL
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS api_usage (
+                    id          SERIAL PRIMARY KEY,
+                    month       TEXT    NOT NULL UNIQUE,
+                    requests    INTEGER NOT NULL DEFAULT 0
+                )
+            """)
     logger.info("Database initialised at %s", cfg.db_url.split("@")[-1])
 
 
@@ -244,4 +251,32 @@ def save_snapshot(total_value: float, cash: Optional[float] = None) -> None:
                 """INSERT INTO portfolio_snapshots (total_value, cash, snapshot_at)
                    VALUES (%s, %s, %s)""",
                 (total_value, cash, datetime.utcnow().isoformat()),
+            )
+
+
+# ── API usage tracking ────────────────────────────────────────────────────────
+
+def _current_month() -> str:
+    return datetime.utcnow().strftime("%Y-%m")
+
+
+def get_api_request_count() -> int:
+    """Return the number of finlight API requests made in the current calendar month."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT requests FROM api_usage WHERE month = %s", (_current_month(),)
+            )
+            row = cur.fetchone()
+            return row["requests"] if row else 0
+
+
+def increment_api_request_count() -> None:
+    """Increment the finlight request counter for the current month by 1."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO api_usage (month, requests) VALUES (%s, 1)
+                   ON CONFLICT (month) DO UPDATE SET requests = api_usage.requests + 1""",
+                (_current_month(),),
             )

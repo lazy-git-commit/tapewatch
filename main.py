@@ -4,8 +4,8 @@ main.py
 Entry point for the momentum trader.
 
 Starts two scheduled jobs:
-  1. news_cycle  — runs every cfg.news_poll_interval_minutes minutes
-                   fetches Benzinga signals → price check → buy
+  1. news_cycle  — runs every minute
+                   fetches finlight.me signals → price check → buy
   2. monitor_job — runs every 60 seconds
                    checks open positions → sell if exit condition met
 
@@ -46,7 +46,7 @@ def news_cycle() -> None:
     """
     The main trading pipeline — runs on a schedule.
 
-      1. Fetch signals from Benzinga (WIIM + general news)
+      1. Fetch positive signals from finlight.me
       2. Confirm price movement via yfinance
       3. Execute a buy via Trading 212 if confirmed
     """
@@ -65,11 +65,7 @@ def news_cycle() -> None:
     logger.info("%d article(s) to evaluate.", len(news_items))
 
     for item in news_items:
-        source_tag = "WIIM" if item.is_wiim else "news"
-        logger.info(
-            "Signal [%s][%s]: %s",
-            item.ticker, source_tag, item.headline,
-        )
+        logger.info("Signal [%s] %.0f%% confidence: %s", item.ticker, item.confidence * 100, item.headline)
 
         # Skip articles already processed in a previous cycle
         if is_article_seen(item.article_id):
@@ -81,13 +77,14 @@ def news_cycle() -> None:
             logger.info("Skipping %s — already traded within the last 24 hours", item.ticker)
             continue
 
-        # Save signal to DB
+        # Save signal to DB — map finlight confidence (0–1) to 1–10 scale
+        confidence_scaled = max(1, min(10, round(item.confidence * 10)))
         signal_id = save_signal(
             ticker=item.ticker,
             headline=item.headline,
             source=item.source,
             sentiment="BULLISH",
-            confidence=9 if item.is_wiim else 7,
+            confidence=confidence_scaled,
             article_id=item.article_id,
             published_at=item.published_at.isoformat(),
             fetched_at=fetched_at,
