@@ -4,8 +4,9 @@ main.py
 Entry point for the momentum trader.
 
 Starts two scheduled jobs:
-  1. news_cycle  — runs every minute
+  1. news_cycle  — runs every minute during market hours
                    fetches finlight.me signals → price check → buy
+                   sleeps until the next NYSE open when the market is closed
   2. monitor_job — runs every 60 seconds
                    checks open positions → sell if exit condition met
 
@@ -23,11 +24,12 @@ from datetime import datetime
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from config.settings import cfg
 from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded, is_article_seen
 from news.fetcher import fetch_all_news
-from market.price_check import confirm_price_signal, is_market_open
+from market.price_check import confirm_price_signal, is_market_open, is_too_late_to_buy, next_market_open
 from trading.executor import buy
 from monitor.position_monitor import monitor_positions
 from reporting.report import generate_report
@@ -42,6 +44,35 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+_scheduler: BackgroundScheduler | None = None  # set in main() before first use
+
+
+def _reschedule_for_market_open() -> None:
+    """Switch the news_cycle job to fire once at the next market open."""
+    if _scheduler is None or not _scheduler.running:
+        return
+    open_utc = next_market_open()
+    _scheduler.reschedule_job(
+        "news_cycle",
+        trigger=DateTrigger(run_date=open_utc, timezone=pytz.utc),
+    )
+    logger.info(
+        "Market closed — news cycle paused until %s UTC",
+        open_utc.strftime("%Y-%m-%d %H:%M"),
+    )
+
+
+def _reschedule_for_interval() -> None:
+    """Switch the news_cycle job back to 1-minute polling."""
+    if _scheduler is None or not _scheduler.running:
+        return
+    _scheduler.reschedule_job(
+        "news_cycle",
+        trigger=IntervalTrigger(minutes=1),
+    )
+    logger.info("Market open — news cycle resumed (1-min interval)")
+
+
 def news_cycle() -> None:
     """
     The main trading pipeline — runs on a schedule.
@@ -49,11 +80,31 @@ def news_cycle() -> None:
       1. Fetch positive signals from finlight.me
       2. Confirm price movement via yfinance
       3. Execute a buy via Trading 212 if confirmed
+
+    When the market is closed, reschedules itself to fire at the next NYSE open
+    instead of polling every minute.
     """
     logger.info("── News cycle starting ──────────────────────────────────")
 
     if not is_market_open():
-        logger.info("Market is closed — skipping cycle.")
+        open_utc = next_market_open()
+        logger.info(
+            "Market closed — next open at %s UTC",
+            open_utc.strftime("%Y-%m-%d %H:%M"),
+        )
+        _reschedule_for_market_open()
+        return
+
+    # If we were sleeping until market open, switch back to 1-min polling
+    job = _scheduler.get_job("news_cycle")
+    if job and not isinstance(job.trigger, IntervalTrigger):
+        _reschedule_for_interval()
+
+    if is_too_late_to_buy():
+        logger.info(
+            "Too close to market close to open new positions (time stop: %d min) — skipping cycle.",
+            cfg.time_stop_minutes,
+        )
         return
 
     fetched_at = datetime.utcnow().isoformat()
@@ -141,9 +192,10 @@ def main() -> None:
     print(generate_report())
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
-    scheduler = BackgroundScheduler(timezone=pytz.utc)
+    global _scheduler
+    _scheduler = BackgroundScheduler(timezone=pytz.utc)
 
-    scheduler.add_job(
+    _scheduler.add_job(
         news_cycle,
         trigger=IntervalTrigger(minutes=1),
         id="news_cycle",
@@ -151,7 +203,7 @@ def main() -> None:
         misfire_grace_time=30,
     )
 
-    scheduler.add_job(
+    _scheduler.add_job(
         monitor_positions,
         trigger=IntervalTrigger(seconds=60),
         id="monitor",
@@ -159,17 +211,17 @@ def main() -> None:
         misfire_grace_time=30,
     )
 
-    # Run once immediately so you see it working straight away
+    # Run once immediately — this also sets the right trigger if market is closed
     logger.info("Running initial news cycle...")
     news_cycle()
 
-    scheduler.start()
+    _scheduler.start()
     logger.info("Scheduler running. News cycle every 1 min. Press Ctrl+C to stop.")
 
     # Keep the main thread alive; handle Ctrl+C gracefully
     def _shutdown(sig, frame):
         logger.info("Shutting down...")
-        scheduler.shutdown(wait=False)
+        _scheduler.shutdown(wait=False)
         print("\n" + generate_report())
         sys.exit(0)
 

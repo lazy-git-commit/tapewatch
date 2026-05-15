@@ -17,6 +17,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 import yfinance as yf
 from dataclasses import dataclass
+import pytz
 from config.settings import cfg
 
 logger = logging.getLogger(__name__)
@@ -25,9 +26,46 @@ logger = logging.getLogger(__name__)
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 
+_ET = pytz.timezone("America/New_York")
+_MARKET_OPEN = (9, 30)   # 09:30 ET
+_MARKET_CLOSE = (16, 0)  # 16:00 ET
+
+
+def next_market_open() -> datetime:
+    """
+    Return the next NYSE market open as a UTC-aware datetime.
+    If called during market hours, returns today's open (already passed).
+    Skips weekends.
+    """
+    now_et = datetime.now(_ET)
+    candidate = now_et.replace(hour=_MARKET_OPEN[0], minute=_MARKET_OPEN[1], second=0, microsecond=0)
+
+    # If today's open is still in the future, that's our answer
+    if candidate > now_et and now_et.weekday() < 5:
+        return candidate.astimezone(timezone.utc)
+
+    # Otherwise advance to the next weekday
+    candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:  # 5=Sat, 6=Sun
+        candidate += timedelta(days=1)
+
+    return candidate.astimezone(timezone.utc)
+
+
 def _to_yf_ticker(t212_ticker: str) -> str:
     """Strip Trading 212 suffix to get a yfinance-compatible ticker."""
     return t212_ticker.split("_")[0]
+
+
+def is_too_late_to_buy() -> bool:
+    """
+    Return True if there is not enough time before market close to hold a
+    position for the full TIME_STOP_MINUTES window.
+    """
+    now_et = datetime.now(_ET)
+    close_et = now_et.replace(hour=_MARKET_CLOSE[0], minute=_MARKET_CLOSE[1], second=0, microsecond=0)
+    minutes_to_close = (close_et - now_et).total_seconds() / 60
+    return minutes_to_close <= cfg.time_stop_minutes
 
 
 def is_market_open() -> bool:
