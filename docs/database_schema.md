@@ -14,9 +14,9 @@ One row per news article-ticker pair that the system evaluated. An article menti
 | `article_id` | TEXT | Benzinga's own article ID. Used to deduplicate across poll cycles — if the same article appears on the next API call, it is skipped without re-analysis. |
 | `ticker` | TEXT | Trading 212 instrument code (e.g. `AAPL_US_EQ`). |
 | `headline` | TEXT | Article headline as returned by Benzinga. |
-| `source` | TEXT | Either `"Benzinga WIIM"` (Why Is It Moving) or `"Benzinga News"` (general news). WIIM signals are higher quality — Benzinga has already confirmed the stock is moving. |
-| `sentiment` | TEXT | Always `"BULLISH"` for now — only bullish signals trigger a buy. |
-| `confidence` | INTEGER | Confidence score 1–10. WIIM articles score 9, general news scores 7. |
+| `source` | TEXT | Always `"benzinga"` — the news provider. |
+| `sentiment` | TEXT | Always `"BULLISH"` for now — only positive-sentiment articles trigger a buy. |
+| `confidence` | INTEGER | Confidence score 1–10, derived from Claude Haiku's classification (raw 0.0–1.0 × 10, rounded). |
 | `acted_on` | INTEGER | `0` = evaluated but no trade placed; `1` = a buy order was executed for this signal. |
 | `published_at` | TEXT | ISO 8601 UTC timestamp of when Benzinga published the article. |
 | `fetched_at` | TEXT | ISO 8601 UTC timestamp of when our news cycle fetched this article from the API. The gap between `published_at` and `fetched_at` shows detection latency. |
