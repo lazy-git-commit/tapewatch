@@ -20,7 +20,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -48,13 +48,19 @@ _scheduler: BackgroundScheduler | None = None  # set in main() before first use
 
 
 def _reschedule_for_market_open() -> None:
-    """Switch the news_cycle job to fire once at the next market open."""
+    """Switch the news_cycle job to fire once at the next market open.
+    Uses add_job with replace_existing=True because APScheduler removes a
+    DateTrigger job after it fires — reschedule_job would raise JobLookupError."""
     if _scheduler is None or not _scheduler.running:
         return
     open_utc = next_market_open()
-    _scheduler.reschedule_job(
-        "news_cycle",
+    _scheduler.add_job(
+        news_cycle,
         trigger=DateTrigger(run_date=open_utc, timezone=pytz.utc),
+        id="news_cycle",
+        name="News → Price Check → Buy",
+        misfire_grace_time=30,
+        replace_existing=True,
     )
     logger.info(
         "Market closed — news cycle paused until %s UTC",
@@ -66,9 +72,13 @@ def _reschedule_for_interval() -> None:
     """Switch the news_cycle job back to 1-minute polling."""
     if _scheduler is None or not _scheduler.running:
         return
-    _scheduler.reschedule_job(
-        "news_cycle",
+    _scheduler.add_job(
+        news_cycle,
         trigger=IntervalTrigger(minutes=1),
+        id="news_cycle",
+        name="News → Price Check → Buy",
+        misfire_grace_time=30,
+        replace_existing=True,
     )
     logger.info("Market open — news cycle resumed (1-min interval)")
 
@@ -107,7 +117,7 @@ def news_cycle() -> None:
         )
         return
 
-    fetched_at = datetime.utcnow().isoformat()
+    fetched_at = datetime.now(timezone.utc).isoformat()
     news_items = fetch_all_news(lookback_minutes=5)
     if not news_items:
         logger.info("No new articles found.")
