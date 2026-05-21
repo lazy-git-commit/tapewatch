@@ -5,7 +5,7 @@ Entry point for the momentum trader.
 
 Starts two scheduled jobs:
   1. news_cycle  — runs every minute during market hours
-                   fetches finlight.me signals → price check → buy
+                   fetches Benzinga signals → Claude sentiment → price check → buy
                    sleeps until the next NYSE open when the market is closed
   2. monitor_job — runs every 60 seconds
                    checks open positions → sell if exit condition met
@@ -77,7 +77,7 @@ def news_cycle() -> None:
     """
     The main trading pipeline — runs on a schedule.
 
-      1. Fetch positive signals from finlight.me
+      1. Fetch and score positive signals from Benzinga via Claude
       2. Confirm price movement via yfinance
       3. Execute a buy via Trading 212 if confirmed
 
@@ -128,7 +128,7 @@ def news_cycle() -> None:
             logger.info("Skipping %s — already traded within the last 24 hours", item.ticker)
             continue
 
-        # Save signal to DB — map finlight confidence (0–1) to 1–10 scale
+        # Save signal to DB — map Claude confidence (0–1) to 1–10 scale
         confidence_scaled = max(1, min(10, round(item.confidence * 10)))
         signal_id = save_signal(
             ticker=item.ticker,

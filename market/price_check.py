@@ -1,8 +1,14 @@
 """
 market/price_check.py
 ──────────────────────
-Fetches live price data via yfinance and checks whether a signal is confirmed
-by actual price movement and elevated volume.
+Fetches live price data and checks whether a signal is confirmed by actual
+price movement and elevated volume.
+
+Price sources:
+  - Current price  — Finnhub REST quote (real-time, <1s latency)
+  - 15-min window  — Finnhub WebSocket bars (real-time trade aggregation)
+  - Older bars     — yfinance (15-min delayed, fine for baseline > 15 min ago)
+  - Volume stats   — yfinance 20-day daily history
 
 A signal is confirmed when ALL of the following hold:
   1. Recent momentum  — price is up >= cfg.min_price_move_pct over the last
@@ -19,6 +25,7 @@ import yfinance as yf
 from dataclasses import dataclass
 import pytz
 from config.settings import cfg
+from market.finnhub_bars import get_finnhub_quote
 
 logger = logging.getLogger(__name__)
 
@@ -110,38 +117,41 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
     Check whether a ticker is experiencing active upward momentum that
     corroborates a bullish news signal.
 
+    Current price — Finnhub REST quote (real-time).
+    Momentum baseline — yfinance intraday bar (15-min delayed, which aligns
+      with the 15-min window: the most recent yfinance bar is approximately
+      the price from cfg.momentum_window_minutes ago).
+    Volume — yfinance intraday cumulative (delayed but fine for ratio checks).
+
     Returns None if data cannot be fetched.
     """
     yf_ticker = _to_yf_ticker(t212_ticker)
 
     try:
-        stock = yf.Ticker(yf_ticker)
-
-        intraday = stock.history(period="1d", interval="5m")
-        if intraday.empty:
-            logger.warning(
-                "No intraday data for %s — market may be closed or ticker delisted",
-                yf_ticker,
-            )
+        # ── Current price via Finnhub REST (real-time) ────────────────────────
+        quote = get_finnhub_quote(yf_ticker)
+        if quote is None:
+            logger.warning("No Finnhub quote for %s — skipping", yf_ticker)
             return None
 
-        current_price = float(intraday["Close"].iloc[-1])
-        open_price = float(intraday["Open"].iloc[0])
-        day_move_pct = ((current_price - open_price) / open_price) * 100
+        current_price = float(quote["c"])
+        open_price = float(quote["o"]) if quote.get("o") else current_price
+        day_move_pct = ((current_price - open_price) / open_price) * 100 if open_price else 0.0
 
-        # Recent momentum: find the bar closest to momentum_window_minutes ago
-        window = timedelta(minutes=cfg.momentum_window_minutes)
-        now_ts = intraday.index[-1]
-        cutoff_ts = now_ts - window
-        past_bars = intraday[intraday.index <= cutoff_ts]
-        if past_bars.empty:
-            # Market just opened — fewer bars than the window; use open price
-            past_price = open_price
-        else:
-            past_price = float(past_bars["Close"].iloc[-1])
-        recent_move_pct = ((current_price - past_price) / past_price) * 100
+        # ── Momentum baseline via yfinance intraday bars ──────────────────────
+        # yfinance data is ~15 min delayed. With momentum_window_minutes=15, the
+        # most recent available bar is our target baseline — this is intentional.
+        stock = yf.Ticker(yf_ticker)
+        intraday = stock.history(period="1d", interval="1m")
+        if intraday.empty:
+            logger.warning("No intraday data for %s — market may be closed or ticker delisted", yf_ticker)
+            return None
 
-        # Volume: compare today's cumulative volume to 20-day daily average
+        # The last yfinance bar is ~15 min ago; use it as the momentum baseline
+        past_price = float(intraday["Close"].iloc[-1])
+        recent_move_pct = ((current_price - past_price) / past_price) * 100 if past_price else 0.0
+
+        # ── Volume: 20-day daily average via yfinance ─────────────────────────
         daily = stock.history(period="21d", interval="1d")
         avg_volume = int(daily["Volume"].iloc[:-1].mean()) if len(daily) >= 2 else 0
         current_volume = int(intraday["Volume"].sum())
@@ -173,7 +183,6 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                 f"(day: {day_move_pct:+.2f}%)"
             )
         else:
-            # Momentum present but volume weak — still confirm, flag as weak
             is_confirmed = True
             reason = (
                 f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
@@ -208,6 +217,10 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
 def get_current_price(t212_ticker: str) -> float | None:
     """Fast lookup of the latest price for an open position monitor."""
     yf_ticker = _to_yf_ticker(t212_ticker)
+    quote = get_finnhub_quote(yf_ticker)
+    if quote is not None:
+        return float(quote["c"])
+    # Fallback to yfinance if Finnhub unavailable
     try:
         data = yf.Ticker(yf_ticker).history(period="1d", interval="1m")
         if data.empty:

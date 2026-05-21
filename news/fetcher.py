@@ -1,29 +1,26 @@
 """
 news/fetcher.py
 ───────────────
-Fetches real-time financial news from finlight.me and filters to
-positive/bullish signals for US equities.
+Fetches real-time financial news from Benzinga (via massive.com) and
+scores sentiment using Claude to identify bullish US equity signals.
 
-Finlight provides built-in sentiment (positive/neutral/negative) and a
-confidence score (0–1), so no separate Claude sentiment call is needed.
-
-Rate limit: 10,000 requests/month on the current plan. The monthly
-request count is tracked in the DB; fetching is halted gracefully if
-the limit is reached to avoid a hard API error.
+Benzinga provides breaking news with ticker symbols but no built-in
+sentiment — Claude classifies each article as bullish/bearish/neutral.
 """
 
+import json
 import logging
 import requests
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import anthropic
 from config.settings import cfg
-from storage.database import get_api_request_count, increment_api_request_count
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL = "https://api.finlight.me/v2/articles"
+_BASE_URL = "https://api.massive.com/benzinga/v2/news"
 _TIMEOUT = 10
-_MONTHLY_LIMIT = 10_000
+_claude = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
 
 
 @dataclass
@@ -35,55 +32,72 @@ class NewsItem:
     source: str
     published_at: datetime
     sentiment: str    # "positive" | "neutral" | "negative"
-    confidence: float  # 0.0–1.0 as returned by finlight
+    confidence: float  # 0.0–1.0
 
 
 def _fetch(lookback_minutes: int) -> list[dict]:
-    """POST to finlight.me and return raw article dicts."""
+    """GET from Benzinga via massive.com and return raw article dicts."""
     since = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
-    payload = {
-        "from": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "language": "en",
-        "countries": ["US"],
-        "pageSize": 100,
+    params = {
+        "published.gte": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": 100,
+        "sort": "published.desc",
     }
     try:
-        resp = requests.post(
+        resp = requests.get(
             _BASE_URL,
-            json=payload,
-            headers={"X-API-KEY": cfg.finlight_api_key},
+            headers={"Authorization": f"Bearer {cfg.benzinga_api_key}"},
+            params=params,
             timeout=_TIMEOUT,
         )
-        if resp.status_code == 429:
-            logger.error("Finlight rate limit hit (429) — monthly quota exhausted")
-            return []
         resp.raise_for_status()
-        increment_api_request_count()
         return resp.json().get("articles", [])
     except requests.RequestException as exc:
-        logger.warning("Finlight API request failed: %s", exc)
+        logger.warning("Benzinga API request failed: %s", exc)
         return []
 
 
-def fetch_all_news(lookback_minutes: int = 5) -> list["NewsItem"]:
+def _score_sentiment(headline: str, teaser: str) -> tuple[str, float]:
     """
-    Fetch recent US equity news from finlight.me.
-    Returns only positive-sentiment articles with tickers, deduplicated by article id.
-    Stops fetching if the monthly request limit is reached.
+    Ask Claude to classify sentiment of a news article.
+    Returns (sentiment, confidence) where sentiment is "positive"|"neutral"|"negative"
+    and confidence is 0.0–1.0.
     """
-    used = get_api_request_count()
-    if used >= _MONTHLY_LIMIT:
-        logger.error(
-            "Finlight monthly limit reached (%d/%d) — skipping fetch until next month",
-            used, _MONTHLY_LIMIT,
+    prompt = (
+        "You are a financial news sentiment classifier. "
+        "Classify the sentiment of this news article for US equity traders. "
+        "Respond with a JSON object only — no markdown, no explanation:\n"
+        '{"sentiment": "positive" | "neutral" | "negative", "confidence": 0.0-1.0}\n\n'
+        f"Headline: {headline}\n"
+        f"Summary: {teaser}"
+    )
+    try:
+        msg = _claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=64,
+            messages=[{"role": "user", "content": prompt}],
         )
-        return []
+        raw = msg.content[0].text.strip()
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw.strip())
+        sentiment = result.get("sentiment", "neutral").lower()
+        confidence = float(result.get("confidence", 0.5))
+        return sentiment, confidence
+    except Exception as exc:
+        logger.warning("Sentiment classification failed: %s", exc)
+        return "neutral", 0.0
 
-    remaining = _MONTHLY_LIMIT - used
-    logger.info("Finlight requests used this month: %d/%d", used, _MONTHLY_LIMIT)
-    if remaining <= 50:
-        logger.warning("Finlight quota nearly exhausted — %d requests remaining", remaining)
 
+def fetch_all_news(lookback_minutes: int = 5) -> list[NewsItem]:
+    """
+    Fetch recent news from Benzinga, classify sentiment with Claude,
+    and return positive-sentiment articles with US equity tickers.
+    Deduplicates by article id.
+    """
     articles = _fetch(lookback_minutes)
     if not articles:
         return []
@@ -92,27 +106,25 @@ def fetch_all_news(lookback_minutes: int = 5) -> list["NewsItem"]:
     results: list[NewsItem] = []
 
     for article in articles:
-        sentiment = article.get("sentiment", "neutral").lower()
-        if sentiment != "positive":
-            continue
-
-        companies = article.get("companies", [])
-        tickers = [
-            c["ticker"]
-            for c in companies
-            if c.get("ticker") and c.get("country") == "US"
-        ]
-        if not tickers:
-            continue
-
-        article_id = article.get("link", article.get("title", ""))
+        article_id = article.get("benzinga_id") or article.get("url", article.get("title", ""))
         if article_id in seen_ids:
             continue
         seen_ids.add(article_id)
 
+        tickers = [t for t in (article.get("tickers") or []) if t]
+        if not tickers:
+            continue
+
+        headline = article.get("title", "")
+        teaser = article.get("teaser") or article.get("body", "")[:200]
+
+        sentiment, confidence = _score_sentiment(headline, teaser)
+        if sentiment != "positive":
+            continue
+
         try:
             published_at = datetime.fromisoformat(
-                article.get("publishDate", "").replace("Z", "+00:00")
+                article.get("published", "").replace("Z", "+00:00")
             )
         except (ValueError, AttributeError):
             published_at = datetime.now(timezone.utc)
@@ -124,16 +136,16 @@ def fetch_all_news(lookback_minutes: int = 5) -> list["NewsItem"]:
             results.append(NewsItem(
                 article_id=article_id,
                 ticker=t212_ticker,
-                headline=article.get("title", ""),
-                body=article.get("summary") or "",
-                source=article.get("source", "finlight"),
+                headline=headline,
+                body=teaser,
+                source="benzinga",
                 published_at=published_at,
                 sentiment=sentiment,
-                confidence=float(article.get("confidence", 0.0)),
+                confidence=confidence,
             ))
 
     logger.info(
-        "Finlight: %d positive article(s) → %d ticker signal(s)",
+        "Benzinga: %d article(s) fetched → %d positive ticker signal(s)",
         len(seen_ids), len(results),
     )
     return results
