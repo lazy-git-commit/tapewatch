@@ -11,7 +11,7 @@ import logging
 import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from config.settings import cfg
 
@@ -85,13 +85,6 @@ def init_db() -> None:
                     snapshot_at TEXT    NOT NULL
                 )
             """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS api_usage (
-                    id          SERIAL PRIMARY KEY,
-                    month       TEXT    NOT NULL UNIQUE,
-                    requests    INTEGER NOT NULL DEFAULT 0
-                )
-            """)
     logger.info("Database initialised at %s", cfg.db_url.split("@")[-1])
 
 
@@ -118,7 +111,7 @@ def save_signal(
     fetched_at: str | None = None,
 ) -> int:
     """Insert a news signal. Returns the new row id."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -163,7 +156,7 @@ def open_trade(
                    VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s)
                    RETURNING id""",
                 (cfg.trading_mode, ticker, signal_id, quantity, buy_price,
-                 datetime.utcnow().isoformat(),
+                 datetime.now(timezone.utc).isoformat(),
                  buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp),
             )
             row_id = cur.fetchone()["id"]
@@ -209,7 +202,7 @@ def close_trade(
                    profit_loss = %s, profit_loss_pct = %s, status = 'closed',
                    sell_order_id = %s, sell_net_gbp = %s, sell_fx_rate = %s, sell_fees_gbp = %s
                    WHERE id = %s""",
-                (sell_price, datetime.utcnow().isoformat(), exit_reason, pnl, pnl_pct,
+                (sell_price, datetime.now(timezone.utc).isoformat(), exit_reason, pnl, pnl_pct,
                  sell_order_id, sell_net_gbp, sell_fx_rate, sell_fees_gbp, trade_id),
             )
             logger.info(
@@ -250,33 +243,7 @@ def save_snapshot(total_value: float, cash: Optional[float] = None) -> None:
             cur.execute(
                 """INSERT INTO portfolio_snapshots (total_value, cash, snapshot_at)
                    VALUES (%s, %s, %s)""",
-                (total_value, cash, datetime.utcnow().isoformat()),
+                (total_value, cash, datetime.now(timezone.utc).isoformat()),
             )
 
 
-# ── API usage tracking ────────────────────────────────────────────────────────
-
-def _current_month() -> str:
-    return datetime.utcnow().strftime("%Y-%m")
-
-
-def get_api_request_count() -> int:
-    """Return the number of finlight API requests made in the current calendar month."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT requests FROM api_usage WHERE month = %s", (_current_month(),)
-            )
-            row = cur.fetchone()
-            return row["requests"] if row else 0
-
-
-def increment_api_request_count() -> None:
-    """Increment the finlight request counter for the current month by 1."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO api_usage (month, requests) VALUES (%s, 1)
-                   ON CONFLICT (month) DO UPDATE SET requests = api_usage.requests + 1""",
-                (_current_month(),),
-            )

@@ -5,24 +5,27 @@ A news-driven momentum trading system for your Trading 212 Stocks ISA.
 ## How it works
 
 ```
-Benzinga WIIM (Why Is It Moving) — stock already moving with known catalyst
-Benzinga News — broad market news for early signals
+Benzinga news (via massive.com) — breaking US equity news with tickers
        ↓
-Price confirmation (yfinance) — price up ≥ 1.5% + volume spike?
+Claude Haiku — sentiment classification (positive / neutral / negative)
+       ↓
+Price confirmation — Finnhub real-time quote + yfinance momentum baseline
+                     price up ≥ 0.5% over last 15 min + volume spike?
        ↓
 Buy order (Trading 212 API — demo or live)
        ↓
-Position monitor (every 60s)
+Position monitor (every 60s) — Finnhub real-time price
   → Take profit (+5%)  ✅
   → Stop loss  (-2%)   ❌
   → Time stop  (60min) ⏱️
        ↓
-Trade logged to SQLite (tagged demo or live)
+Trade logged to PostgreSQL (tagged demo or live)
        ↓
 Grafana dashboard — live activity and history
 ```
 
 Only runs during US market hours (Mon–Fri, 14:30–21:00 UTC).
+Sleeps precisely until the next NYSE open when the market is closed.
 
 ---
 
@@ -32,7 +35,9 @@ Only runs during US market hours (Mon–Fri, 14:30–21:00 UTC).
 
 - Python 3.12
 - A [Trading 212](https://www.trading212.com) account with a Stocks ISA (demo or live)
-- A [Benzinga](https://www.benzinga.com/apis/) API key (News + WIIM)
+- A [massive.com](https://massive.com) account with Benzinga news subscription
+- A [Finnhub](https://finnhub.io) API key (free tier is sufficient)
+- An [Anthropic](https://console.anthropic.com) API key for Claude Haiku sentiment
 - A VM or server to deploy to (Linux recommended)
 
 ### 2. Install dependencies
@@ -58,7 +63,7 @@ Key settings in `.env`:
 | `DEMO_PORTFOLIO_VALUE` | `500.0` | Simulated balance for position sizing in demo mode (GBP) |
 | `BLOCKLIST` | `` | Comma-separated Trading 212 codes to never trade (e.g. `TSLA_US_EQ`) |
 | `MIN_PRICE_MOVE_PCT` | `0.5` | Price must be up this % over the momentum window to confirm a signal |
-| `MOMENTUM_WINDOW_MINUTES` | `30` | How far back to measure recent price momentum |
+| `MOMENTUM_WINDOW_MINUTES` | `15` | How far back to measure recent price momentum |
 | `MAX_DAY_DROP_PCT` | `3.0` | Reject signal if stock is down more than this % from today's open (dead-cat bounce guard) |
 | `MAX_POSITION_SIZE_PCT` | `5.0` | Max % of portfolio per trade |
 | `TAKE_PROFIT_PCT` | `5.0` | Sell when up this % |
@@ -79,10 +84,10 @@ python main.py
 
 You'll see live output like:
 ```
-INFO  __main__ — News cycle starting
-INFO  news.fetcher — Benzinga WIIM: 3 signals
-INFO  news.fetcher — Benzinga News: 8 articles matched
-INFO  market.price_check — Price check [AAPL]: +2.1% move, 2.3× volume — confirmed=True
+INFO  __main__ — ── News cycle starting ──────────────────────────────────
+INFO  news.fetcher — Benzinga: 12 article(s) fetched → 3 positive ticker signal(s)
+INFO  __main__ — Signal [AAPL_US_EQ] 85% confidence: Apple announces record quarter
+INFO  market.price_check — Price check [AAPL]: recent=+1.8% day=+2.3% volume=2.1× — approved
 INFO  trading.executor — BUY executed: AAPL_US_EQ × 2.381000 | order_id=...
 ```
 
@@ -102,11 +107,18 @@ The system deploys automatically to a Linux VM via GitHub Actions on every push 
 
 | Secret | Description |
 |---|---|
-| `DEPLOY_HOST` | VM public IP |
+| `DEPLOY_HOST` | VM the private network IP (after setup) |
 | `DEPLOY_USER` | SSH user (e.g. `root`) |
 | `DEPLOY_SSH_KEY` | SSH private key |
-| `TRADING212_API_KEY` | Trading 212 API key |
-| `BENZINGA_API_KEY` | Benzinga API key |
+| `NETWORK_AUTH_KEY` | the private network auth key |
+| `TRADING212_API_KEY` | Trading 212 live API key |
+| `TRADING212_API_KEY_ID` | Trading 212 live API key ID |
+| `TRADING212_DEMO_API_KEY` | Trading 212 demo API key |
+| `TRADING212_DEMO_API_KEY_ID` | Trading 212 demo API key ID |
+| `MASSIVE_BENZINGA_API_KEY` | Benzinga news key from massive.com |
+| `FINNHUBIO_API_KEY` | Finnhub API key |
+| `ANTHROPIC_API_KEY` | Anthropic API key for Claude Haiku |
+| `DASHBOARD_ADMIN_PASSWORD` | Grafana admin password |
 
 ### Useful commands on the VM
 
@@ -118,7 +130,7 @@ journalctl -u momentum_trader -f
 systemctl status momentum_trader
 
 # View trade history
-sqlite3 /opt/tapewatch/trader.db "SELECT mode, ticker, buy_price, sell_price, profit_loss_pct, status FROM trades"
+psql postgresql://<db-user>:<db-password>@localhost:5432/momentum_trader -c "SELECT mode, ticker, buy_price, sell_price, profit_loss_pct, status FROM trades"
 
 # Performance report
 cd /opt/tapewatch && .venv/bin/python -m reporting.report
