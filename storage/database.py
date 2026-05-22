@@ -66,6 +66,10 @@ def init_db() -> None:
                 ADD COLUMN IF NOT EXISTS rejection_reason TEXT
             """)
             cur.execute("""
+                ALTER TABLE news_signals
+                ADD COLUMN IF NOT EXISTS rejection_code TEXT
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id              SERIAL PRIMARY KEY,
                     mode            TEXT    NOT NULL DEFAULT 'demo',
@@ -147,13 +151,13 @@ def mark_signal_acted_on(signal_id: int) -> None:
             )
 
 
-def set_rejection_reason(signal_id: int, reason: str) -> None:
-    """Store the price-check rejection reason for a signal that was not traded."""
+def set_rejection_reason(signal_id: int, reason: str, code: str | None = None) -> None:
+    """Store the rejection reason and optional short code for a signal that was not traded."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE news_signals SET rejection_reason = %s WHERE id = %s",
-                (reason, signal_id),
+                "UPDATE news_signals SET rejection_reason = %s, rejection_code = %s WHERE id = %s",
+                (reason, code, signal_id),
             )
 
 

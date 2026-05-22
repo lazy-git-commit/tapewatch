@@ -110,6 +110,7 @@ class PriceConfirmation:
     volume_ratio: float
     is_confirmed: bool
     reason: str
+    reason_code: str          # short keyword: approved | low_momentum | low_volume | dead_cat | no_price_data
 
 
 def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
@@ -164,12 +165,14 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
 
         if dead_cat:
             is_confirmed = False
+            reason_code = "dead_cat"
             reason = (
                 f"Dead-cat bounce guard: stock is down {day_move_pct:.2f}% on the day "
                 f"(max allowed drop: -{cfg.max_day_drop_pct}%) — skipping"
             )
         elif not momentum_ok:
             is_confirmed = False
+            reason_code = "low_momentum"
             reason = (
                 f"Insufficient recent momentum: +{recent_move_pct:.2f}% "
                 f"over last {cfg.momentum_window_minutes} min "
@@ -177,6 +180,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
             )
         elif volume_ok:
             is_confirmed = True
+            reason_code = "approved"
             reason = (
                 f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
                 f"with {volume_ratio:.1f}× average volume "
@@ -184,6 +188,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
             )
         else:
             is_confirmed = False
+            reason_code = "low_volume"
             reason = (
                 f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
                 f"but low volume ({volume_ratio:.1f}× avg, threshold 1.5×) — rejected"
@@ -206,6 +211,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
             volume_ratio=volume_ratio,
             is_confirmed=is_confirmed,
             reason=reason,
+            reason_code=reason_code,
         )
 
     except Exception as exc:
