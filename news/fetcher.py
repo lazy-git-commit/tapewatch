@@ -107,7 +107,7 @@ def fetch_all_news(lookback_minutes: int = 5) -> list[NewsItem]:
     results: list[NewsItem] = []
 
     for article in articles:
-        article_id = article.get("benzinga_id") or article.get("url", article.get("title", ""))
+        article_id = str(article.get("benzinga_id") or article.get("url", article.get("title", "")))
         if article_id in seen_ids:
             continue
         seen_ids.add(article_id)
