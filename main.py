@@ -27,7 +27,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from config.settings import cfg
-from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded, is_article_seen
+from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded, is_article_seen, set_rejection_reason
 from news.fetcher import fetch_all_news
 from market.price_check import confirm_price_signal, is_market_open, is_too_late_to_buy, next_market_open
 from trading.executor import buy
@@ -156,6 +156,7 @@ def news_cycle() -> None:
         if confirmation is None or not confirmation.is_confirmed:
             reason = confirmation.reason if confirmation else "price data unavailable"
             logger.info("Signal rejected for %s: %s", item.ticker, reason)
+            set_rejection_reason(signal_id, reason)
             continue
 
         logger.info("Signal approved for %s — placing buy order: %s", item.ticker, confirmation.reason)
@@ -164,6 +165,7 @@ def news_cycle() -> None:
         result = buy(item.ticker, confirmation.current_price)
         if not result.success:
             logger.error("Buy order failed for %s: %s", item.ticker, result.error)
+            set_rejection_reason(signal_id, f"buy order failed: {result.error}")
             continue
 
         # Record trade in DB

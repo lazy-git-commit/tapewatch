@@ -11,9 +11,17 @@ import logging
 import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
+import pytz
 from config.settings import cfg
+
+_LONDON = pytz.timezone("Europe/London")
+
+
+def _now_london() -> str:
+    """Current time as an ISO string in London local time (handles BST/GMT automatically)."""
+    return datetime.now(_LONDON).isoformat()
 
 logger = logging.getLogger(__name__)
 
@@ -39,18 +47,23 @@ def init_db() -> None:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS news_signals (
-                    id           SERIAL PRIMARY KEY,
-                    article_id   TEXT,
-                    ticker       TEXT    NOT NULL,
-                    headline     TEXT    NOT NULL,
-                    source       TEXT,
-                    sentiment    TEXT    NOT NULL,
-                    confidence   INTEGER NOT NULL,
-                    acted_on     INTEGER NOT NULL DEFAULT 0,
-                    published_at TEXT,
-                    fetched_at   TEXT    NOT NULL,
-                    created_at   TEXT    NOT NULL
+                    id               SERIAL PRIMARY KEY,
+                    article_id       TEXT,
+                    ticker           TEXT    NOT NULL,
+                    headline         TEXT    NOT NULL,
+                    source           TEXT,
+                    sentiment        TEXT    NOT NULL,
+                    confidence       INTEGER NOT NULL,
+                    acted_on         INTEGER NOT NULL DEFAULT 0,
+                    rejection_reason TEXT,
+                    published_at     TEXT,
+                    fetched_at       TEXT    NOT NULL,
+                    created_at       TEXT    NOT NULL
                 )
+            """)
+            cur.execute("""
+                ALTER TABLE news_signals
+                ADD COLUMN IF NOT EXISTS rejection_reason TEXT
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
@@ -111,7 +124,7 @@ def save_signal(
     fetched_at: str | None = None,
 ) -> int:
     """Insert a news signal. Returns the new row id."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now_london()
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -131,6 +144,16 @@ def mark_signal_acted_on(signal_id: int) -> None:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE news_signals SET acted_on = 1 WHERE id = %s", (signal_id,)
+            )
+
+
+def set_rejection_reason(signal_id: int, reason: str) -> None:
+    """Store the price-check rejection reason for a signal that was not traded."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE news_signals SET rejection_reason = %s WHERE id = %s",
+                (reason, signal_id),
             )
 
 
@@ -156,7 +179,7 @@ def open_trade(
                    VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s)
                    RETURNING id""",
                 (cfg.trading_mode, ticker, signal_id, quantity, buy_price,
-                 datetime.now(timezone.utc).isoformat(),
+                 _now_london(),
                  buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp),
             )
             row_id = cur.fetchone()["id"]
@@ -202,7 +225,7 @@ def close_trade(
                    profit_loss = %s, profit_loss_pct = %s, status = 'closed',
                    sell_order_id = %s, sell_net_gbp = %s, sell_fx_rate = %s, sell_fees_gbp = %s
                    WHERE id = %s""",
-                (sell_price, datetime.now(timezone.utc).isoformat(), exit_reason, pnl, pnl_pct,
+                (sell_price, _now_london(), exit_reason, pnl, pnl_pct,
                  sell_order_id, sell_net_gbp, sell_fx_rate, sell_fees_gbp, trade_id),
             )
             logger.info(
@@ -243,7 +266,7 @@ def save_snapshot(total_value: float, cash: Optional[float] = None) -> None:
             cur.execute(
                 """INSERT INTO portfolio_snapshots (total_value, cash, snapshot_at)
                    VALUES (%s, %s, %s)""",
-                (total_value, cash, datetime.now(timezone.utc).isoformat()),
+                (total_value, cash, _now_london()),
             )
 
 
