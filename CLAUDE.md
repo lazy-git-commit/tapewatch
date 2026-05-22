@@ -26,6 +26,11 @@ pytest tests/test_core.py::TestExitConditions::test_take_profit_triggered -v
 
 # View performance report without running the trader
 python -m reporting.report
+
+# Run a backtest against a historical trading day (fetches real Benzinga + yfinance data)
+python -m backtest.backtest --date 2026-05-21
+python -m backtest.backtest                      # defaults to yesterday
+python -m backtest.backtest --no-sentiment       # skip Claude, use all positive articles
 ```
 
 ## Architecture
