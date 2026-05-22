@@ -39,9 +39,11 @@ Authorization: Bearer <MASSIVE_BENZINGA_API_KEY>
 **Sample response (JSON):**
 ```json
 {
-  "articles": [
+  "status": "OK",
+  "request_id": "6c717517b18d4866a455669b56280c9b",
+  "results": [
     {
-      "benzinga_id": "abc123",
+      "benzinga_id": 52736856,
       "title": "Apple Reports Record iPhone Sales",
       "teaser": "Apple shares rose after the company reported...",
       "body": "Full article text...",
@@ -53,7 +55,8 @@ Authorization: Bearer <MASSIVE_BENZINGA_API_KEY>
       "tags": ["earnings", "revenue"],
       "url": "https://www.benzinga.com/..."
     }
-  ]
+  ],
+  "next_url": "..."
 }
 ```
 

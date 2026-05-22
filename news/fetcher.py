@@ -51,7 +51,8 @@ def _fetch(lookback_minutes: int) -> list[dict]:
             timeout=_TIMEOUT,
         )
         resp.raise_for_status()
-        return resp.json().get("articles", [])
+        data = resp.json()
+        return data.get("results", data.get("articles", []))
     except requests.RequestException as exc:
         logger.warning("Benzinga API request failed: %s", exc)
         return []
