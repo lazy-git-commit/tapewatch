@@ -6,8 +6,8 @@ price movement and elevated volume.
 
 Price sources:
   - Current price  — Finnhub REST quote (real-time, <1s latency)
-  - 15-min window  — Finnhub WebSocket bars (real-time trade aggregation)
-  - Older bars     — yfinance (15-min delayed, fine for baseline > 15 min ago)
+  - Momentum baseline — yfinance 1-min bars (15-min delayed, intentional: aligns
+                        with MOMENTUM_WINDOW_MINUTES=15 so the last bar ≈ now-15min)
   - Volume stats   — yfinance 20-day daily history
 
 A signal is confirmed when ALL of the following hold:
@@ -175,7 +175,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                 f"over last {cfg.momentum_window_minutes} min "
                 f"(threshold: +{cfg.min_price_move_pct}%)"
             )
-        elif momentum_ok and volume_ok:
+        elif volume_ok:
             is_confirmed = True
             reason = (
                 f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
@@ -183,11 +183,10 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                 f"(day: {day_move_pct:+.2f}%)"
             )
         else:
-            is_confirmed = True
+            is_confirmed = False
             reason = (
                 f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
-                f"but low volume ({volume_ratio:.1f}× avg) — weak confirmation "
-                f"(day: {day_move_pct:+.2f}%)"
+                f"but low volume ({volume_ratio:.1f}× avg, threshold 1.5×) — rejected"
             )
 
         logger.info(

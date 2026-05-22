@@ -3,8 +3,8 @@ tests/test_core.py
 ───────────────────
 Unit tests for the most critical logic:
   - Exit condition evaluation (no external calls)
-  - Sentiment result parsing
-  - Position sizing
+  - Sentiment scoring (news/fetcher.py)
+  - Position sizing (trading/executor.py)
 
 Run with: pytest tests/
 """
@@ -65,79 +65,60 @@ class TestExitConditions:
         assert should_exit is False
 
 
-# ── Sentiment parsing tests ───────────────────────────────────────────────────
+# ── Sentiment scoring tests ───────────────────────────────────────────────────
 
-class TestSentimentParsing:
-    """Tests for analysis/sentiment.py — focuses on JSON parsing robustness"""
+class TestSentimentScoring:
+    """Tests for news/fetcher.py::_score_sentiment"""
 
-    def _make_news_item(self):
-        from news.fetcher import NewsItem
-        from datetime import datetime, timezone
-        return NewsItem(
-            article_id="test-001",
-            ticker="AAPL_US_EQ",
-            headline="Apple reports record quarterly earnings",
-            body="Apple beat analyst estimates by 20% with record services revenue.",
-            source="test",
-            published_at=datetime.now(timezone.utc),
-            is_wiim=False,
+    def _mock_claude_response(self, text: str) -> MagicMock:
+        mock_msg = MagicMock()
+        mock_msg.content = [MagicMock(text=text)]
+        return mock_msg
+
+    @patch("news.fetcher._claude")
+    def test_positive_sentiment_parsed(self, mock_claude):
+        from news.fetcher import _score_sentiment
+        mock_claude.messages.create.return_value = self._mock_claude_response(
+            '{"sentiment": "positive", "confidence": 0.9}'
         )
+        sentiment, confidence = _score_sentiment("Apple beats earnings", "Record revenue quarter")
+        assert sentiment == "positive"
+        assert confidence == pytest.approx(0.9)
 
-    @patch("analysis.sentiment._get_client")
-    def test_bullish_high_confidence_is_actionable(self, mock_get_client):
-        from analysis.sentiment import analyse
+    @patch("news.fetcher._claude")
+    def test_neutral_sentiment_parsed(self, mock_claude):
+        from news.fetcher import _score_sentiment
+        mock_claude.messages.create.return_value = self._mock_claude_response(
+            '{"sentiment": "neutral", "confidence": 0.5}'
+        )
+        sentiment, confidence = _score_sentiment("Company files routine 10-K", "Annual report")
+        assert sentiment == "neutral"
 
-        mock_response = MagicMock()
-        mock_response.content = [
-            MagicMock(text='{"sentiment": "BULLISH", "confidence": 9, "reason": "Earnings beat"}')
-        ]
-        mock_get_client.return_value.messages.create.return_value = mock_response
+    @patch("news.fetcher._claude")
+    def test_malformed_json_returns_neutral(self, mock_claude):
+        from news.fetcher import _score_sentiment
+        mock_claude.messages.create.return_value = self._mock_claude_response("not json")
+        sentiment, confidence = _score_sentiment("Some headline", "Some teaser")
+        assert sentiment == "neutral"
+        assert confidence == 0.0
 
-        result = analyse(self._make_news_item())
+    @patch("news.fetcher._claude")
+    def test_markdown_fenced_json_parsed(self, mock_claude):
+        from news.fetcher import _score_sentiment
+        mock_claude.messages.create.return_value = self._mock_claude_response(
+            '```json\n{"sentiment": "positive", "confidence": 0.85}\n```'
+        )
+        sentiment, confidence = _score_sentiment("Good news", "Positive outlook")
+        assert sentiment == "positive"
+        assert confidence == pytest.approx(0.85)
 
-        assert result is not None
-        assert result.sentiment == "BULLISH"
-        assert result.confidence == 9
-        assert result.is_actionable is True
-
-    @patch("analysis.sentiment._get_client")
-    def test_bullish_low_confidence_not_actionable(self, mock_get_client):
-        from analysis.sentiment import analyse
-
-        mock_response = MagicMock()
-        mock_response.content = [
-            MagicMock(text='{"sentiment": "BULLISH", "confidence": 5, "reason": "Vague positive"}')
-        ]
-        mock_get_client.return_value.messages.create.return_value = mock_response
-
-        result = analyse(self._make_news_item())
-        assert result is not None
-        assert result.is_actionable is False  # confidence 5 < threshold 7
-
-    @patch("analysis.sentiment._get_client")
-    def test_neutral_not_actionable(self, mock_get_client):
-        from analysis.sentiment import analyse
-
-        mock_response = MagicMock()
-        mock_response.content = [
-            MagicMock(text='{"sentiment": "NEUTRAL", "confidence": 3, "reason": "No catalyst"}')
-        ]
-        mock_get_client.return_value.messages.create.return_value = mock_response
-
-        result = analyse(self._make_news_item())
-        assert result is not None
-        assert result.is_actionable is False
-
-    @patch("analysis.sentiment._get_client")
-    def test_malformed_json_returns_none(self, mock_get_client):
-        from analysis.sentiment import analyse
-
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="This is not JSON at all")]
-        mock_get_client.return_value.messages.create.return_value = mock_response
-
-        result = analyse(self._make_news_item())
-        assert result is None
+    @patch("news.fetcher._claude")
+    def test_api_exception_returns_neutral(self, mock_claude):
+        from news.fetcher import _score_sentiment
+        mock_claude.messages.create.side_effect = Exception("API timeout")
+        sentiment, confidence = _score_sentiment("Some headline", "Some teaser")
+        assert sentiment == "neutral"
+        assert confidence == 0.0
 
 
 # ── Position sizing tests ─────────────────────────────────────────────────────
@@ -161,10 +142,16 @@ class TestPositionSizing:
         quantity = calculate_quantity("AAPL_US_EQ", price=100.0)
         assert quantity == pytest.approx(2.0, rel=1e-4)
 
-    @patch("trading.executor.get_portfolio_value", return_value=1000.0)
-    @patch("trading.executor.get_available_cash", return_value=10.0)
-    def test_insufficient_funds_returns_none(self, _c, _p):
+    @patch("trading.executor.get_portfolio_value", return_value=None)
+    @patch("trading.executor.get_available_cash", return_value=None)
+    def test_no_funds_data_returns_none(self, _c, _p):
         from trading.executor import calculate_quantity
-        # Price £100, max spend £50 (5% of £1000 capped at £10 cash) < price
+        quantity = calculate_quantity("AAPL_US_EQ", price=100.0)
+        assert quantity is None
+
+    @patch("trading.executor.get_portfolio_value", return_value=100.0)
+    @patch("trading.executor.get_available_cash", return_value=0.0)
+    def test_zero_cash_returns_none(self, _c, _p):
+        from trading.executor import calculate_quantity
         quantity = calculate_quantity("AAPL_US_EQ", price=100.0)
         assert quantity is None
