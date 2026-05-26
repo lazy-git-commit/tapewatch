@@ -15,6 +15,7 @@ API call optimisations:
      same article is never re-scored across consecutive polling windows.
 """
 
+import html
 import json
 import logging
 import requests
@@ -162,8 +163,8 @@ def fetch_all_news(lookback_minutes: int = 5) -> list[NewsItem]:
     to_score = [
         {
             "id": article_id,
-            "headline": article.get("title", ""),
-            "teaser": article.get("teaser") or article.get("body", "")[:200],
+            "headline": html.unescape(article.get("title", "")),
+            "teaser": html.unescape(article.get("teaser") or article.get("body", "")[:200]),
         }
         for article, _, article_id in eligible
     ]
@@ -177,8 +178,8 @@ def fetch_all_news(lookback_minutes: int = 5) -> list[NewsItem]:
         if sentiment != "positive":
             continue
 
-        headline = article.get("title", "")
-        teaser = article.get("teaser") or article.get("body", "")[:200]
+        headline = html.unescape(article.get("title", ""))
+        teaser = html.unescape(article.get("teaser") or article.get("body", "")[:200])
 
         try:
             published_at = datetime.fromisoformat(
