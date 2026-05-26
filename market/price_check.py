@@ -174,7 +174,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
             is_confirmed = False
             reason_code = "low_momentum"
             reason = (
-                f"Insufficient recent momentum: +{recent_move_pct:.2f}% "
+                f"Insufficient recent momentum: {recent_move_pct:+.2f}% "
                 f"over last {cfg.momentum_window_minutes} min "
                 f"(threshold: +{cfg.min_price_move_pct}%)"
             )

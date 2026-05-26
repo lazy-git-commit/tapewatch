@@ -107,12 +107,13 @@ def init_db() -> None:
 
 # ── News signals ──────────────────────────────────────────────────────────────
 
-def is_article_seen(article_id: str) -> bool:
-    """Return True if this Benzinga article id has already been processed."""
+def is_article_seen(article_id: str, ticker: str) -> bool:
+    """Return True if this (article, ticker) pair has already been processed."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM news_signals WHERE article_id = %s LIMIT 1", (article_id,)
+                "SELECT 1 FROM news_signals WHERE article_id = %s AND ticker = %s LIMIT 1",
+                (article_id, ticker),
             )
             return cur.fetchone() is not None
 

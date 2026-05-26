@@ -128,8 +128,8 @@ def news_cycle() -> None:
     for item in news_items:
         logger.info("Signal [%s] %.0f%% confidence: %s", item.ticker, item.confidence * 100, item.headline)
 
-        # Skip articles already processed in a previous cycle
-        if is_article_seen(item.article_id):
+        # Skip if this (article, ticker) pair was already processed in a previous cycle
+        if is_article_seen(item.article_id, item.ticker):
             logger.debug("Skipping %s — article %s already processed", item.ticker, item.article_id)
             continue
 
