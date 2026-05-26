@@ -97,39 +97,46 @@ def _parse_fill(fill: dict) -> tuple[float | None, float | None, float | None, f
     return filled_price, net_gbp, fx_rate, fees_gbp
 
 
-def get_portfolio_value() -> float | None:
+def _fetch_cash() -> dict | None:
+    """Fetch /equity/account/cash once and return the raw dict, or None on error."""
     try:
-        data = _get("/equity/account/cash")
-        return float(data.get("total", 0))
+        return _get("/equity/account/cash")
     except Exception as exc:
-        logger.error("Failed to fetch portfolio value: %s", exc)
+        logger.error("Failed to fetch T212 cash balance: %s", exc)
         return None
+
+
+def get_portfolio_value() -> float | None:
+    data = _fetch_cash()
+    return float(data["total"]) if data else None
 
 
 def get_available_cash() -> float | None:
+    data = _fetch_cash()
+    return float(data["free"]) if data else None
+
+
+def calculate_quantity(ticker: str, price: float) -> tuple[float | None, str | None]:
+    """Returns (quantity, error_reason). error_reason is None on success."""
     try:
         data = _get("/equity/account/cash")
-        return float(data.get("free", 0))
     except Exception as exc:
-        logger.error("Failed to fetch cash balance: %s", exc)
-        return None
+        reason = f"T212 cash API failed: {exc}"
+        logger.error("calculate_quantity for %s: %s", ticker, reason)
+        return None, reason
 
+    portfolio_value = float(data.get("total", 0))
+    available_cash = float(data.get("free", 0))
 
-def calculate_quantity(ticker: str, price: float) -> float | None:
-    portfolio_value = get_portfolio_value()
-    available_cash = get_available_cash()
-
-    if portfolio_value is None or available_cash is None:
-        return None
+    if portfolio_value <= 0 or available_cash <= 0:
+        reason = f"no funds available (total=£{portfolio_value:.2f} free=£{available_cash:.2f})"
+        logger.warning("calculate_quantity for %s: %s", ticker, reason)
+        return None, reason
 
     max_spend = min(
         portfolio_value * (cfg.max_position_size_pct / 100),
         available_cash,
     )
-
-    if max_spend <= 0:
-        logger.warning("No funds available to buy %s", ticker)
-        return None
 
     # Trading 212 allows at most 4 decimal places for fractional quantities
     quantity = round(max_spend / price, 4)
@@ -137,15 +144,15 @@ def calculate_quantity(ticker: str, price: float) -> float | None:
         "Position size for %s: £%.2f → %.4f shares @ £%.4f",
         ticker, max_spend, quantity, price,
     )
-    return quantity
+    return quantity, None
 
 
 def buy(ticker: str, price: float) -> OrderResult:
-    quantity = calculate_quantity(ticker, price)
+    quantity, err = calculate_quantity(ticker, price)
     if quantity is None:
         return OrderResult(
             success=False, ticker=ticker, quantity=0,
-            price=price, order_id=None, error="Could not calculate position size",
+            price=price, order_id=None, error=err or "Could not calculate position size",
         )
 
     try:
