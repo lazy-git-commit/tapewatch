@@ -20,7 +20,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -117,7 +117,7 @@ def news_cycle() -> None:
         )
         return
 
-    fetched_at = datetime.now(timezone.utc).isoformat()
+    fetched_at = datetime.now(pytz.timezone("Europe/London")).isoformat()
     news_items = fetch_all_news(lookback_minutes=5)
     if not news_items:
         logger.info("No new articles found.")
