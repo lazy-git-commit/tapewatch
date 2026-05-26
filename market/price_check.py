@@ -66,13 +66,13 @@ def _to_yf_ticker(t212_ticker: str) -> str:
 
 def is_too_late_to_buy() -> bool:
     """
-    Return True if there is not enough time before market close to hold a
-    position for the full TIME_STOP_MINUTES window.
+    Return True if we are within TIME_STOP_MINUTES of market close.
+    Returns False outside of market hours — is_market_open() handles that.
     """
     now_et = datetime.now(_ET)
     close_et = now_et.replace(hour=_MARKET_CLOSE[0], minute=_MARKET_CLOSE[1], second=0, microsecond=0)
     minutes_to_close = (close_et - now_et).total_seconds() / 60
-    return minutes_to_close <= cfg.time_stop_minutes
+    return 0 < minutes_to_close <= cfg.time_stop_minutes
 
 
 def is_market_open() -> bool:
