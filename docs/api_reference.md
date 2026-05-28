@@ -87,30 +87,37 @@ Classifies the sentiment of each Benzinga article as `positive`, `neutral`, or `
 
 ### API call
 
+All eligible articles in a single news cycle are scored in **one batched call** — not one call per article. Articles are pre-filtered (must have tickers, not blocklisted, not already seen in DB) before the call is made.
+
 **Code:**
 ```python
 client = anthropic.Anthropic()
 msg = client.messages.create(
     model="claude-haiku-4-5-20251001",
-    max_tokens=64,
+    max_tokens=512,
     messages=[{"role": "user", "content": prompt}],
 )
 ```
 
 **Prompt template:**
 ```
-You are a financial news sentiment classifier.
-Classify the sentiment of this news article for US equity traders.
-Respond with a JSON object only — no markdown, no explanation:
-{"sentiment": "positive" | "neutral" | "negative", "confidence": 0.0-1.0}
+You are a financial news sentiment classifier for US equity traders.
+Classify the sentiment of each article below.
+Respond with a JSON array only — no markdown, no explanation.
+Each element must have exactly these keys: id, sentiment, confidence.
+sentiment must be one of: "positive", "neutral", "negative"
+confidence must be a float 0.0–1.0
 
-Headline: <title>
-Summary: <teaser>
+Articles:
+[{"id": "...", "headline": "...", "teaser": "..."}, ...]
 ```
 
 **Sample response:**
 ```json
-{"sentiment": "positive", "confidence": 0.88}
+[
+  {"id": "52736856", "sentiment": "positive", "confidence": 0.88},
+  {"id": "52736901", "sentiment": "neutral",  "confidence": 0.72}
+]
 ```
 
 **Output mapping:**
@@ -126,17 +133,47 @@ Summary: <teaser>
 
 **Base URL:** `https://finnhub.io/api/v1`
 **Auth:** `token=<FINNHUBIO_API_KEY>` query parameter
-**Used by:** `market/finnhub_bars.py` → `market/price_check.py`, `monitor/position_monitor.py`
+**Used by:** `market/price_check.py`, `market/finnhub_bars.py`
 
 ### Purpose
 
-Provides real-time stock quotes (no delay). Used for:
-- **Signal confirmation** — current price to measure momentum vs. the yfinance baseline
-- **Position monitor** — current price every 60s to evaluate take-profit / stop-loss
+Provides two things:
+- **Market status** — authoritative NYSE open/closed check (handles holidays, early closes, weekends)
+- **Real-time stock quotes** — used for signal confirmation and position monitoring
+
+**Rate limit:** 60 requests/minute on the free tier.
+
+---
+
+### Endpoint: GET `/stock/market-status`
+
+**Purpose:** Check whether the US market is currently open. This is the authoritative source — it correctly handles NYSE holidays and early closes where a wall-clock check would be wrong.
+
+**Request:**
+```
+GET https://finnhub.io/api/v1/stock/market-status?exchange=US&token=<FINNHUBIO_API_KEY>
+```
+
+**Sample response (market open):**
+```json
+{"exchange": "US", "holiday": null, "isOpen": true, "session": "market", "t": 1716321600, "timezone": "America/New_York"}
+```
+
+**Sample response (market closed / holiday):**
+```json
+{"exchange": "US", "holiday": "Memorial Day", "isOpen": false, "session": null, "t": 1716321600, "timezone": "America/New_York"}
+```
+
+| Field | Description |
+|---|---|
+| `isOpen` | `true` when the market is in regular trading hours |
+| `holiday` | Holiday name if closed for a holiday, otherwise `null` |
 
 ---
 
 ### Endpoint: GET `/quote`
+
+**Purpose:** Real-time current price. Used for signal confirmation (current price vs. yfinance baseline) and position monitoring.
 
 **Request:**
 ```
@@ -164,8 +201,6 @@ GET https://finnhub.io/api/v1/quote?symbol=AAPL&token=<FINNHUBIO_API_KEY>
 | `c` | Current price (real-time) — used as `current_price` |
 | `o` | Today's open price — used for `day_move_pct` and as fallback baseline |
 
-**Rate limit:** 60 requests/minute on the free tier.
-
 ---
 
 ## 4. yfinance (Yahoo Finance)
@@ -178,18 +213,7 @@ yfinance is used only for **historical** data where the 15-minute delay is accep
 
 ---
 
-### Call 1: Market open check (`is_market_open`)
-
-**Purpose:** Determine whether the US market is in regular trading hours. Fetches 1 minute of SPY data and checks if the last bar is less than 5 minutes old.
-
-**Code:**
-```python
-yf.Ticker("SPY").history(period="1d", interval="1m")
-```
-
----
-
-### Call 2: Momentum baseline (`confirm_price_signal`)
+### Call 1: Momentum baseline (`confirm_price_signal`)
 
 **Purpose:** Fetch 1-minute intraday bars to get the price from ~15 minutes ago as the momentum baseline. The 15-minute delay is intentional — the most recent yfinance bar aligns with `MOMENTUM_WINDOW_MINUTES=15`.
 
@@ -211,7 +235,7 @@ The last bar (`Close.iloc[-1]`) is used as `past_price` for the recent momentum 
 
 ---
 
-### Call 3: 20-day average volume (`confirm_price_signal`)
+### Call 2: 20-day average volume (`confirm_price_signal`)
 
 **Purpose:** Calculate the 20-day average daily volume to determine if today's volume is elevated (volume ratio ≥ 1.5× average = volume spike).
 
@@ -332,10 +356,10 @@ Content-Type: application/json
 | API | Endpoint / Call | Purpose | File |
 |---|---|---|---|
 | Benzinga (massive.com) | `GET /benzinga/v2/news` | Fetch recent US equity news | `news/fetcher.py` |
-| Anthropic (Claude Haiku) | `messages.create` | Classify article sentiment | `news/fetcher.py` |
+| Anthropic (Claude Haiku) | `messages.create` (batched) | Classify article sentiment | `news/fetcher.py` |
+| Finnhub | `GET /stock/market-status` | Authoritative NYSE open/closed check | `market/price_check.py` |
 | Finnhub | `GET /quote` | Real-time current price | `market/finnhub_bars.py` |
-| yfinance | SPY 1m history | Check if market is open | `market/price_check.py` |
 | yfinance | `<ticker>` 1m history (1d) | Momentum baseline (~15 min ago) | `market/price_check.py` |
 | yfinance | `<ticker>` 1d history (21d) | 20-day average volume | `market/price_check.py` |
-| Trading 212 | `GET /equity/account/cash` | Portfolio value + cash | `trading/executor.py` |
+| Trading 212 | `GET /equity/account/cash` | Portfolio value + cash for position sizing | `trading/executor.py` |
 | Trading 212 | `POST /equity/orders/market` | Place buy / sell order | `trading/executor.py` |

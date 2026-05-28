@@ -60,7 +60,6 @@ Key settings in `.env`:
 | Variable | Default | Notes |
 |---|---|---|
 | `TRADING_MODE` | `demo` | **Keep as `demo` until confident** |
-| `DEMO_PORTFOLIO_VALUE` | `500.0` | Simulated balance for position sizing in demo mode (GBP) |
 | `BLOCKLIST` | `` | Comma-separated Trading 212 codes to never trade (e.g. `TSLA_US_EQ`) |
 | `MIN_PRICE_MOVE_PCT` | `0.5` | Price must be up this % over the momentum window to confirm a signal |
 | `MOMENTUM_WINDOW_MINUTES` | `15` | How far back to measure recent price momentum |
@@ -85,7 +84,7 @@ python main.py
 You'll see live output like:
 ```
 INFO  __main__ — ── News cycle starting ──────────────────────────────────
-INFO  news.fetcher — Benzinga: 12 article(s) fetched → 3 positive ticker signal(s)
+INFO  news.fetcher — Benzinga: 12 article(s) fetched → 3 eligible → 2 positive ticker signal(s)
 INFO  __main__ — Signal [AAPL_US_EQ] 85% confidence: Apple announces record quarter
 INFO  market.price_check — Price check [AAPL]: recent=+1.8% day=+2.3% volume=2.1× — approved
 INFO  trading.executor — BUY executed: AAPL_US_EQ × 2.381000 | order_id=...

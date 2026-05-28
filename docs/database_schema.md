@@ -18,9 +18,11 @@ One row per news article-ticker pair that the system evaluated. An article menti
 | `sentiment` | TEXT | Always `"BULLISH"` for now — only positive-sentiment articles trigger a buy. |
 | `confidence` | INTEGER | Confidence score 1–10, derived from Claude Haiku's classification (raw 0.0–1.0 × 10, rounded). |
 | `acted_on` | INTEGER | `0` = evaluated but no trade placed; `1` = a buy order was executed for this signal. |
-| `published_at` | TEXT | ISO 8601 UTC timestamp of when Benzinga published the article. |
-| `fetched_at` | TEXT | ISO 8601 UTC timestamp of when our news cycle fetched this article from the API. The gap between `published_at` and `fetched_at` shows detection latency. |
-| `created_at` | TEXT | ISO 8601 UTC timestamp of when this row was inserted. |
+| `rejection_reason` | TEXT | Human-readable explanation of why the signal was not traded (e.g. `"Insufficient recent momentum: +0.12% over last 15 min"`). NULL if the signal led to a trade. |
+| `rejection_code` | TEXT | Short keyword for the rejection reason: `approved`, `low_momentum`, `low_volume`, `dead_cat`, `no_price_data`, or `buy_failed`. NULL if the signal led to a trade. |
+| `published_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when Benzinga published the article. |
+| `fetched_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when our news cycle fetched this article from the API. The gap between `published_at` and `fetched_at` shows detection latency. |
+| `created_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when this row was inserted. |
 
 ---
 
@@ -44,7 +46,7 @@ One row per open or closed trade. A row is inserted when a buy order is placed (
 |---|---|---|
 | `quantity` | REAL | Number of shares (fractional) purchased. |
 | `buy_price` | REAL | Actual fill price in USD, sourced from the Trading 212 fill data after the order is confirmed. |
-| `buy_time` | TEXT | ISO 8601 UTC timestamp of when the buy order was placed. |
+| `buy_time` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when the buy order was placed. |
 | `buy_order_id` | TEXT | Trading 212 order ID for the buy. |
 | `buy_net_gbp` | REAL | GBP amount debited from the account for this purchase, net of FX conversion and fees, as reported by Trading 212. This is the true cash cost. |
 | `buy_fx_rate` | REAL | USD/GBP exchange rate applied by Trading 212 at the time of the buy fill. |
@@ -55,7 +57,7 @@ One row per open or closed trade. A row is inserted when a buy order is placed (
 | Column | Type | Description |
 |---|---|---|
 | `sell_price` | REAL | Actual fill price in USD at the time of sale. |
-| `sell_time` | TEXT | ISO 8601 UTC timestamp of when the sell order was placed. |
+| `sell_time` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when the sell order was placed. |
 | `sell_order_id` | TEXT | Trading 212 order ID for the sell. |
 | `exit_reason` | TEXT | Why the position was closed: `"take_profit"`, `"stop_loss"`, or `"time_stop"`. |
 | `sell_net_gbp` | REAL | GBP amount credited back to the account from this sale, net of FX conversion and fees, as reported by Trading 212. |
@@ -80,4 +82,4 @@ Periodic snapshots of account value, used to plot the portfolio value chart in G
 | `id` | SERIAL PK | Auto-incrementing primary key. |
 | `total_value` | REAL | Total account value in GBP at snapshot time (cash + open position market value). |
 | `cash` | REAL | Free cash available in GBP at snapshot time. |
-| `snapshot_at` | TEXT | ISO 8601 UTC timestamp of when the snapshot was taken. |
+| `snapshot_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when the snapshot was taken. |
