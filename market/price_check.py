@@ -20,6 +20,7 @@ A signal is confirmed when ALL of the following hold:
 """
 
 import logging
+import time
 import requests
 from datetime import datetime, timezone, timedelta
 import yfinance as yf
@@ -90,25 +91,36 @@ def _is_within_market_hours() -> bool:
 def is_market_open() -> bool:
     """
     Check whether the US market is open using the Finnhub market-status API.
-    This is authoritative — it handles holidays, early closes, and weekends.
-    Falls back to a wall-clock check on API error so a transient timeout
-    does not incorrectly pause trading during market hours.
+    Retries up to 3 times total (2 retries after the first failure) with a
+    60-second wait between attempts. Falls back to a wall-clock check only
+    after all 3 attempts fail, so a transient timeout does not incorrectly
+    pause trading during market hours.
     """
-    try:
-        resp = requests.get(
-            "https://finnhub.io/api/v1/stock/market-status",
-            params={"exchange": "US", "token": cfg.finnhub_api_key},
-            timeout=5,
-        )
-        resp.raise_for_status()
-        return bool(resp.json().get("isOpen", False))
-    except Exception as exc:
-        fallback = _is_within_market_hours()
-        logger.warning(
-            "Finnhub market-status check failed: %s — falling back to wall-clock (%s)",
-            exc, "open" if fallback else "closed",
-        )
-        return fallback
+    last_exc = None
+    for attempt in range(3):
+        if attempt > 0:
+            logger.warning(
+                "Finnhub market-status retry %d/2 after 60s (last error: %s)",
+                attempt, last_exc,
+            )
+            time.sleep(60)
+        try:
+            resp = requests.get(
+                "https://finnhub.io/api/v1/stock/market-status",
+                params={"exchange": "US", "token": cfg.finnhub_api_key},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            return bool(resp.json().get("isOpen", False))
+        except Exception as exc:
+            last_exc = exc
+
+    fallback = _is_within_market_hours()
+    logger.warning(
+        "Finnhub market-status failed after 3 attempts — falling back to wall-clock (%s)",
+        "open" if fallback else "closed",
+    )
+    return fallback
 
 
 @dataclass
