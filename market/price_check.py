@@ -20,6 +20,7 @@ A signal is confirmed when ALL of the following hold:
 """
 
 import logging
+import requests
 from datetime import datetime, timezone, timedelta
 import yfinance as yf
 from dataclasses import dataclass
@@ -77,23 +78,20 @@ def is_too_late_to_buy() -> bool:
 
 def is_market_open() -> bool:
     """
-    Check whether the US market is open by fetching 1 minute of live SPY
-    data. If yfinance returns rows with a timestamp from the last 5 minutes,
-    the market is open. This avoids relying on .info/.fast_info field names
-    which vary across yfinance versions.
+    Check whether the US market is open using the Finnhub market-status API.
+    This is authoritative — it handles holidays, early closes, and weekends.
+    Falls back to False on any error so we don't trade on uncertainty.
     """
     try:
-        data = yf.Ticker("SPY").history(period="1d", interval="1m")
-        if data.empty:
-            return False
-        last_ts = data.index[-1]
-        if last_ts.tzinfo is None:
-            last_ts = last_ts.replace(tzinfo=timezone.utc)
-        else:
-            last_ts = last_ts.astimezone(timezone.utc)
-        age = datetime.now(timezone.utc) - last_ts
-        return age < timedelta(minutes=5)
-    except Exception:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/stock/market-status",
+            params={"exchange": "US", "token": cfg.finnhub_api_key},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        return bool(resp.json().get("isOpen", False))
+    except Exception as exc:
+        logger.warning("Finnhub market-status check failed: %s", exc)
         return False
 
 
