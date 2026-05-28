@@ -22,8 +22,11 @@ import requests
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import anthropic
+import pytz
 from config.settings import cfg
 from storage.database import is_article_seen
+
+_LONDON = pytz.timezone("Europe/London")
 
 logger = logging.getLogger(__name__)
 
@@ -184,9 +187,9 @@ def fetch_all_news(lookback_minutes: int = 5) -> list[NewsItem]:
         try:
             published_at = datetime.fromisoformat(
                 article.get("published", "").replace("Z", "+00:00")
-            )
+            ).astimezone(_LONDON)
         except (ValueError, AttributeError):
-            published_at = datetime.now(timezone.utc)
+            published_at = datetime.now(_LONDON)
 
         for ticker in tickers:
             results.append(NewsItem(
