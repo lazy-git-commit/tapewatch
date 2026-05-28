@@ -138,6 +138,14 @@ def news_cycle() -> None:
             logger.info("Skipping %s — already traded within the last 24 hours", item.ticker)
             continue
 
+        # Price confirmation — do this before saving to DB so that a transient
+        # yfinance failure (e.g. no bars at market open) doesn't permanently mark
+        # the article as seen and block re-evaluation in the next cycle.
+        confirmation = confirm_price_signal(item.ticker)
+        if confirmation is None:
+            logger.info("Signal rejected for %s: price data unavailable — will retry next cycle", item.ticker)
+            continue
+
         # Save signal to DB — map Claude confidence (0–1) to 1–10 scale
         confidence_scaled = max(1, min(10, round(item.confidence * 10)))
         signal_id = save_signal(
@@ -151,13 +159,9 @@ def news_cycle() -> None:
             fetched_at=fetched_at,
         )
 
-        # Price confirmation
-        confirmation = confirm_price_signal(item.ticker)
-        if confirmation is None or not confirmation.is_confirmed:
-            reason = confirmation.reason if confirmation else "price data unavailable"
-            code = confirmation.reason_code if confirmation else "no_price_data"
-            logger.info("Signal rejected for %s: %s", item.ticker, reason)
-            set_rejection_reason(signal_id, reason, code)
+        if not confirmation.is_confirmed:
+            logger.info("Signal rejected for %s: %s", item.ticker, confirmation.reason)
+            set_rejection_reason(signal_id, confirmation.reason, confirmation.reason_code)
             continue
 
         logger.info("Signal approved for %s — placing buy order: %s", item.ticker, confirmation.reason)

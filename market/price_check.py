@@ -76,11 +76,23 @@ def is_too_late_to_buy() -> bool:
     return 0 < minutes_to_close <= cfg.time_stop_minutes
 
 
+def _is_within_market_hours() -> bool:
+    """Wall-clock fallback: True if current ET time is within regular NYSE hours on a weekday."""
+    now_et = datetime.now(_ET)
+    if now_et.weekday() >= 5:
+        return False
+    open_mins = _MARKET_OPEN[0] * 60 + _MARKET_OPEN[1]
+    close_mins = _MARKET_CLOSE[0] * 60 + _MARKET_CLOSE[1]
+    now_mins = now_et.hour * 60 + now_et.minute
+    return open_mins <= now_mins < close_mins
+
+
 def is_market_open() -> bool:
     """
     Check whether the US market is open using the Finnhub market-status API.
     This is authoritative — it handles holidays, early closes, and weekends.
-    Falls back to False on any error so we don't trade on uncertainty.
+    Falls back to a wall-clock check on API error so a transient timeout
+    does not incorrectly pause trading during market hours.
     """
     try:
         resp = requests.get(
@@ -91,8 +103,12 @@ def is_market_open() -> bool:
         resp.raise_for_status()
         return bool(resp.json().get("isOpen", False))
     except Exception as exc:
-        logger.warning("Finnhub market-status check failed: %s", exc)
-        return False
+        fallback = _is_within_market_hours()
+        logger.warning(
+            "Finnhub market-status check failed: %s — falling back to wall-clock (%s)",
+            exc, "open" if fallback else "closed",
+        )
+        return fallback
 
 
 @dataclass
