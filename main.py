@@ -4,9 +4,9 @@ main.py
 Entry point for the momentum trader.
 
 Starts two scheduled jobs:
-  1. news_cycle  — runs every minute during market hours
+  1. news_cycle  — runs every minute unconditionally
+                   returns immediately when the market is closed (cheap Finnhub check)
                    fetches Benzinga signals → Claude sentiment → price check → buy
-                   sleeps until the next NYSE open when the market is closed
   2. monitor_job — runs every 60 seconds
                    checks open positions → sell if exit condition met
 
@@ -24,12 +24,11 @@ from datetime import datetime
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.triggers.date import DateTrigger
 
 from config.settings import cfg
 from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded, is_article_seen, set_rejection_reason
 from news.fetcher import fetch_all_news
-from market.price_check import confirm_price_signal, is_market_open, is_too_late_to_buy, next_market_open
+from market.price_check import confirm_price_signal, is_market_open, is_too_late_to_buy
 from trading.executor import buy
 from monitor.position_monitor import monitor_positions
 from reporting.report import generate_report
@@ -40,75 +39,27 @@ logging.basicConfig(
     format="%(levelname)-8s  %(name)s — %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logging.getLogger("apscheduler").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
-
-
-_scheduler: BackgroundScheduler | None = None  # set in main() before first use
-
-
-def _reschedule_for_market_open() -> None:
-    """Switch the news_cycle job to fire once at the next market open.
-    Uses add_job with replace_existing=True because APScheduler removes a
-    DateTrigger job after it fires — reschedule_job would raise JobLookupError."""
-    if _scheduler is None or not _scheduler.running:
-        return
-    open_utc = next_market_open()
-    _scheduler.add_job(
-        news_cycle,
-        trigger=DateTrigger(run_date=open_utc, timezone=pytz.utc),
-        id="news_cycle",
-        name="News → Price Check → Buy",
-        misfire_grace_time=30,
-        replace_existing=True,
-    )
-    logger.info(
-        "Market closed — news cycle paused until %s UTC",
-        open_utc.strftime("%Y-%m-%d %H:%M"),
-    )
-
-
-def _reschedule_for_interval() -> None:
-    """Switch the news_cycle job back to 1-minute polling."""
-    if _scheduler is None or not _scheduler.running:
-        return
-    _scheduler.add_job(
-        news_cycle,
-        trigger=IntervalTrigger(minutes=1),
-        id="news_cycle",
-        name="News → Price Check → Buy",
-        misfire_grace_time=30,
-        replace_existing=True,
-    )
-    logger.info("Market open — news cycle resumed (1-min interval)")
 
 
 def news_cycle() -> None:
     """
-    The main trading pipeline — runs on a schedule.
+    The main trading pipeline — runs every minute on a fixed IntervalTrigger.
 
       1. Fetch and score positive signals from Benzinga via Claude
       2. Confirm price movement via yfinance
       3. Execute a buy via Trading 212 if confirmed
 
-    When the market is closed, reschedules itself to fire at the next NYSE open
-    instead of polling every minute.
+    Returns immediately (with a log) when the market is closed or too close
+    to close. Never reschedules its own trigger — that avoids a race condition
+    where APScheduler drops the replacement job when it's added mid-execution.
     """
     logger.info("── News cycle starting ──────────────────────────────────")
 
     if not is_market_open():
-        open_utc = next_market_open()
-        logger.info(
-            "Market closed — next open at %s UTC",
-            open_utc.strftime("%Y-%m-%d %H:%M"),
-        )
-        _reschedule_for_market_open()
+        logger.info("Market closed — skipping cycle")
         return
-
-    # If we were sleeping until market open, switch back to 1-min polling
-    job = _scheduler.get_job("news_cycle")
-    if job and not isinstance(job.trigger, IntervalTrigger):
-        _reschedule_for_interval()
 
     if is_too_late_to_buy():
         logger.info(
@@ -228,12 +179,13 @@ def main() -> None:
         misfire_grace_time=30,
     )
 
-    # Run once immediately — this also sets the right trigger if market is closed
+    # Run once immediately on startup
     logger.info("Running initial news cycle...")
     news_cycle()
 
     _scheduler.start()
     logger.info("Scheduler running. News cycle every 1 min. Press Ctrl+C to stop.")
+    logger.info("Jobs scheduled: %s", [j.id for j in _scheduler.get_jobs()])
 
     # Keep the main thread alive; handle Ctrl+C gracefully
     def _shutdown(sig, frame):
