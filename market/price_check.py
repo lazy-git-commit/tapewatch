@@ -168,20 +168,34 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         # ── Momentum baseline via yfinance intraday bars ──────────────────────
         # yfinance data is ~15 min delayed. With momentum_window_minutes=15, the
         # most recent available bar is our target baseline — this is intentional.
+        # At market open (first ~15 min) yfinance has no bars yet; fall back to
+        # the Finnhub open price so signals at open are not silently dropped.
         stock = yf.Ticker(yf_ticker)
         intraday = stock.history(period="1d", interval="1m")
-        if intraday.empty:
-            logger.warning("No intraday data for %s — market may be closed or ticker delisted", yf_ticker)
-            return None
 
-        # The last yfinance bar is ~15 min ago; use it as the momentum baseline
-        past_price = float(intraday["Close"].iloc[-1])
+        if intraday.empty:
+            if open_price and open_price > 0:
+                # No yfinance bars yet — use today's open as the baseline.
+                # This measures how much the stock has moved since the open,
+                # which is the most meaningful momentum at the start of the day.
+                past_price = open_price
+                logger.info(
+                    "No intraday bars for %s yet — using Finnhub open price as momentum baseline",
+                    yf_ticker,
+                )
+            else:
+                logger.warning("No intraday data for %s — market may be closed or ticker delisted", yf_ticker)
+                return None
+        else:
+            # The last yfinance bar is ~15 min ago; use it as the momentum baseline
+            past_price = float(intraday["Close"].iloc[-1])
+
         recent_move_pct = ((current_price - past_price) / past_price) * 100 if past_price else 0.0
 
         # ── Volume: 20-day daily average via yfinance ─────────────────────────
         daily = stock.history(period="21d", interval="1d")
         avg_volume = int(daily["Volume"].iloc[:-1].mean()) if len(daily) >= 2 else 0
-        current_volume = int(intraday["Volume"].sum())
+        current_volume = int(intraday["Volume"].sum()) if not intraday.empty else 0
         volume_ratio = (current_volume / avg_volume) if avg_volume > 0 else 0.0
 
         # ── Evaluate conditions ───────────────────────────────────────────────
