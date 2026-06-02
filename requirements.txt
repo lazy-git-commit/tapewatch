@@ -8,6 +8,7 @@ anthropic==0.54.0
 yfinance==1.3.0
 pandas==2.3.2
 pandas-ta==0.4.71b0
+pandas_market_calendars==5.4.0
 
 # Order execution — Trading 212 REST API called directly via requests
 

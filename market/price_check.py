@@ -20,14 +20,17 @@ A signal is confirmed when ALL of the following hold:
 """
 
 import logging
-import time
 import requests
+import pandas as pd
+import pandas_market_calendars as mcal
 from datetime import datetime, timezone, timedelta
 import yfinance as yf
 from dataclasses import dataclass
 import pytz
 from config.settings import cfg
 from market.finnhub_bars import get_finnhub_quote
+
+_NYSE = mcal.get_calendar("NYSE")
 
 logger = logging.getLogger(__name__)
 
@@ -68,59 +71,56 @@ def _to_yf_ticker(t212_ticker: str) -> str:
 
 def is_too_late_to_buy() -> bool:
     """
-    Return True if we are within TIME_STOP_MINUTES of market close.
+    Return True if we are within TIME_STOP_MINUTES of today's market close.
+    Uses the calendar's actual close time so early-close days are handled correctly.
     Returns False outside of market hours — is_market_open() handles that.
     """
-    now_et = datetime.now(_ET)
-    close_et = now_et.replace(hour=_MARKET_CLOSE[0], minute=_MARKET_CLOSE[1], second=0, microsecond=0)
-    minutes_to_close = (close_et - now_et).total_seconds() / 60
-    return 0 < minutes_to_close <= cfg.time_stop_minutes
-
-
-def _is_within_market_hours() -> bool:
-    """Wall-clock fallback: True if current ET time is within regular NYSE hours on a weekday."""
-    now_et = datetime.now(_ET)
-    if now_et.weekday() >= 5:
-        return False
-    open_mins = _MARKET_OPEN[0] * 60 + _MARKET_OPEN[1]
-    close_mins = _MARKET_CLOSE[0] * 60 + _MARKET_CLOSE[1]
-    now_mins = now_et.hour * 60 + now_et.minute
-    return open_mins <= now_mins < close_mins
+    try:
+        now_utc = pd.Timestamp.now("UTC")
+        today = now_utc.strftime("%Y-%m-%d")
+        sched = _NYSE.schedule(today, today)
+        if sched.empty:
+            return False
+        close_utc = sched.iloc[0]["market_close"]
+        minutes_to_close = (close_utc - now_utc).total_seconds() / 60
+        return 0 < minutes_to_close <= cfg.time_stop_minutes
+    except Exception:
+        # Fallback to hardcoded close time
+        now_et = datetime.now(_ET)
+        close_et = now_et.replace(hour=_MARKET_CLOSE[0], minute=_MARKET_CLOSE[1], second=0, microsecond=0)
+        minutes_to_close = (close_et - now_et).total_seconds() / 60
+        return 0 < minutes_to_close <= cfg.time_stop_minutes
 
 
 def is_market_open() -> bool:
     """
-    Check whether the US market is open using the Finnhub market-status API.
-    Retries up to 3 times total (2 retries after the first failure) with a
-    60-second wait between attempts. Falls back to a wall-clock check only
-    after all 3 attempts fail, so a transient timeout does not incorrectly
-    pause trading during market hours.
-    """
-    last_exc = None
-    for attempt in range(3):
-        if attempt > 0:
-            logger.warning(
-                "Finnhub market-status retry %d/2 after 60s (last error: %s)",
-                attempt, last_exc,
-            )
-            time.sleep(60)
-        try:
-            resp = requests.get(
-                "https://finnhub.io/api/v1/stock/market-status",
-                params={"exchange": "US", "token": cfg.finnhub_api_key},
-                timeout=5,
-            )
-            resp.raise_for_status()
-            return bool(resp.json().get("isOpen", False))
-        except Exception as exc:
-            last_exc = exc
+    Check whether the NYSE is currently open using pandas_market_calendars
+    as the authoritative local source (handles holidays, early closes, weekends).
 
-    fallback = _is_within_market_hours()
-    logger.warning(
-        "Finnhub market-status failed after 3 attempts — falling back to wall-clock (%s)",
-        "open" if fallback else "closed",
-    )
-    return fallback
+    Falls back to a Finnhub API check if the calendar check fails for any reason.
+    """
+    try:
+        now_utc = pd.Timestamp.now("UTC")
+        today = now_utc.strftime("%Y-%m-%d")
+        sched = _NYSE.schedule(today, today)
+        if sched.empty:
+            return False  # holiday or weekend
+        return bool(_NYSE.open_at_time(sched, now_utc))
+    except Exception as exc:
+        logger.warning("Calendar open check failed: %s — falling back to Finnhub", exc)
+
+    # Finnhub fallback
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/stock/market-status",
+            params={"exchange": "US", "token": cfg.finnhub_api_key},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        return bool(resp.json().get("isOpen", False))
+    except Exception as exc:
+        logger.warning("Finnhub market-status fallback also failed: %s — assuming closed", exc)
+        return False
 
 
 @dataclass
