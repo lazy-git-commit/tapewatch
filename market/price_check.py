@@ -200,8 +200,15 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
 
         # ── Evaluate conditions ───────────────────────────────────────────────
         momentum_ok = recent_move_pct >= cfg.min_price_move_pct
-        volume_ok = volume_ratio >= 1.5
         dead_cat = day_move_pct < -cfg.max_day_drop_pct
+
+        # Skip volume filter in the first 15 min after open: intraday cumulative
+        # volume hasn't had time to build up, making the ratio artificially low.
+        now_et = datetime.now(_ET)
+        market_open_et = now_et.replace(hour=_MARKET_OPEN[0], minute=_MARKET_OPEN[1], second=0, microsecond=0)
+        minutes_since_open = (now_et - market_open_et).total_seconds() / 60
+        at_open = 0 <= minutes_since_open < 15
+        volume_ok = at_open or volume_ratio >= 1.5
 
         if dead_cat:
             is_confirmed = False
@@ -221,11 +228,18 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         elif volume_ok:
             is_confirmed = True
             reason_code = "approved"
-            reason = (
-                f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
-                f"with {volume_ratio:.1f}× average volume "
-                f"(day: {day_move_pct:+.2f}%)"
-            )
+            if at_open:
+                reason = (
+                    f"+{recent_move_pct:.2f}% since open "
+                    f"(volume filter skipped — first 15 min) "
+                    f"(day: {day_move_pct:+.2f}%)"
+                )
+            else:
+                reason = (
+                    f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
+                    f"with {volume_ratio:.1f}× average volume "
+                    f"(day: {day_move_pct:+.2f}%)"
+                )
         else:
             is_confirmed = False
             reason_code = "low_volume"
