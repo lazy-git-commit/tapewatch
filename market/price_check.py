@@ -105,7 +105,10 @@ def is_market_open() -> bool:
         sched = _NYSE.schedule(today, today)
         if sched.empty:
             return False  # holiday or weekend
-        return bool(_NYSE.open_at_time(sched, now_utc))
+        market_open = sched.iloc[0]["market_open"]
+        market_close = sched.iloc[0]["market_close"]
+        # compare directly — avoids open_at_time raising when timestamp is outside session
+        return bool(market_open <= now_utc < market_close)
     except Exception as exc:
         logger.warning("Calendar open check failed: %s — falling back to Finnhub", exc)
 
