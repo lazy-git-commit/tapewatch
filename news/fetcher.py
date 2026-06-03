@@ -93,18 +93,34 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, tuple[str, float]]
         "confidence must be a float 0.0–1.0\n\n"
         f"Articles:\n{items_json}"
     )
+    # Budget ~40 tokens per article for the response array
+    max_tokens = max(512, len(articles) * 40 + 64)
     try:
         msg = _claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=512,
+            max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = msg.content[0].text.strip()
+        # Strip markdown fences if present
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        results = json.loads(raw.strip())
+        raw = raw.strip()
+        # If the response was truncated mid-JSON, recover completed entries
+        # by finding the last complete object and closing the array.
+        if not raw.endswith("]"):
+            last_close = raw.rfind("}")
+            if last_close != -1:
+                raw = raw[: last_close + 1] + "]"
+                logger.warning(
+                    "Claude response truncated — recovered %d/%d articles",
+                    raw.count('"id"'), len(articles),
+                )
+            else:
+                raise ValueError("No complete JSON object found in response")
+        results = json.loads(raw)
         return {
             str(r["id"]): (r.get("sentiment", "neutral").lower(), float(r.get("confidence", 0.5)))
             for r in results
@@ -145,6 +161,20 @@ def fetch_all_news(lookback_minutes: int = 5) -> list[NewsItem]:
         raw_tickers = [t for t in (article.get("tickers") or []) if t]
         if not raw_tickers:
             continue
+
+        # Skip stale articles — published more than 1 min before we fetched them.
+        # We poll every minute, so anything older than 1 min was already seen
+        # (or missed) in a prior cycle. Acting on old news risks buying after
+        # the move has already happened and reversed.
+        try:
+            published_at = datetime.fromisoformat(
+                article.get("published", "").replace("Z", "+00:00")
+            )
+            age_minutes = (datetime.now(timezone.utc) - published_at).total_seconds() / 60
+            if age_minutes > 1:
+                continue
+        except (ValueError, AttributeError):
+            pass
 
         # Build T212 tickers and filter blocklist + already-seen pairs
         eligible_tickers = [

@@ -371,6 +371,22 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
 
         momentum_pct = (confirm_price - baseline_price) / baseline_price * 100
 
+        # ── Dead-cat bounce guard ─────────────────────────────────────────────
+        open_price = float(bars.iloc[0]["Open"])
+        day_move_pct = (confirm_price - open_price) / open_price * 100
+        if day_move_pct < -cfg.max_day_drop_pct:
+            results.append(TradeResult(
+                ticker=ev.ticker, headline=ev.headline,
+                published_at=ev.published_at,
+                entry_time=t_confirm, entry_price=confirm_price,
+                exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
+                price_minus_15=price_minus_15, price_at_news=price_at_news,
+                price_plus_15=confirm_price, momentum_pct=momentum_pct,
+                volume_ratio=volume_ratio,
+                rejected=f"dead_cat: down {day_move_pct:.1f}% on day (max -{cfg.max_day_drop_pct}%)",
+            ))
+            continue
+
         # ── v7: volume check ──────────────────────────────────────────────────
         volume_ratio = _get_volume_ratio(yf_ticker, date, bars)
         # Compute volume at confirmation time (not end of day)
