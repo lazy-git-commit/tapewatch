@@ -17,6 +17,7 @@ Press Ctrl+C to stop gracefully.
 """
 
 import logging
+import os
 import signal
 import sys
 import time
@@ -145,11 +146,25 @@ def news_cycle() -> None:
     logger.info("── News cycle complete ──────────────────────────────────")
 
 
+def _read_version() -> dict:
+    """Read VERSION file written by GitHub Actions at deploy time."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "VERSION")) as f:
+            return dict(line.strip().split("=", 1) for line in f if "=" in line)
+    except FileNotFoundError:
+        return {}
+
+
 def main() -> None:
+    version = _read_version()
     logger.info("=" * 60)
     logger.info("  MOMENTUM TRADER STARTING")
     logger.info("  Mode: %s", cfg.trading_mode.upper())
     logger.info("  Blocklist: %s", ", ".join(cfg.blocklist) if cfg.blocklist else "none")
+    if version:
+        logger.info("  Deployed: %s", version.get("deployed_at", "unknown"))
+        logger.info("  Commit:   %s", version.get("commit", "unknown")[:12])
     logger.info("=" * 60)
 
     # Validate config and initialise DB

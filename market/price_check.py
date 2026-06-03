@@ -168,20 +168,33 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         open_price = float(quote["o"]) if quote.get("o") else current_price
         day_move_pct = ((current_price - open_price) / open_price) * 100 if open_price else 0.0
 
+        # ── Time since open ───────────────────────────────────────────────────
+        now_et = datetime.now(_ET)
+        market_open_et = now_et.replace(hour=_MARKET_OPEN[0], minute=_MARKET_OPEN[1], second=0, microsecond=0)
+        minutes_since_open = (now_et - market_open_et).total_seconds() / 60
+
+        # Hard block on the first minute: the opening auction creates noisy
+        # price ticks that look like momentum but reverse within seconds.
+        if minutes_since_open < 1:
+            logger.info(
+                "Price check [%s]: skipping — within first minute of open (auction noise)",
+                yf_ticker,
+            )
+            return None
+
         # ── Momentum baseline via yfinance intraday bars ──────────────────────
         # yfinance data is ~15 min delayed. With momentum_window_minutes=15, the
         # most recent available bar is our target baseline — this is intentional.
-        # At market open (first ~15 min) yfinance has no bars yet; fall back to
-        # the Finnhub open price so signals at open are not silently dropped.
         stock = yf.Ticker(yf_ticker)
         intraday = stock.history(period="1d", interval="1m")
 
         if intraday.empty:
-            if open_price and open_price > 0:
-                # No yfinance bars yet — use today's open as the baseline.
-                # This measures how much the stock has moved since the open,
-                # which is the most meaningful momentum at the start of the day.
+            if 1 <= minutes_since_open < 15 and open_price and open_price > 0:
+                # No yfinance bars yet (1–15 min after open) — use Finnhub open
+                # price as baseline. Measures move since open, which is meaningful
+                # once the auction has settled (after the 1-min block above).
                 past_price = open_price
+                using_open_fallback = True
                 logger.info(
                     "No intraday bars for %s yet — using Finnhub open price as momentum baseline",
                     yf_ticker,
@@ -192,6 +205,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         else:
             # The last yfinance bar is ~15 min ago; use it as the momentum baseline
             past_price = float(intraday["Close"].iloc[-1])
+            using_open_fallback = False
 
         recent_move_pct = ((current_price - past_price) / past_price) * 100 if past_price else 0.0
 
@@ -205,13 +219,15 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         momentum_ok = recent_move_pct >= cfg.min_price_move_pct
         dead_cat = day_move_pct < -cfg.max_day_drop_pct
 
-        # Skip volume filter in the first 15 min after open: intraday cumulative
-        # volume hasn't had time to build up, making the ratio artificially low.
-        now_et = datetime.now(_ET)
-        market_open_et = now_et.replace(hour=_MARKET_OPEN[0], minute=_MARKET_OPEN[1], second=0, microsecond=0)
-        minutes_since_open = (now_et - market_open_et).total_seconds() / 60
-        at_open = 0 <= minutes_since_open < 15
-        volume_ok = at_open or volume_ratio >= 1.5
+        # Volume check: require ≥1.5× average after the first 15 min.
+        # In the 1–15 min window (using open-price fallback), require that
+        # volume is at least non-zero — a true gap-up surge will have volume;
+        # a noisy auction tick will not.
+        if minutes_since_open >= 15:
+            volume_ok = volume_ratio >= 1.5
+        else:
+            # 1–15 min window: must have some volume (not 0.0×)
+            volume_ok = current_volume > 0 and volume_ratio > 0
 
         if dead_cat:
             is_confirmed = False
@@ -231,10 +247,10 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         elif volume_ok:
             is_confirmed = True
             reason_code = "approved"
-            if at_open:
+            if using_open_fallback:
                 reason = (
                     f"+{recent_move_pct:.2f}% since open "
-                    f"(volume filter skipped — first 15 min) "
+                    f"with {volume_ratio:.1f}× avg volume "
                     f"(day: {day_move_pct:+.2f}%)"
                 )
             else:
@@ -246,10 +262,16 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         else:
             is_confirmed = False
             reason_code = "low_volume"
-            reason = (
-                f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
-                f"but low volume ({volume_ratio:.1f}× avg, threshold 1.5×) — rejected"
-            )
+            if minutes_since_open < 15:
+                reason = (
+                    f"+{recent_move_pct:.2f}% since open "
+                    f"but no volume yet ({current_volume} shares) — rejected"
+                )
+            else:
+                reason = (
+                    f"+{recent_move_pct:.2f}% in last {cfg.momentum_window_minutes} min "
+                    f"but low volume ({volume_ratio:.1f}× avg, threshold 1.5×) — rejected"
+                )
 
         logger.info(
             "Price check [%s]: recent=%+.2f%% day=%+.2f%% volume=%.1f× — %s",
