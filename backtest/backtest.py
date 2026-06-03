@@ -226,6 +226,7 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
     seen_article_tickers: set = set()
 
     if use_sentiment:
+        scores: dict = {}
         to_score = [
             {
                 "id": str(a.get("benzinga_id", "")),
@@ -234,7 +235,11 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
             }
             for a in articles
         ]
-        scores = _batch_score_sentiment(to_score)
+        # Chunk into batches of 20 to stay within Claude's output token limit
+        chunk_size = 20
+        for i in range(0, len(to_score), chunk_size):
+            chunk = to_score[i:i + chunk_size]
+            scores.update(_batch_score_sentiment(chunk))
     else:
         scores = {}
 
