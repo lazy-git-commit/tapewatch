@@ -24,8 +24,9 @@ Trade logged to PostgreSQL (tagged demo or live)
 Grafana dashboard — live activity and history
 ```
 
-Only runs during US market hours (Mon–Fri, 14:30–21:00 UTC).
-Sleeps precisely until the next NYSE open when the market is closed.
+Polls every minute around the clock. Skips cycles outside NYSE market hours
+(Mon–Fri, 13:30–20:00 UTC). Holidays and early closes are handled automatically
+via `pandas_market_calendars` — no manual configuration needed.
 
 ---
 
