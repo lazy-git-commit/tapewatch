@@ -3,14 +3,17 @@ backtest/backtest.py
 ────────────────────
 Replays the full trading strategy against historical news + price data.
 
-For each article fetched from Benzinga:
-  1. Classify sentiment with Claude Haiku (same prompt as production)
-  2. Check price momentum: Finnhub open price as baseline, yfinance 1-min bars
-     to measure the move in the 15-min window after publication
-  3. Check volume: today's cumulative volume vs 20-day average (≥1.5× required)
-  4. Simulate a buy at the post-news price, then exit at:
+Mirrors the live v7 logic:
+  1. Classify sentiment with Claude Haiku (batched, same as production)
+  2. Block signals in the first minute after open (09:30–09:31 ET)
+  3. Check price momentum: yfinance 1-min bars (15-min delayed baseline)
+     Falls back to open price as baseline in the 1–15 min window
+  4. Check volume:
+       - 1–15 min after open: current_volume > 0 required
+       - after 15 min: ≥1.5× 20-day average required
+  5. Simulate a buy at the confirmation price, then exit at:
        +5% take profit / -2% stop loss / 60-min time stop
-  5. Show a price window: 15 min before news → 60 min after news
+  6. Show a price window: 15 min before news → 60 min after news
 
 Usage:
   python -m backtest.backtest                     # yesterday's market session
@@ -19,11 +22,9 @@ Usage:
 """
 
 import argparse
-import json
+import html
 import logging
-import sys
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -31,7 +32,7 @@ import requests
 import yfinance as yf
 
 from config.settings import cfg
-from news.fetcher import _score_sentiment, _fetch
+from news.fetcher import _batch_score_sentiment, _fetch
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -219,18 +220,31 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
     articles = [a for a in articles if a.get("tickers")]
     print(f"With tickers: {len(articles)}")
 
-    # Score sentiment (or accept all)
-    print(f"Scoring sentiment {'with Claude Haiku' if use_sentiment else '(skipped — all articles used)'}...")
+    # Score sentiment in one batched Claude call (or accept all)
+    print(f"Scoring sentiment {'with Claude Haiku (batched)' if use_sentiment else '(skipped — all articles used)'}...")
     news_events: list[NewsEvent] = []
     seen_article_tickers: set = set()
 
+    if use_sentiment:
+        to_score = [
+            {
+                "id": str(a.get("benzinga_id", "")),
+                "headline": html.unescape(a.get("title", "")),
+                "teaser": html.unescape(a.get("teaser") or a.get("body", "")[:200]),
+            }
+            for a in articles
+        ]
+        scores = _batch_score_sentiment(to_score)
+    else:
+        scores = {}
+
     for a in articles:
         article_id = str(a.get("benzinga_id", ""))
-        headline = a.get("title", "")
-        teaser = a.get("teaser") or a.get("body", "")[:200]
+        headline = html.unescape(a.get("title", ""))
+        teaser = html.unescape(a.get("teaser") or a.get("body", "")[:200])
 
         if use_sentiment:
-            sentiment, confidence = _score_sentiment(headline, teaser)
+            sentiment, confidence = scores.get(article_id, ("neutral", 0.0))
             if sentiment != "positive":
                 continue
         else:
@@ -270,6 +284,8 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
     print(f"\nRunning price checks and trade simulations...")
     print("-" * 72)
 
+    market_open_utc = date.replace(hour=13, minute=30, second=0, microsecond=0, tzinfo=timezone.utc)
+
     for ev in news_events:
         yf_ticker = ev.ticker.split("_")[0] if "_" in ev.ticker else ev.ticker
 
@@ -289,71 +305,120 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
             ))
             continue
 
-        # Price window
-        t_minus_15 = ev.published_at - timedelta(minutes=15)
-        t_plus_15  = ev.published_at + timedelta(minutes=15)
-
-        price_minus_15 = _price_at(bars, t_minus_15)
-        price_at_news  = _price_at(bars, ev.published_at)
-        price_plus_15  = _price_at(bars, t_plus_15)
-
-        if price_at_news is None or price_plus_15 is None:
+        # ── v7: block signals in the first minute after open ─────────────────
+        minutes_since_open = (ev.published_at - market_open_utc).total_seconds() / 60
+        if minutes_since_open < 1:
             results.append(TradeResult(
                 ticker=ev.ticker, headline=ev.headline,
                 published_at=ev.published_at,
                 entry_time=ev.published_at, entry_price=0,
                 exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
-                price_minus_15=price_minus_15, price_at_news=price_at_news,
-                price_plus_15=price_plus_15, momentum_pct=None,
+                price_minus_15=None, price_at_news=None, price_plus_15=None,
+                momentum_pct=None, volume_ratio=None,
+                rejected="first_minute_block",
+            ))
+            continue
+
+        # Price window — confirmation point is 15 min after publication
+        t_minus_15 = ev.published_at - timedelta(minutes=15)
+        t_confirm  = ev.published_at + timedelta(minutes=15)
+
+        price_minus_15  = _price_at(bars, t_minus_15)
+        price_at_news   = _price_at(bars, ev.published_at)
+        price_at_confirm = _price_at(bars, t_confirm)
+
+        if price_at_news is None:
+            results.append(TradeResult(
+                ticker=ev.ticker, headline=ev.headline,
+                published_at=ev.published_at,
+                entry_time=ev.published_at, entry_price=0,
+                exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
+                price_minus_15=price_minus_15, price_at_news=None,
+                price_plus_15=None, momentum_pct=None,
                 volume_ratio=None, rejected="no_price_data",
             ))
             continue
 
-        momentum_pct = (price_plus_15 - price_at_news) / price_at_news * 100
+        # ── v7: momentum baseline ─────────────────────────────────────────────
+        # In the 1–15 min window, yfinance has no bars; use the open-bar price
+        # as the baseline (first bar of the day). After 15 min, the last bar
+        # ~15 min ago is the baseline (standard production logic).
+        if minutes_since_open < 15:
+            open_bar = bars.iloc[0] if not bars.empty else None
+            baseline_price = float(open_bar["Close"]) if open_bar is not None else price_at_news
+            confirm_price = price_at_news  # enter at current price, baseline is open
+        else:
+            # baseline = price 15 min ago (last yfinance bar before news)
+            baseline_price = price_at_news
+            confirm_price = price_at_confirm
 
-        # Volume check
+        if confirm_price is None:
+            results.append(TradeResult(
+                ticker=ev.ticker, headline=ev.headline,
+                published_at=ev.published_at,
+                entry_time=t_confirm, entry_price=0,
+                exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
+                price_minus_15=price_minus_15, price_at_news=price_at_news,
+                price_plus_15=None, momentum_pct=None,
+                volume_ratio=None, rejected="no_price_data",
+            ))
+            continue
+
+        momentum_pct = (confirm_price - baseline_price) / baseline_price * 100
+
+        # ── v7: volume check ──────────────────────────────────────────────────
         volume_ratio = _get_volume_ratio(yf_ticker, date, bars)
+        # Compute volume at confirmation time (not end of day)
+        bars_at_confirm = bars[bars.index <= t_confirm]
+        current_volume = int(bars_at_confirm["Volume"].sum()) if not bars_at_confirm.empty else 0
+
+        if minutes_since_open < 15:
+            volume_ok = current_volume > 0
+            volume_reject_reason = f"no volume yet ({current_volume} shares)"
+        else:
+            volume_ok = volume_ratio >= VOLUME_RATIO_MIN
+            volume_reject_reason = f"volume {volume_ratio:.2f}× < {VOLUME_RATIO_MIN}× threshold"
 
         # Apply confirmation filters
         if momentum_pct < MIN_PRICE_MOVE_PCT:
             results.append(TradeResult(
                 ticker=ev.ticker, headline=ev.headline,
                 published_at=ev.published_at,
-                entry_time=t_plus_15, entry_price=price_plus_15,
+                entry_time=t_confirm, entry_price=confirm_price,
                 exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
                 price_minus_15=price_minus_15, price_at_news=price_at_news,
-                price_plus_15=price_plus_15, momentum_pct=momentum_pct,
+                price_plus_15=confirm_price, momentum_pct=momentum_pct,
                 volume_ratio=volume_ratio,
                 rejected=f"momentum {momentum_pct:+.2f}% < {MIN_PRICE_MOVE_PCT}% threshold",
             ))
             continue
 
-        if volume_ratio < VOLUME_RATIO_MIN:
+        if not volume_ok:
             results.append(TradeResult(
                 ticker=ev.ticker, headline=ev.headline,
                 published_at=ev.published_at,
-                entry_time=t_plus_15, entry_price=price_plus_15,
+                entry_time=t_confirm, entry_price=confirm_price,
                 exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
                 price_minus_15=price_minus_15, price_at_news=price_at_news,
-                price_plus_15=price_plus_15, momentum_pct=momentum_pct,
+                price_plus_15=confirm_price, momentum_pct=momentum_pct,
                 volume_ratio=volume_ratio,
-                rejected=f"volume {volume_ratio:.2f}× < {VOLUME_RATIO_MIN}× threshold",
+                rejected=volume_reject_reason,
             ))
             continue
 
-        # Simulate trade
+        # Simulate trade — enter at confirmation price
         exit_time, exit_price, exit_reason, pnl_pct = _simulate_trade(
-            bars, t_plus_15, price_plus_15
+            bars, t_confirm, confirm_price
         )
 
         results.append(TradeResult(
             ticker=ev.ticker, headline=ev.headline,
             published_at=ev.published_at,
-            entry_time=t_plus_15, entry_price=price_plus_15,
+            entry_time=t_confirm, entry_price=confirm_price,
             exit_time=exit_time, exit_price=exit_price,
             exit_reason=exit_reason, pnl_pct=pnl_pct,
             price_minus_15=price_minus_15, price_at_news=price_at_news,
-            price_plus_15=price_plus_15, momentum_pct=momentum_pct,
+            price_plus_15=confirm_price, momentum_pct=momentum_pct,
             volume_ratio=volume_ratio, rejected=None,
         ))
 
