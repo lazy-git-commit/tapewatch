@@ -81,32 +81,47 @@ Authorization: Bearer <MASSIVE_BENZINGA_API_KEY>
 
 ### Purpose
 
-Classifies the sentiment of each Benzinga article as `positive`, `neutral`, or `negative` from a US equity trader's perspective. Only `positive` articles proceed to price confirmation.
+Acts as an expert day trader to identify news that will cause a stock to move up sharply within the next 15 minutes. Classifies each article as `positive`, `neutral`, or `negative`. Only `positive` articles proceed to price confirmation.
+
+The prompt is domain-specific — it explicitly teaches Claude which news types drive intraday momentum (earnings beats, FDA approvals, M&A, contract wins, guidance raises) and which to ignore regardless of tone (analyst price target raises, "Maintains" ratings, sector commentary, conference attendance).
 
 ---
 
 ### API call
 
-All eligible articles in a single news cycle are scored in **one batched call** — not one call per article. Articles are pre-filtered (must have tickers, not blocklisted, not already seen in DB) before the call is made.
+All eligible articles in a single news cycle are scored in **one batched call** — not one call per article. Articles are pre-filtered (must have tickers, not blocklisted, not already seen in DB, published within the last 60 seconds) before the call is made. `max_tokens` scales dynamically with batch size (~40 tokens per article).
 
 **Code:**
 ```python
 client = anthropic.Anthropic()
 msg = client.messages.create(
     model="claude-haiku-4-5-20251001",
-    max_tokens=512,
+    max_tokens=max(512, len(articles) * 40 + 64),
     messages=[{"role": "user", "content": prompt}],
 )
 ```
 
-**Prompt template:**
+**Prompt structure:**
 ```
-You are a financial news sentiment classifier for US equity traders.
-Classify the sentiment of each article below.
-Respond with a JSON array only — no markdown, no explanation.
-Each element must have exactly these keys: id, sentiment, confidence.
-sentiment must be one of: "positive", "neutral", "negative"
-confidence must be a float 0.0–1.0
+You are an expert day trader specialising in US equity momentum trading.
+Your job is to identify news that will cause a stock to move UP sharply
+within the next 15 minutes of market trading.
+
+POSITIVE (high confidence 0.8–1.0) — genuine catalysts that move stocks NOW:
+- Earnings beats: revenue or EPS above analyst estimates
+- FDA approvals, drug trial success, regulatory green lights
+- M&A: acquisition announcements, buyout offers, merger deals
+- Major contract wins with concrete dollar values
+- Guidance raises: company raises full-year revenue or earnings outlook
+- Short squeeze signals: stock halted to the upside, unusual volume surge
+- Surprise CEO/product announcements with material business impact
+
+NEUTRAL (do not mark positive) — these almost never move a stock in 15 min:
+- Analyst price target raises or reiterations with no new information
+- 'Maintains Buy/Overweight' — the analyst already had this rating
+- General market or sector commentary
+- Conference attendance, awards, ESG reports
+- Articles that summarise news published days ago
 
 Articles:
 [{"id": "...", "headline": "...", "teaser": "..."}, ...]
@@ -115,8 +130,8 @@ Articles:
 **Sample response:**
 ```json
 [
-  {"id": "52736856", "sentiment": "positive", "confidence": 0.88},
-  {"id": "52736901", "sentiment": "neutral",  "confidence": 0.72}
+  {"id": "52736856", "sentiment": "positive", "confidence": 0.92},
+  {"id": "52736901", "sentiment": "neutral",  "confidence": 0.10}
 ]
 ```
 

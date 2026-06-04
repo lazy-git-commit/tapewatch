@@ -85,8 +85,42 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, tuple[str, float]]
         ensure_ascii=False,
     )
     prompt = (
-        "You are a financial news sentiment classifier for US equity traders.\n"
-        "Classify the sentiment of each article below.\n"
+        "You are an expert day trader specialising in US equity momentum trading.\n"
+        "Your job is to identify news that will cause a stock to move UP sharply "
+        "within the next 15 minutes of market trading.\n\n"
+
+        "Rate each article as 'positive', 'neutral', or 'negative' based on whether "
+        "it is likely to drive immediate intraday buying momentum.\n\n"
+
+        "POSITIVE (high confidence 0.8–1.0) — genuine catalysts that move stocks NOW:\n"
+        "- Earnings beats: revenue or EPS above analyst estimates\n"
+        "- FDA approvals, drug trial success, regulatory green lights\n"
+        "- M&A: acquisition announcements, buyout offers, merger deals\n"
+        "- Major contract wins with concrete dollar values\n"
+        "- Guidance raises: company raises full-year revenue or earnings outlook\n"
+        "- Short squeeze signals: stock halted to the upside, unusual volume surge\n"
+        "- Surprise CEO/product announcements with material business impact\n\n"
+
+        "NEUTRAL or low-confidence positive (0.5–0.7) — may have some impact but weak:\n"
+        "- Analyst initiations or upgrades WITH a specific catalyst mentioned\n"
+        "- Partnership announcements without clear revenue figures\n"
+        "- Clinical trial updates that are early-stage or mixed\n\n"
+
+        "NEUTRAL (do not mark positive) — these almost never move a stock in 15 min:\n"
+        "- Analyst price target raises or reiterations with no new information\n"
+        "- 'Maintains Buy/Overweight' — the analyst already had this rating\n"
+        "- General market or sector commentary\n"
+        "- Conference attendance announcements\n"
+        "- Scheduled dividend declarations\n"
+        "- Articles that summarise or repeat news published days ago\n"
+        "- Awards, rankings, ESG reports\n\n"
+
+        "NEGATIVE — news that will drive the stock DOWN:\n"
+        "- Earnings misses, guidance cuts, revenue warnings\n"
+        "- FDA rejections, trial failures\n"
+        "- Layoffs, CEO departures, fraud investigations\n"
+        "- Analyst downgrades with specific negative catalyst\n\n"
+
         "Respond with a JSON array only — no markdown, no explanation.\n"
         "Each element must have exactly these keys: id, sentiment, confidence.\n"
         'sentiment must be one of: "positive", "neutral", "negative"\n'

@@ -7,7 +7,9 @@ A news-driven momentum trading system for your Trading 212 Stocks ISA.
 ```
 Benzinga news (via massive.com) — breaking US equity news with tickers
        ↓
-Claude Haiku — sentiment classification (positive / neutral / negative)
+Claude Haiku — momentum catalyst classifier
+                     earnings beats / FDA / M&A / contract wins → positive
+                     analyst PT raises / "Maintains" ratings → neutral (ignored)
        ↓
 Price confirmation — Finnhub real-time quote + yfinance momentum baseline
                      price up ≥ 0.5% over last 15 min + volume spike?
