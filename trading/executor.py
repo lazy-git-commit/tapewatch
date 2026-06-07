@@ -157,6 +157,36 @@ def buy(ticker: str, price: float) -> OrderResult:
 
     try:
         order = _post("/equity/orders/market", {"quantity": quantity, "ticker": ticker})
+    except Exception as exc:
+        exc_str = str(exc)
+        # T212 rejects orders when our quantity has more decimal places than the
+        # instrument allows. The error says "invalid quantity precision N" where N
+        # is the maximum allowed. Retry once with the correct rounding.
+        if "quantity-precision-mismatch" in exc_str:
+            import json as _json
+            try:
+                body = exc_str.split(" - ", 1)[1]
+                allowed = int(_json.loads(body)["detail"].split()[-1])
+                quantity = round(quantity, allowed)
+                logger.info(
+                    "Retrying BUY %s with precision=%d → quantity=%s",
+                    ticker, allowed, quantity,
+                )
+                order = _post("/equity/orders/market", {"quantity": quantity, "ticker": ticker})
+            except Exception as retry_exc:
+                logger.error("BUY failed for %s after precision retry: %s", ticker, retry_exc)
+                return OrderResult(
+                    success=False, ticker=ticker, quantity=quantity,
+                    price=price, order_id=None, error=str(retry_exc),
+                )
+        else:
+            logger.error("BUY failed for %s: %s", ticker, exc)
+            return OrderResult(
+                success=False, ticker=ticker, quantity=quantity,
+                price=price, order_id=None, error=exc_str,
+            )
+
+    try:
         order_id = str(order.get("id", ""))
         fill = _fetch_fill(order_id)
         filled_price, net_gbp, fx_rate, fees_gbp = _parse_fill(fill)
@@ -172,7 +202,7 @@ def buy(ticker: str, price: float) -> OrderResult:
             net_gbp=net_gbp, fx_rate=fx_rate, fees_gbp=fees_gbp,
         )
     except Exception as exc:
-        logger.error("BUY failed for %s: %s", ticker, exc)
+        logger.error("BUY post-order processing failed for %s: %s", ticker, exc)
         return OrderResult(
             success=False, ticker=ticker, quantity=quantity,
             price=price, order_id=None, error=str(exc),

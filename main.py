@@ -104,7 +104,7 @@ def news_cycle() -> None:
             ticker=item.ticker,
             headline=item.headline,
             source=item.source,
-            sentiment="BULLISH",
+            sentiment="positive",
             confidence=confidence_scaled,
             article_id=item.article_id,
             published_at=item.published_at.isoformat(),

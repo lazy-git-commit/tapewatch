@@ -68,57 +68,73 @@ class TestExitConditions:
 # ── Sentiment scoring tests ───────────────────────────────────────────────────
 
 class TestSentimentScoring:
-    """Tests for news/fetcher.py::_score_sentiment"""
+    """Tests for news/fetcher.py::_batch_score_sentiment"""
 
     def _mock_claude_response(self, text: str) -> MagicMock:
         mock_msg = MagicMock()
         mock_msg.content = [MagicMock(text=text)]
         return mock_msg
 
+    def _article(self, id="1", headline="Earnings beat", teaser="Revenue up"):
+        return {"id": id, "headline": headline, "teaser": teaser}
+
     @patch("news.fetcher._claude")
     def test_positive_sentiment_parsed(self, mock_claude):
-        from news.fetcher import _score_sentiment
+        from news.fetcher import _batch_score_sentiment
         mock_claude.messages.create.return_value = self._mock_claude_response(
-            '{"sentiment": "positive", "confidence": 0.9}'
+            '[{"id": "1", "sentiment": "positive", "confidence": 0.9}]'
         )
-        sentiment, confidence = _score_sentiment("Apple beats earnings", "Record revenue quarter")
-        assert sentiment == "positive"
-        assert confidence == pytest.approx(0.9)
+        scores = _batch_score_sentiment([self._article()])
+        assert scores["1"] == ("positive", pytest.approx(0.9))
 
     @patch("news.fetcher._claude")
     def test_neutral_sentiment_parsed(self, mock_claude):
-        from news.fetcher import _score_sentiment
+        from news.fetcher import _batch_score_sentiment
         mock_claude.messages.create.return_value = self._mock_claude_response(
-            '{"sentiment": "neutral", "confidence": 0.5}'
+            '[{"id": "1", "sentiment": "neutral", "confidence": 0.2}]'
         )
-        sentiment, confidence = _score_sentiment("Company files routine 10-K", "Annual report")
-        assert sentiment == "neutral"
+        scores = _batch_score_sentiment([self._article()])
+        assert scores["1"][0] == "neutral"
 
     @patch("news.fetcher._claude")
-    def test_malformed_json_returns_neutral(self, mock_claude):
-        from news.fetcher import _score_sentiment
+    def test_malformed_json_returns_empty(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
         mock_claude.messages.create.return_value = self._mock_claude_response("not json")
-        sentiment, confidence = _score_sentiment("Some headline", "Some teaser")
-        assert sentiment == "neutral"
-        assert confidence == 0.0
+        scores = _batch_score_sentiment([self._article()])
+        assert scores == {}
 
     @patch("news.fetcher._claude")
     def test_markdown_fenced_json_parsed(self, mock_claude):
-        from news.fetcher import _score_sentiment
+        from news.fetcher import _batch_score_sentiment
         mock_claude.messages.create.return_value = self._mock_claude_response(
-            '```json\n{"sentiment": "positive", "confidence": 0.85}\n```'
+            '```json\n[{"id": "1", "sentiment": "positive", "confidence": 0.85}]\n```'
         )
-        sentiment, confidence = _score_sentiment("Good news", "Positive outlook")
-        assert sentiment == "positive"
-        assert confidence == pytest.approx(0.85)
+        scores = _batch_score_sentiment([self._article()])
+        assert scores["1"] == ("positive", pytest.approx(0.85))
 
     @patch("news.fetcher._claude")
-    def test_api_exception_returns_neutral(self, mock_claude):
-        from news.fetcher import _score_sentiment
+    def test_api_exception_returns_empty(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
         mock_claude.messages.create.side_effect = Exception("API timeout")
-        sentiment, confidence = _score_sentiment("Some headline", "Some teaser")
-        assert sentiment == "neutral"
-        assert confidence == 0.0
+        scores = _batch_score_sentiment([self._article()])
+        assert scores == {}
+
+    @patch("news.fetcher._claude")
+    def test_truncated_json_recovered(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
+        # Simulates a truncated response with only the first of two objects complete
+        truncated = '[{"id": "1", "sentiment": "positive", "confidence": 0.9}, {"id": "2"'
+        mock_claude.messages.create.return_value = self._mock_claude_response(truncated)
+        scores = _batch_score_sentiment([self._article("1"), self._article("2")])
+        assert "1" in scores
+        assert scores["1"][0] == "positive"
+
+    @patch("news.fetcher._claude")
+    def test_empty_articles_returns_empty(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
+        scores = _batch_score_sentiment([])
+        mock_claude.messages.create.assert_not_called()
+        assert scores == {}
 
 
 # ── Position sizing tests ─────────────────────────────────────────────────────
@@ -126,32 +142,102 @@ class TestSentimentScoring:
 class TestPositionSizing:
     """Tests for trading/executor.py::calculate_quantity"""
 
-    @patch("trading.executor.get_portfolio_value", return_value=10000.0)
-    @patch("trading.executor.get_available_cash", return_value=10000.0)
-    def test_quantity_respects_max_position_pct(self, _c, _p):
+    def _mock_cash(self, total, free):
+        return {"total": total, "free": free, "invested": total - free}
+
+    @patch("trading.executor._get")
+    def test_quantity_respects_max_position_pct(self, mock_get):
         from trading.executor import calculate_quantity
+        mock_get.return_value = self._mock_cash(total=10000.0, free=10000.0)
         # 5% of £10,000 = £500. At £100/share = 5 shares
-        quantity = calculate_quantity("AAPL_US_EQ", price=100.0)
+        quantity, err = calculate_quantity("AAPL_US_EQ", price=100.0)
+        assert err is None
         assert quantity == pytest.approx(5.0, rel=1e-4)
 
-    @patch("trading.executor.get_portfolio_value", return_value=10000.0)
-    @patch("trading.executor.get_available_cash", return_value=200.0)  # less than 5%
-    def test_quantity_capped_by_available_cash(self, _c, _p):
+    @patch("trading.executor._get")
+    def test_quantity_capped_by_available_cash(self, mock_get):
         from trading.executor import calculate_quantity
+        mock_get.return_value = self._mock_cash(total=10000.0, free=200.0)
         # 5% of £10,000 = £500, but only £200 cash available → use £200
-        quantity = calculate_quantity("AAPL_US_EQ", price=100.0)
+        quantity, err = calculate_quantity("AAPL_US_EQ", price=100.0)
+        assert err is None
         assert quantity == pytest.approx(2.0, rel=1e-4)
 
-    @patch("trading.executor.get_portfolio_value", return_value=None)
-    @patch("trading.executor.get_available_cash", return_value=None)
-    def test_no_funds_data_returns_none(self, _c, _p):
+    @patch("trading.executor._get")
+    def test_zero_cash_returns_none(self, mock_get):
         from trading.executor import calculate_quantity
-        quantity = calculate_quantity("AAPL_US_EQ", price=100.0)
+        mock_get.return_value = self._mock_cash(total=1000.0, free=0.0)
+        quantity, err = calculate_quantity("AAPL_US_EQ", price=100.0)
         assert quantity is None
+        assert err is not None
 
-    @patch("trading.executor.get_portfolio_value", return_value=100.0)
-    @patch("trading.executor.get_available_cash", return_value=0.0)
-    def test_zero_cash_returns_none(self, _c, _p):
+    @patch("trading.executor._get")
+    def test_api_failure_returns_none(self, mock_get):
         from trading.executor import calculate_quantity
-        quantity = calculate_quantity("AAPL_US_EQ", price=100.0)
+        mock_get.side_effect = Exception("HTTP 401")
+        quantity, err = calculate_quantity("AAPL_US_EQ", price=100.0)
         assert quantity is None
+        assert err is not None
+
+
+# ── Precision retry tests ─────────────────────────────────────────────────────
+
+class TestBuyPrecisionRetry:
+    """Tests for trading/executor.py::buy — precision mismatch auto-retry"""
+
+    def _mock_cash(self, total=5000.0, free=5000.0):
+        return {"total": total, "free": free, "invested": 0.0}
+
+    def _precision_error(self, allowed: int) -> Exception:
+        body = (
+            f'{{"type":"/api-errors/quantity-precision-mismatch",'
+            f'"title":"Error while placing the order",'
+            f'"status":400,'
+            f'"detail":"invalid quantity precision {allowed}",'
+            f'"traceId":"abc"}}'
+        )
+        return Exception(f"HTTP 400 - {body}")
+
+    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._post")
+    @patch("trading.executor._get")
+    def test_precision_retry_succeeds(self, mock_get, mock_post, mock_fill):
+        from trading.executor import buy
+        mock_get.return_value = self._mock_cash()
+        # First call raises precision error (precision 2 allowed); second call succeeds
+        mock_post.side_effect = [self._precision_error(2), {"id": "99"}]
+        result = buy("BCDA_US_EQ", price=1.51)
+        assert result.success is True
+        assert mock_post.call_count == 2
+        # Second call should use quantity rounded to 2 decimal places
+        # _post is called as _post(path, payload_dict)
+        second_call_payload = mock_post.call_args[0][1]
+        second_call_qty = second_call_payload["quantity"]
+        # str(165.93) → "165.93" → split on "." → ["165", "93"] → len("93") == 2
+        qty_str = str(second_call_qty)
+        if "." in qty_str:
+            decimal_places = len(qty_str.rstrip("0").split(".")[-1])
+        else:
+            decimal_places = 0
+        assert decimal_places <= 2
+
+    @patch("trading.executor._post")
+    @patch("trading.executor._get")
+    def test_non_precision_error_does_not_retry(self, mock_get, mock_post):
+        from trading.executor import buy
+        mock_get.return_value = self._mock_cash()
+        mock_post.side_effect = Exception("HTTP 500 - Internal server error")
+        result = buy("AAPL_US_EQ", price=100.0)
+        assert result.success is False
+        assert mock_post.call_count == 1
+
+    @patch("trading.executor._post")
+    @patch("trading.executor._get")
+    def test_precision_retry_still_fails(self, mock_get, mock_post):
+        from trading.executor import buy
+        mock_get.return_value = self._mock_cash()
+        # Both attempts fail
+        mock_post.side_effect = [self._precision_error(2), Exception("HTTP 500")]
+        result = buy("BCDA_US_EQ", price=1.51)
+        assert result.success is False
+        assert mock_post.call_count == 2
