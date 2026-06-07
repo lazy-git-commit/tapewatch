@@ -6,15 +6,20 @@ A news-driven momentum trading system for your Trading 212 Stocks ISA.
 
 ```
 Benzinga news (via massive.com) — breaking US equity news with tickers
-       ↓
-Claude Haiku — momentum catalyst classifier
-                     earnings beats / FDA / M&A / contract wins → positive
-                     analyst PT raises / "Maintains" ratings → neutral (ignored)
+       ↓  freshness filter: article must be <60s old at fetch time
+Claude Haiku — expert momentum day trader classifier
+                     earnings beats / FDA / M&A / contract wins → positive (0.8–1.0)
+                     analyst PT raises / "Maintains" ratings    → neutral  (ignored)
+                     earnings misses / guidance cuts            → negative (ignored)
        ↓
 Price confirmation — Finnhub real-time quote + yfinance momentum baseline
-                     price up ≥ 0.5% over last 15 min + volume spike?
+                     blocks first minute after open (auction noise)
+                     price up ≥ 0.5% over last 15 min?
+                     volume ≥ 1.5× 20-day average? (or >0 in first 15 min)
+                     stock not down >3% on the day? (dead-cat bounce guard)
        ↓
 Buy order (Trading 212 API — demo or live)
+  auto-retries once if T212 rejects for quantity precision mismatch
        ↓
 Position monitor (every 60s) — Finnhub real-time price
   → Take profit (+5%)  ✅
@@ -27,8 +32,8 @@ Grafana dashboard — live activity and history
 ```
 
 Polls every minute around the clock. Skips cycles outside NYSE market hours
-(Mon–Fri, 13:30–20:00 UTC). Holidays and early closes are handled automatically
-via `pandas_market_calendars` — no manual configuration needed.
+(Mon–Fri, 13:30–20:00 UTC = 09:30–16:00 ET). Holidays and early closes are
+handled automatically via `pandas_market_calendars` — no manual configuration needed.
 
 ---
 

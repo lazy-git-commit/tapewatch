@@ -37,21 +37,21 @@ python -m backtest.backtest --no-sentiment       # skip Claude, use all positive
 
 The system runs two APScheduler background jobs from `main.py`:
 
-**`news_cycle`** (every 1 minute during market hours):
+**`news_cycle`** (every 1 minute, unconditional):
 `news/fetcher.py` → `market/price_check.py` → `trading/executor.py` → `storage/database.py`
 
-When the market is closed the job reschedules itself to fire once at the next NYSE open (DateTrigger) instead of polling every minute.
+Returns immediately when the market is closed (checked via `pandas_market_calendars` — no network call). Never reschedules its own trigger; rescheduling from within a running job causes APScheduler to silently drop the replacement.
 
 **`monitor_positions`** (every 60 seconds):
 `monitor/position_monitor.py` checks every open trade in the DB and calls `trading/executor.sell()` if take-profit (+5%), stop-loss (−2%), or time-stop (60 min) is triggered.
 
 ### Key data contracts
 
-- `news/fetcher.py` fetches articles from Benzinga via massive.com, uses Claude Haiku to classify sentiment, and produces `NewsItem` dataclasses (ticker, headline, body, source, published_at, sentiment, confidence).
-- `market/price_check.py` confirms a signal using Finnhub REST quote for the real-time current price, and yfinance 1-min bars for the momentum baseline (~15 min delayed, intentional — aligns with `MOMENTUM_WINDOW_MINUTES=15`). Volume ratio uses yfinance 20-day daily history.
+- `news/fetcher.py` fetches articles from Benzinga via massive.com, filters to articles published within the last 60 seconds (freshness filter), uses Claude Haiku acting as an expert momentum day trader to classify sentiment, and produces `NewsItem` dataclasses (ticker, headline, body, source, published_at, sentiment, confidence). Only articles classified `"positive"` proceed further.
+- `market/price_check.py` confirms a signal using Finnhub REST quote for the real-time current price, and yfinance 1-min bars for the momentum baseline (~15 min delayed, intentional — aligns with `MOMENTUM_WINDOW_MINUTES=15`). Market open/close is determined by `pandas_market_calendars` (local, no network). Volume ratio uses yfinance 20-day daily history. Blocks trades in the first minute after open (auction noise).
 - `market/finnhub_bars.py` provides `get_finnhub_quote()` — Finnhub REST quote wrapper used for real-time current price in both signal confirmation and the position monitor.
-- `trading/executor.py` calls the Trading 212 REST API directly via `requests`. In demo mode (`cfg.is_live == False`) it logs simulated orders without hitting the API. Sell orders use a negative quantity.
-- `storage/database.py` manages a PostgreSQL DB (`DB_URL`) with tables: `news_signals`, `trades`, `portfolio_snapshots`, `api_usage`. All DB access goes through the `get_conn()` context manager.
+- `trading/executor.py` calls the Trading 212 REST API directly via `requests`. On a `quantity-precision-mismatch` error, it parses the allowed decimal places from the response and retries once. In demo mode (`cfg.is_live == False`) it logs simulated orders without hitting the API. Sell orders use a negative quantity.
+- `storage/database.py` manages a PostgreSQL DB (`DB_URL`) with tables: `news_signals`, `trades`, `portfolio_snapshots`. All DB access goes through the `get_conn()` context manager.
 
 ### Configuration
 
@@ -72,3 +72,14 @@ There is no watchlist — the system relies on Benzinga tagging articles with st
 ### Logging
 
 Logs go to stdout (captured by systemd journald on the VM). Each module uses `logging.getLogger(__name__)`.
+
+### Deployment
+
+Always deploy via `git push origin main`. GitHub Actions picks it up, rsyncs to the VM, and restarts the systemd service. **Never SSH and run commands directly** — changes would be overwritten on the next deploy.
+
+### Test classes
+
+- `TestExitConditions` — take-profit / stop-loss / time-stop logic (no external calls)
+- `TestSentimentScoring` — `_batch_score_sentiment()` with mocked Claude responses
+- `TestPositionSizing` — `calculate_quantity()` with mocked `_get`
+- `TestBuyPrecisionRetry` — T212 precision-mismatch auto-retry logic

@@ -8,6 +8,8 @@ PostgreSQL database: `momentum_trader`
 
 One row per news article-ticker pair that the system evaluated. An article mentioning three tickers produces three rows.
 
+Only articles classified as `"positive"` by Claude AND published within 60 seconds of the fetch time are saved here. Articles that fail the freshness filter or are classified neutral/negative are silently dropped before any DB write.
+
 | Column | Type | Description |
 |---|---|---|
 | `id` | SERIAL PK | Auto-incrementing primary key. |
@@ -15,11 +17,11 @@ One row per news article-ticker pair that the system evaluated. An article menti
 | `ticker` | TEXT | Trading 212 instrument code (e.g. `AAPL_US_EQ`). |
 | `headline` | TEXT | Article headline as returned by Benzinga. |
 | `source` | TEXT | Always `"benzinga"` — the news provider. |
-| `sentiment` | TEXT | Always `"BULLISH"` for now — only positive-sentiment articles trigger a buy. |
+| `sentiment` | TEXT | Claude's classification: `"positive"`, `"neutral"`, or `"negative"`. Only `"positive"` articles proceed to price confirmation and are saved to this table. |
 | `confidence` | INTEGER | Confidence score 1–10, derived from Claude Haiku's classification (raw 0.0–1.0 × 10, rounded). |
 | `acted_on` | INTEGER | `0` = evaluated but no trade placed; `1` = a buy order was executed for this signal. |
 | `rejection_reason` | TEXT | Human-readable explanation of why the signal was not traded (e.g. `"Insufficient recent momentum: +0.12% over last 15 min"`). NULL if the signal led to a trade. |
-| `rejection_code` | TEXT | Short keyword for the rejection reason: `approved`, `low_momentum`, `low_volume`, `dead_cat`, `no_price_data`, or `buy_failed`. NULL if the signal led to a trade. |
+| `rejection_code` | TEXT | Short keyword for the rejection reason: `low_momentum`, `low_volume`, `dead_cat`, `no_price_data`, or `buy_failed`. NULL if the signal led to a trade (`acted_on = 1`). |
 | `published_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when Benzinga published the article. |
 | `fetched_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when our news cycle fetched this article from the API. The gap between `published_at` and `fetched_at` shows detection latency. |
 | `created_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when this row was inserted. |

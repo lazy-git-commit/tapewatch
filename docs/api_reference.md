@@ -153,8 +153,8 @@ Articles:
 ### Purpose
 
 Provides two things:
-- **Market status** — authoritative NYSE open/closed check (handles holidays, early closes, weekends)
-- **Real-time stock quotes** — used for signal confirmation and position monitoring
+- **Market status** — fallback NYSE open/closed check. The primary check is `pandas_market_calendars` (local, no network). Finnhub is only called if the calendar check raises an exception.
+- **Real-time stock quotes** — used for signal confirmation and position monitoring.
 
 **Rate limit:** 60 requests/minute on the free tier.
 
@@ -162,7 +162,7 @@ Provides two things:
 
 ### Endpoint: GET `/stock/market-status`
 
-**Purpose:** Check whether the US market is currently open. This is the authoritative source — it correctly handles NYSE holidays and early closes where a wall-clock check would be wrong.
+**Purpose:** Fallback market open check. `pandas_market_calendars` is tried first; this endpoint is only reached if the calendar library raises an exception. Correctly handles NYSE holidays and early closes.
 
 **Request:**
 ```
@@ -360,9 +360,20 @@ Content-Type: application/json
   "type": "/api-errors/quantity-precision-mismatch",
   "title": "Error while placing the order",
   "status": 400,
-  "detail": "invalid quantity precision 4"
+  "detail": "invalid quantity precision 2"
 }
 ```
+
+The `detail` field contains the maximum allowed decimal places for that instrument. `trading/executor.py` parses this value from the error and retries the order once with the quantity rounded to the allowed precision. For example, `164.9305` → `164.93` when precision 2 is required.
+
+Other notable error types:
+
+| Error type | HTTP | Meaning |
+|---|---|---|
+| `/api-errors/quantity-precision-mismatch` | 400 | Quantity has more decimal places than the instrument allows — auto-retried once |
+| `/api-errors/instrument-disabled` | 400 | Instrument is suspended or not tradeable — order fails permanently |
+| `/api-errors/entity-not-found` | 404 | Ticker not in T212 universe — order fails permanently |
+| `TooManyRequests` | 429 | Rate limit hit — order fails; next cycle will retry the full pipeline |
 
 ---
 
@@ -372,7 +383,7 @@ Content-Type: application/json
 |---|---|---|---|
 | Benzinga (massive.com) | `GET /benzinga/v2/news` | Fetch recent US equity news | `news/fetcher.py` |
 | Anthropic (Claude Haiku) | `messages.create` (batched) | Classify article sentiment | `news/fetcher.py` |
-| Finnhub | `GET /stock/market-status` | Authoritative NYSE open/closed check | `market/price_check.py` |
+| Finnhub | `GET /stock/market-status` | Fallback NYSE open/closed check (primary is `pandas_market_calendars`) | `market/price_check.py` |
 | Finnhub | `GET /quote` | Real-time current price | `market/finnhub_bars.py` |
 | yfinance | `<ticker>` 1m history (1d) | Momentum baseline (~15 min ago) | `market/price_check.py` |
 | yfinance | `<ticker>` 1d history (21d) | 20-day average volume | `market/price_check.py` |
