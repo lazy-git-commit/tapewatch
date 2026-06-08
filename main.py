@@ -30,7 +30,7 @@ from config.settings import cfg
 from storage.database import init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded, is_article_seen, set_rejection_reason
 from news.fetcher import fetch_all_news
 from market.price_check import confirm_price_signal, is_market_open, is_too_late_to_buy
-from trading.executor import buy
+from trading.executor import buy, build_symbol_map
 from monitor.position_monitor import monitor_positions
 from reporting.report import generate_report
 
@@ -170,6 +170,7 @@ def main() -> None:
     # Validate config and initialise DB
     cfg.validate()
     init_db()
+    build_symbol_map()
 
     # Print current report on startup
     print(generate_report())

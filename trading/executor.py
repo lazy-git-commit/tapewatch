@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 _T212_DEMO = "https://demo.trading212.com/api/v0"
 _T212_LIVE = "https://live.trading212.com/api/v0"
 
+# symbol → T212 ticker code, e.g. "SUNE" → "JCS_US_EQ"
+# T212 keeps original IPO/SPAC codes even after a company changes its exchange ticker,
+# so "SUNE_US_EQ" 404s while the instrument lives as "JCS_US_EQ".
+# Built once at startup from the instruments metadata endpoint.
+_symbol_to_t212: dict[str, str] = {}
+
 
 def _base_url() -> str:
     return _T212_LIVE if cfg.is_live else _T212_DEMO
@@ -37,6 +43,47 @@ def _auth_header() -> dict:
     credentials = f"{key_id}:{key}"
     encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
     return {"Authorization": f"Basic {encoded}"}
+
+
+def build_symbol_map() -> None:
+    """
+    Fetch T212's full instrument catalogue and build a shortName → ticker map.
+
+    T212 keeps the original SPAC/IPO ticker code even after a company changes
+    its exchange symbol (e.g. SUNE → JCS_US_EQ after a reverse merger).
+    Without this map, ~16% of small-cap tickers 404 when we append _US_EQ.
+
+    Called once at startup from main.py. Safe to call again to refresh.
+    """
+    global _symbol_to_t212
+    try:
+        resp = requests.get(
+            f"{_base_url()}/equity/metadata/instruments",
+            headers=_auth_header(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        instruments = resp.json()
+        mapping = {}
+        for inst in instruments:
+            if not isinstance(inst, dict):
+                continue
+            ticker = inst.get("ticker", "")
+            short = inst.get("shortName", "")
+            if ticker and short and inst.get("currencyCode") == "USD":
+                mapping[short.upper()] = ticker
+        _symbol_to_t212 = mapping
+        logger.info("T212 symbol map built: %d USD instruments", len(mapping))
+    except Exception as exc:
+        logger.warning("Could not build T212 symbol map: %s — will use shortName_US_EQ fallback", exc)
+
+
+def resolve_t212_ticker(exchange_symbol: str) -> str:
+    """
+    Convert a Benzinga exchange symbol (e.g. "SUNE") to the correct T212 ticker code.
+    Uses the pre-built symbol map; falls back to "<symbol>_US_EQ" if not found.
+    """
+    return _symbol_to_t212.get(exchange_symbol.upper(), f"{exchange_symbol}_US_EQ")
 
 
 def _get(path: str) -> dict:

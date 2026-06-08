@@ -6,7 +6,11 @@ A news-driven momentum trading system for your Trading 212 Stocks ISA.
 
 ```
 Benzinga news (via massive.com) — breaking US equity news with tickers
-       ↓  freshness filter: article must be <60s old at fetch time
+       ↓  pre-filters (before Claude API call):
+          • freshness: article must be <60s old at fetch time
+          • crypto tickers stripped (X:BTCUSD etc. are not equities)
+          • roundup articles skipped (>3 tickers = market digest, no catalyst)
+          • T212 symbol map: Benzinga shortName → correct T212 ticker code
 Claude Haiku — expert momentum day trader classifier
                      earnings beats / FDA / M&A / contract wins → positive (0.8–1.0)
                      analyst PT raises / "Maintains" ratings    → neutral  (ignored)

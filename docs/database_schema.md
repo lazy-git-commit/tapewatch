@@ -8,7 +8,12 @@ PostgreSQL database: `momentum_trader`
 
 One row per news article-ticker pair that the system evaluated. An article mentioning three tickers produces three rows.
 
-Only articles classified as `"positive"` by Claude AND published within 60 seconds of the fetch time are saved here. Articles that fail the freshness filter or are classified neutral/negative are silently dropped before any DB write.
+Articles pass through three pre-filters before reaching Claude or the DB:
+1. **Freshness** — must be published within 60 seconds of the fetch time.
+2. **Crypto filter** — tickers prefixed `X:` (e.g. `X:BTCUSD`) are stripped; not equities.
+3. **Roundup filter** — articles tagging more than 3 tickers are skipped; these are market digests, not single-stock catalysts.
+
+Only articles that pass all three filters, are classified `"positive"` by Claude, and proceed through the price check are saved here. Articles dropped by a pre-filter or classified neutral/negative are silently discarded before any DB write.
 
 | Column | Type | Description |
 |---|---|---|

@@ -25,6 +25,7 @@ import anthropic
 import pytz
 from config.settings import cfg
 from storage.database import is_article_seen
+from trading.executor import resolve_t212_ticker
 
 _LONDON = pytz.timezone("Europe/London")
 
@@ -192,7 +193,10 @@ def fetch_all_news(lookback_minutes: int = 5) -> list[NewsItem]:
             continue
         seen_ids.add(article_id)
 
-        raw_tickers = [t for t in (article.get("tickers") or []) if t]
+        raw_tickers = [
+            t for t in (article.get("tickers") or [])
+            if t and not t.startswith("X:")  # X:BTCUSD etc. are crypto pairs, not equities
+        ]
         if not raw_tickers:
             continue
 
@@ -210,14 +214,28 @@ def fetch_all_news(lookback_minutes: int = 5) -> list[NewsItem]:
         except (ValueError, AttributeError):
             pass
 
-        # Build T212 tickers and filter blocklist + already-seen pairs
+        # Build T212 tickers and filter blocklist + already-seen pairs.
+        # resolve_t212_ticker() maps the Benzinga symbol to T212's internal code,
+        # handling post-SPAC/reverse-merger tickers where shortName != ticker prefix.
         eligible_tickers = [
-            f"{t}_US_EQ"
+            t212
             for t in raw_tickers
-            if f"{t}_US_EQ" not in cfg.blocklist
-            and not is_article_seen(article_id, f"{t}_US_EQ")
+            for t212 in (resolve_t212_ticker(t),)
+            if t212 not in cfg.blocklist
+            and not is_article_seen(article_id, t212)
         ]
         if not eligible_tickers:
+            continue
+
+        # Skip roundup articles — a single article tagging >3 tickers is a market
+        # digest ("Big stocks moving higher on Monday"), not a specific catalyst.
+        # These generate large batches of price checks that all fail for low momentum
+        # because the article contains no actionable news for any individual stock.
+        if len(raw_tickers) > 3:
+            logger.debug(
+                "Skipping roundup article %s — %d tickers (max 3): %s",
+                article_id, len(raw_tickers), article.get("title", "")[:60],
+            )
             continue
 
         eligible.append((article, eligible_tickers, article_id))

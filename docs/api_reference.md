@@ -284,6 +284,58 @@ The correct base URL and credentials are selected automatically based on `TRADIN
 
 ---
 
+### Endpoint: GET `/equity/metadata/instruments`
+
+**Purpose:** Fetch T212's full instrument catalogue at startup to build a `shortName → ticker` lookup map. Required because T212 keeps the original SPAC/IPO ticker code even after a company changes its exchange symbol (e.g. after a reverse merger, `SUNE` on the exchange lives as `JCS_US_EQ` in T212). Without this map, ~16% of small-cap US tickers 404 when the system appends `_US_EQ` to the Benzinga symbol.
+
+Called once at startup by `build_symbol_map()` in `trading/executor.py`. The result is stored in the module-level `_symbol_to_t212` dict; `resolve_t212_ticker(symbol)` uses it for all subsequent symbol lookups.
+
+**Request:**
+```
+GET https://demo.trading212.com/api/v0/equity/metadata/instruments
+Authorization: Basic <base64(KEY_ID:KEY)>
+```
+
+**Sample response (JSON array):**
+```json
+[
+  {
+    "addedOn": "2020-01-02T08:00:00.000+02:00",
+    "currencyCode": "USD",
+    "isin": "US4592001014",
+    "maxOpenQuantity": 10000.0,
+    "minTradeQuantity": 0.1,
+    "name": "International Business Machines Corp",
+    "shortName": "IBM",
+    "ticker": "IBM_US_EQ",
+    "type": "STOCK"
+  },
+  {
+    "addedOn": "2021-11-15T08:00:00.000+02:00",
+    "currencyCode": "USD",
+    "isin": "US47759T1007",
+    "maxOpenQuantity": 10000.0,
+    "minTradeQuantity": 1.0,
+    "name": "JCS Enterprises Inc (formerly SUNation Energy)",
+    "shortName": "JCS",
+    "ticker": "JCS_US_EQ",
+    "type": "STOCK"
+  }
+]
+```
+
+**Key fields used:**
+
+| Field | Description |
+|---|---|
+| `shortName` | Current exchange symbol (e.g. `"JCS"`) — used as map key |
+| `ticker` | T212 internal instrument code (e.g. `"JCS_US_EQ"`) — used as map value |
+| `currencyCode` | Filtered to `"USD"` only — ignores non-US instruments |
+
+**Fallback:** If the endpoint is unavailable at startup (network error, rate limit), `build_symbol_map()` logs a warning and `resolve_t212_ticker()` falls back to `<symbol>_US_EQ` for all tickers.
+
+---
+
 ### Endpoint: GET `/equity/account/cash`
 
 **Purpose:** Fetch account total value and available cash for position sizing (live mode only; demo mode uses `DEMO_PORTFOLIO_VALUE` from `.env`).
@@ -387,5 +439,6 @@ Other notable error types:
 | Finnhub | `GET /quote` | Real-time current price | `market/finnhub_bars.py` |
 | yfinance | `<ticker>` 1m history (1d) | Momentum baseline (~15 min ago) | `market/price_check.py` |
 | yfinance | `<ticker>` 1d history (21d) | 20-day average volume | `market/price_check.py` |
+| Trading 212 | `GET /equity/metadata/instruments` | Build shortName→ticker map at startup (handles SPAC/rename mismatches) | `trading/executor.py` |
 | Trading 212 | `GET /equity/account/cash` | Portfolio value + cash for position sizing | `trading/executor.py` |
 | Trading 212 | `POST /equity/orders/market` | Place buy / sell order | `trading/executor.py` |
