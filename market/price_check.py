@@ -24,6 +24,15 @@ A signal is confirmed when ALL of the following hold:
                           meant our market sell moved price 11.7% below trigger.
   5. No dead-cat bounce — stock is not down more than cfg.max_day_drop_pct
                           from today's open.
+  6. Min stock price     — current price >= cfg.min_stock_price ($2.00 default).
+                          Sub-$2 stocks have catastrophic spread/slippage.
+  7. Max momentum cap    — recent_move_pct <= cfg.max_price_move_pct (15% default).
+                          A +15%+ reading means we are buying a post-halt top.
+                          Circuit-breaker halt articles publish AFTER the spike —
+                          every Jun 8–11 loss was a halt-article trade.
+  8. Max volume ceiling  — volume_ratio <= cfg.max_volume_ratio (20× default).
+                          Extreme volume (>20×) on micro-caps = circuit-breaker
+                          halt pattern, not a genuine catalyst.
 """
 
 import logging
@@ -138,7 +147,7 @@ class PriceConfirmation:
     daily_dollar_volume: float | None
     is_confirmed: bool
     reason: str
-    reason_code: str            # approved | low_momentum | low_volume | dead_cat | no_price_data | illiquid | opening_block
+    reason_code: str            # approved | low_momentum | high_momentum | low_volume | high_volume | dead_cat | no_price_data | illiquid | opening_block | penny_stock
 
 
 def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
@@ -200,6 +209,32 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                     f"(block lasts {cfg.open_block_minutes} min to avoid auction noise)"
                 ),
                 reason_code="opening_block",
+            )
+
+        # ── Penny stock guard ────────────────────────────────────────────────────
+        # Stocks below min_stock_price ($2 default) have extreme bid-ask spreads
+        # relative to price and are frequently the subject of halt-pump patterns.
+        # All Jun 8–11 losses were on stocks priced < $5 at entry.
+        if current_price < cfg.min_stock_price:
+            reason = (
+                f"Penny stock filter: price ${current_price:.4f} "
+                f"< ${cfg.min_stock_price:.2f} minimum — extreme spread/slippage risk"
+            )
+            logger.info("Price check [%s]: rejected — %s", symbol, reason)
+            return PriceConfirmation(
+                ticker=t212_ticker,
+                symbol=symbol,
+                current_price=current_price,
+                open_price=open_price,
+                day_move_pct=day_move_pct,
+                recent_move_pct=0.0,
+                current_volume=0,
+                avg_volume=0,
+                volume_ratio=0.0,
+                daily_dollar_volume=None,
+                is_confirmed=False,
+                reason=reason,
+                reason_code="penny_stock",
             )
 
         # ── Momentum baseline via Twelvedata 1-min bars ───────────────────────
@@ -278,7 +313,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                 is_confirmed=False, reason=reason, reason_code="illiquid",
             )
 
-        # 3. Momentum check
+        # 3. Momentum floor check
         momentum_ok = recent_move_pct >= cfg.min_price_move_pct
         if not momentum_ok:
             reason = (
@@ -298,6 +333,30 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                 current_volume=current_volume, avg_volume=avg_daily_volume or 0,
                 volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
                 is_confirmed=False, reason=reason, reason_code="low_momentum",
+            )
+
+        # 3b. Momentum ceiling check — reject stocks that have already moved too far.
+        # A recent_move_pct > cfg.max_price_move_pct means we're likely reading a
+        # post-halt spike. Circuit-breaker halt articles publish AFTER the 30–120% move;
+        # buying here = buying the top. All Jun 8–11 losses triggered this pattern.
+        if recent_move_pct > cfg.max_price_move_pct:
+            reason = (
+                f"Momentum ceiling breached: {recent_move_pct:+.2f}% over last ~5 min "
+                f"exceeds max {cfg.max_price_move_pct}% — likely a post-halt article, "
+                f"not a live catalyst"
+            )
+            logger.info(
+                "Price check [%s]: recent=%+.2f%% day=%+.2f%% vol=%.1f× ddv=%s — rejected: high_momentum",
+                symbol, recent_move_pct, day_move_pct, volume_ratio,
+                f"${daily_dollar_volume:,.0f}" if daily_dollar_volume else "n/a",
+            )
+            return PriceConfirmation(
+                ticker=t212_ticker, symbol=symbol,
+                current_price=current_price, open_price=open_price,
+                day_move_pct=day_move_pct, recent_move_pct=recent_move_pct,
+                current_volume=current_volume, avg_volume=avg_daily_volume or 0,
+                volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
+                is_confirmed=False, reason=reason, reason_code="high_momentum",
             )
 
         # 4. Volume check
@@ -337,6 +396,30 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                 current_volume=current_volume, avg_volume=avg_daily_volume or 0,
                 volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
                 is_confirmed=False, reason=reason, reason_code="low_volume",
+            )
+
+        # 4b. Volume ceiling check — extreme volume on micro-caps = halt pattern.
+        # All Jun 8–11 halt-article trades had volume_ratio > 30×. A genuine
+        # momentum catalyst has elevated but not parabolic volume (5–15× is the
+        # sweet spot). Above cfg.max_volume_ratio (20×) the risk/reward inverts.
+        if volume_ratio > cfg.max_volume_ratio:
+            reason = (
+                f"Volume ceiling breached: {volume_ratio:.1f}× avg volume "
+                f"exceeds max {cfg.max_volume_ratio:.0f}× — "
+                f"extreme volume pattern consistent with circuit-breaker halt"
+            )
+            logger.info(
+                "Price check [%s]: recent=%+.2f%% day=%+.2f%% vol=%.1f× ddv=%s — rejected: high_volume",
+                symbol, recent_move_pct, day_move_pct, volume_ratio,
+                f"${daily_dollar_volume:,.0f}" if daily_dollar_volume else "n/a",
+            )
+            return PriceConfirmation(
+                ticker=t212_ticker, symbol=symbol,
+                current_price=current_price, open_price=open_price,
+                day_move_pct=day_move_pct, recent_move_pct=recent_move_pct,
+                current_volume=current_volume, avg_volume=avg_daily_volume or 0,
+                volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
+                is_confirmed=False, reason=reason, reason_code="high_volume",
             )
 
         # ── All conditions met — signal confirmed ─────────────────────────────

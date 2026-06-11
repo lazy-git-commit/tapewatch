@@ -35,16 +35,19 @@ logging.basicConfig(level=logging.WARNING)
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-# ── v12 strategy constants (mirrors config/settings.py defaults) ──────────────
-TAKE_PROFIT_PCT      = cfg.take_profit_pct      # 5.0
-STOP_LOSS_PCT        = cfg.stop_loss_pct        # 2.0
-TIME_STOP_MINUTES    = cfg.time_stop_minutes    # 60
-MIN_PRICE_MOVE_PCT   = cfg.min_price_move_pct   # 0.5 (but we use 1.5 as tighter gate for day-trader logic)
+# ── v13 strategy constants (mirrors config/settings.py defaults) ──────────────
+TAKE_PROFIT_PCT      = cfg.take_profit_pct           # 5.0
+STOP_LOSS_PCT        = cfg.stop_loss_pct             # 2.0
+TIME_STOP_MINUTES    = cfg.time_stop_minutes         # 60
+MIN_PRICE_MOVE_PCT   = cfg.min_price_move_pct        # 1.5 (raised from 0.5 in v13)
+MAX_PRICE_MOVE_PCT   = cfg.max_price_move_pct        # 15.0 (new in v13 — halt article ceiling)
+MAX_VOLUME_RATIO     = cfg.max_volume_ratio          # 20.0 (new in v13 — halt pattern ceiling)
+MIN_STOCK_PRICE      = cfg.min_stock_price           # 2.0  (new in v13 — penny stock filter)
 VOLUME_RATIO_MIN     = 1.5
 VOLUME_RATIO_EARLY   = 0.5
-OPEN_BLOCK_MINUTES   = cfg.open_block_minutes   # 5
-MIN_DAILY_DOLLAR_VOL = cfg.min_daily_dollar_volume  # 1_000_000
-MAX_DAY_DROP_PCT     = cfg.max_day_drop_pct     # 3.0
+OPEN_BLOCK_MINUTES   = cfg.open_block_minutes        # 5
+MIN_DAILY_DOLLAR_VOL = cfg.min_daily_dollar_volume   # 1_000_000
+MAX_DAY_DROP_PCT     = cfg.max_day_drop_pct          # 3.0
 MOMENTUM_BARS_BACK   = 6   # ~5 min ago
 
 
@@ -290,6 +293,18 @@ def run_v12_check(signal: SignalRecord) -> BacktestResult:
             production_outcome=prod_outcome, v12_outcome="no_data",
         )
 
+    # Penny stock filter
+    if price_now < MIN_STOCK_PRICE:
+        return BacktestResult(
+            signal_id=signal.signal_id, ticker=signal.ticker,
+            headline=signal.headline, published_at=pub,
+            entry_price=price_now, momentum_pct=None, volume_ratio=None,
+            daily_dollar_volume=None, day_move_pct=None,
+            exit_reason=None, exit_price=None, pnl_pct=None,
+            production_outcome=prod_outcome,
+            v12_outcome=f"rejected:penny_stock (${price_now:.4f})",
+        )
+
     # Momentum baseline (~5 min back)
     if minutes_since_open < 15:
         open_bar = bars.iloc[0] if not bars.empty else None
@@ -331,7 +346,7 @@ def run_v12_check(signal: SignalRecord) -> BacktestResult:
             v12_outcome=f"rejected:illiquid (DDV=${daily_dollar_volume:,.0f})",
         )
 
-    # Momentum filter
+    # Momentum floor filter
     if momentum_pct < MIN_PRICE_MOVE_PCT:
         return BacktestResult(
             signal_id=signal.signal_id, ticker=signal.ticker,
@@ -341,6 +356,18 @@ def run_v12_check(signal: SignalRecord) -> BacktestResult:
             exit_reason=None, exit_price=None, pnl_pct=None,
             production_outcome=prod_outcome,
             v12_outcome=f"rejected:low_momentum ({momentum_pct:+.2f}%)",
+        )
+
+    # Momentum ceiling filter — halt-article top guard
+    if momentum_pct > MAX_PRICE_MOVE_PCT:
+        return BacktestResult(
+            signal_id=signal.signal_id, ticker=signal.ticker,
+            headline=signal.headline, published_at=pub,
+            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
+            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
+            exit_reason=None, exit_price=None, pnl_pct=None,
+            production_outcome=prod_outcome,
+            v12_outcome=f"rejected:high_momentum ({momentum_pct:+.2f}%)",
         )
 
     # Volume filter
@@ -360,6 +387,18 @@ def run_v12_check(signal: SignalRecord) -> BacktestResult:
             exit_reason=None, exit_price=None, pnl_pct=None,
             production_outcome=prod_outcome,
             v12_outcome=f"rejected:low_volume ({vol_reason})",
+        )
+
+    # Volume ceiling filter — extreme volume = halt pattern
+    if volume_ratio > MAX_VOLUME_RATIO:
+        return BacktestResult(
+            signal_id=signal.signal_id, ticker=signal.ticker,
+            headline=signal.headline, published_at=pub,
+            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
+            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
+            exit_reason=None, exit_price=None, pnl_pct=None,
+            production_outcome=prod_outcome,
+            v12_outcome=f"rejected:high_volume ({volume_ratio:.1f}×)",
         )
 
     # All filters passed — simulate trade
@@ -542,10 +581,13 @@ if __name__ == "__main__":
     else:
         start, end = _trading_week(now)
 
-    print(f"\nDB-Replay Backtest: {start} → {end}")
+    print(f"\nDB-Replay Backtest (v13): {start} → {end}")
     print(f"  Strategy: TP={TAKE_PROFIT_PCT}% | SL={STOP_LOSS_PCT}% | time-stop={TIME_STOP_MINUTES}min")
-    print(f"  Filters:  open-block={OPEN_BLOCK_MINUTES}min | momentum>={MIN_PRICE_MOVE_PCT}% | "
-          f"vol>={VOLUME_RATIO_MIN}× | DDV>=${MIN_DAILY_DOLLAR_VOL/1e6:.0f}M")
+    print(f"  Filters:  open-block={OPEN_BLOCK_MINUTES}min | "
+          f"momentum {MIN_PRICE_MOVE_PCT}%–{MAX_PRICE_MOVE_PCT}% | "
+          f"vol {VOLUME_RATIO_MIN}×–{MAX_VOLUME_RATIO:.0f}× | "
+          f"DDV>=${MIN_DAILY_DOLLAR_VOL/1e6:.0f}M | "
+          f"price>=${MIN_STOCK_PRICE:.2f} | 24h ticker cooldown")
     print(f"  DB: {cfg.db_url.split('@')[-1]}")
 
     try:
@@ -569,11 +611,38 @@ if __name__ == "__main__":
         day = s.published_at.strftime("%Y-%m-%d")
         by_date[day].append(s)
 
+    # Apply 24-hour per-ticker cooldown (mirrors production behaviour).
+    # Production skips a ticker for 24h after a trade to avoid re-entering
+    # on the same catalyst. Without this, the backtest counts every duplicate
+    # signal for a ticker that already traded, overstating both trades and losses.
+    ticker_last_traded: dict[str, datetime] = {}
+
     all_results: dict[str, list[BacktestResult]] = {}
     for day_str in sorted(by_date.keys()):
         day_signals = by_date[day_str]
         print(f"\n  Processing {day_str}: {len(day_signals)} signals...", flush=True)
-        day_results = [run_v12_check(s) for s in day_signals]
+        day_results = []
+        for s in day_signals:
+            last_trade_time = ticker_last_traded.get(s.ticker)
+            if last_trade_time is not None:
+                hours_since = (s.published_at - last_trade_time).total_seconds() / 3600
+                if hours_since < 24:
+                    day_results.append(BacktestResult(
+                        signal_id=s.signal_id, ticker=s.ticker,
+                        headline=s.headline, published_at=s.published_at,
+                        entry_price=None, momentum_pct=None, volume_ratio=None,
+                        daily_dollar_volume=None, day_move_pct=None,
+                        exit_reason=None, exit_price=None, pnl_pct=None,
+                        production_outcome=(
+                            "traded" if s.acted_on else f"rejected:{s.rejection_code or 'unknown'}"
+                        ),
+                        v12_outcome=f"rejected:cooldown ({hours_since:.1f}h since last trade)",
+                    ))
+                    continue
+            result = run_v12_check(s)
+            if result.v12_outcome == "traded":
+                ticker_last_traded[s.ticker] = s.published_at
+            day_results.append(result)
         all_results[day_str] = day_results
         print_day_results(day_results, day_str)
 

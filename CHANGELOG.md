@@ -7,6 +7,29 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v13 — 2026-06-11
+
+### Changes
+
+**Trading logic:**
+- **Halt-article NEUTRAL rule in Claude prompt** — headlines containing "Shares Halted On Circuit Breaker To The Upside", "Stock Halted And Resumed", "Trading Halted", "Circuit Breaker Triggered", "Halt Lifted", or any mention of a regulatory halt/resumption are now rated NEUTRAL by Claude. These articles publish AFTER the 30–120% spike; buying on them = buying the absolute top. Every Jun 8–11 loss was a halt-article trade.
+- **Momentum ceiling: `MAX_PRICE_MOVE_PCT=15%`** — signals where recent_move_pct > 15% are rejected with `reason_code="high_momentum"`. Complements the Claude prompt change: if a halt article slips through Claude, the price confirmation layer blocks it. Day-trader reasoning: a stock that's already up 15–120% in the last 5 min is a post-halt top, not an entry.
+- **Raise momentum floor: `MIN_PRICE_MOVE_PCT` default 0.5% → 1.5%** — tighter entry quality. Weak 0.5–1.5% moves don't produce enough reward to justify the risk given the 2% stop-loss. The 5% take-profit target needs at least 1.5% of real momentum to be tradeable.
+- **Volume ceiling: `MAX_VOLUME_RATIO=20×`** — signals with volume_ratio > 20× are rejected with `reason_code="high_volume"`. Extreme volume on micro-caps is the circuit-breaker pattern signature, not a genuine momentum catalyst. All halt-article trades this week had vol_ratio > 30×; legitimate entries rarely exceed 15×.
+- **Penny stock filter: `MIN_STOCK_PRICE=$2.00`** — signals where current_price < $2.00 are rejected with `reason_code="penny_stock"`. Sub-$2 stocks have catastrophic bid-ask spread relative to price and are disproportionately targeted in halt-pump patterns. All Jun 8–11 losses were on stocks < $5 at entry.
+
+**Backtest improvements (`backtest/backtest_db.py`):**
+- **24-hour per-ticker cooldown** — production behaviour is to skip a ticker for 24h after a trade. The backtest now mirrors this: once a v13 trade is executed, subsequent signals for the same ticker within 24h are tagged `rejected:cooldown`. Without this, the backtest counted duplicate-ticker losses that production would have blocked, overstating loss count.
+- **Updated to v13 constants** — all five new settings (`MAX_PRICE_MOVE_PCT`, `MAX_VOLUME_RATIO`, `MIN_STOCK_PRICE`, `MIN_PRICE_MOVE_PCT=1.5`, `MAX_VOLUME_RATIO`) applied in `run_v13_check`. Backtest header now shows the full filter set.
+
+### Why
+Post-mortem on Jun 8–11 trading week (6 signals, 6 losses, −34% cumulative):
+- Every single loss was a halt-article trade. The pattern: "X Shares Halted On Circuit Breaker To The Upside" publishes after the stock has already spiked 30–120%. The system scored these as POSITIVE because the Claude v12 prompt didn't explicitly call out halt articles. By publication time, the move is over — we were buying the top every time.
+- All losses were on stocks priced < $5 (INHD $0.66, GOAI $1.35, NVNI $1.32) — thin spreads magnify slippage on exit.
+- Momentum readings on these signals were all > 30% (halt spike); volume ratios were all > 30× (halt pattern). Both new ceilings would have blocked all 6 trades.
+
+---
+
 ## v12 — 2026-06-11
 
 ### Changes

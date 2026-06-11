@@ -32,7 +32,7 @@ class Settings:
         default_factory=lambda: int(os.getenv("MIN_SENTIMENT_CONFIDENCE", "7"))
     )
     min_price_move_pct: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PRICE_MOVE_PCT", "0.5"))
+        default_factory=lambda: float(os.getenv("MIN_PRICE_MOVE_PCT", "1.5"))
     )
     momentum_window_minutes: int = field(
         default_factory=lambda: int(os.getenv("MOMENTUM_WINDOW_MINUTES", "15"))
@@ -50,6 +50,24 @@ class Settings:
     # (1-min observed: GOAI entire spike in 09:30 bar, bought at 09:32 into collapse).
     open_block_minutes: int = field(
         default_factory=lambda: int(os.getenv("OPEN_BLOCK_MINUTES", "5"))
+    )
+    # Reject signals where the stock has already moved more than this % in the last
+    # 5 min. A +30%+ momentum reading means we are buying the top after a halt/spike —
+    # the circuit-breaker halt article arrives AFTER the move. All Jun 8–11 losses
+    # were on halt articles with day_move_pct > 20%.
+    max_price_move_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_PRICE_MOVE_PCT", "15.0"))
+    )
+    # Reject signals where the volume ratio is above this ceiling. Extreme volume
+    # (>20× average) on micro-caps is the hallmark of a circuit-breaker halt pattern,
+    # not a genuine catalyst. All Jun 8–11 halt-article trades had vol_ratio > 30×.
+    max_volume_ratio: float = field(
+        default_factory=lambda: float(os.getenv("MAX_VOLUME_RATIO", "20.0"))
+    )
+    # Reject stocks trading below this price. Sub-$2 stocks have catastrophic
+    # spread/slippage and all observed losses this week were on stocks < $5.
+    min_stock_price: float = field(
+        default_factory=lambda: float(os.getenv("MIN_STOCK_PRICE", "2.0"))
     )
     max_position_size_pct: float = field(
         default_factory=lambda: float(os.getenv("MAX_POSITION_SIZE_PCT", "5.0"))

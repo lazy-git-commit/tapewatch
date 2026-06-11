@@ -26,7 +26,7 @@ Only articles that pass all three filters, are classified `"positive"` by Claude
 | `confidence` | INTEGER | Confidence score 1–10, derived from Claude Haiku's classification (raw 0.0–1.0 × 10, rounded). |
 | `acted_on` | INTEGER | `0` = evaluated but no trade placed; `1` = a buy order was executed for this signal. |
 | `rejection_reason` | TEXT | Human-readable explanation of why the signal was not traded (e.g. `"Insufficient recent momentum: +0.12% over last 15 min"`). NULL if the signal led to a trade. |
-| `rejection_code` | TEXT | Short keyword for the rejection reason: `low_momentum`, `low_volume`, `dead_cat`, `no_price_data`, `buy_failed`, `illiquid`, or `opening_block`. NULL if the signal led to a trade (`acted_on = 1`). |
+| `rejection_code` | TEXT | Short keyword for the rejection reason: `low_momentum`, `high_momentum`, `low_volume`, `high_volume`, `dead_cat`, `no_price_data`, `buy_failed`, `illiquid`, `opening_block`, or `penny_stock`. NULL if the signal led to a trade (`acted_on = 1`). |
 | `published_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when Benzinga published the article. |
 | `fetched_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when our news cycle fetched this article from the API. The gap between `published_at` and `fetched_at` shows detection latency. |
 | `created_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when this row was inserted. |
