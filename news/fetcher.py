@@ -63,11 +63,24 @@ def _fetch(lookback_minutes: int) -> list[dict]:
             params=params,
             timeout=_TIMEOUT,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            logger.warning(
+                "Benzinga API HTTP %d — %s",
+                resp.status_code, resp.text[:200],
+            )
+            return []
         data = resp.json()
-        return data.get("results", data.get("articles", []))
+        articles = data.get("results", data.get("articles", []))
+        logger.debug("Benzinga: fetched %d raw articles (lookback=%d min)", len(articles), lookback_minutes)
+        return articles
+    except requests.exceptions.Timeout:
+        logger.warning("Benzinga API timeout after %ds — skipping cycle", _TIMEOUT)
+        return []
     except requests.RequestException as exc:
         logger.warning("Benzinga API request failed: %s", exc)
+        return []
+    except Exception as exc:
+        logger.error("Benzinga API unexpected error: %s", exc, exc_info=True)
         return []
 
 
@@ -88,7 +101,7 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, tuple[str, float]]
     prompt = (
         "You are an expert day trader specialising in US equity momentum trading.\n"
         "Your job is to identify news that will cause a stock to move UP sharply "
-        "within the next 15 minutes of market trading.\n\n"
+        "within the next 5–15 minutes of market trading.\n\n"
 
         "Rate each article as 'positive', 'neutral', or 'negative' based on whether "
         "it is likely to drive immediate intraday buying momentum.\n\n"
@@ -96,7 +109,7 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, tuple[str, float]]
         "POSITIVE (high confidence 0.8–1.0) — genuine catalysts that move stocks NOW:\n"
         "- Earnings beats: revenue or EPS above analyst estimates\n"
         "- FDA approvals, drug trial success, regulatory green lights\n"
-        "- M&A: acquisition announcements, buyout offers, merger deals\n"
+        "- M&A: binding acquisition announcements, firm buyout offers, definitive merger agreements\n"
         "- Major contract wins with concrete dollar values\n"
         "- Guidance raises: company raises full-year revenue or earnings outlook\n"
         "- Short squeeze signals: stock halted to the upside, unusual volume surge\n"
@@ -114,7 +127,26 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, tuple[str, float]]
         "- Conference attendance announcements\n"
         "- Scheduled dividend declarations\n"
         "- Articles that summarise or repeat news published days ago\n"
-        "- Awards, rankings, ESG reports\n\n"
+        "- Awards, rankings, ESG reports\n"
+        "- LOI / MOU / letter of intent / memorandum of understanding — these are "
+        "non-binding exploratory agreements with no financial terms. They can be "
+        "cancelled at any time and almost never close. Rate as NEUTRAL.\n"
+        "- Recap / explainer articles — headlines like 'What's Going On With X Stock?', "
+        "'Why Is X Up Today?', 'Here's Why X Is Moving', 'X Stock Rally Explained' — "
+        "these are written hours AFTER the move, not before it. Rate as NEUTRAL.\n"
+        "- Large-cap S&P 500 components (AAPL, MSFT, GOOGL, AMZN, NVDA, META, TSLA, "
+        "BRK, JPM, V, UNH, XOM, etc.) unless the catalyst is extraordinary (e.g. "
+        "earnings surprise >10%, CEO criminal charges, regulatory shutdown). "
+        "Routine analyst upgrades, price target raises, or minor contract wins for "
+        "mega-caps will NOT cause 5%+ intraday momentum. Rate as NEUTRAL.\n"
+        "- Acquirer stocks in M&A announcements — the company BEING ACQUIRED may spike, "
+        "but the acquiring company almost always drops or stays flat. If the article is "
+        "about an acquirer paying a premium, rate the ACQUIRER ticker as NEUTRAL.\n\n"
+
+        "TICKER RELEVANCE: Only rate a ticker as POSITIVE if the article is specifically "
+        "about that company. If an article tags Company A but the news is primarily about "
+        "Company B (e.g. 'Company B acquires Company A' — Company B's ticker is tagged "
+        "but not the subject), rate Company B's ticker as NEUTRAL.\n\n"
 
         "NEGATIVE — news that will drive the stock DOWN:\n"
         "- Earnings misses, guidance cuts, revenue warnings\n"
@@ -161,8 +193,16 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, tuple[str, float]]
             for r in results
             if "id" in r
         }
+    except json.JSONDecodeError as exc:
+        logger.error(
+            "Batch sentiment: JSON parse failed — truncated=%s raw_start=%r: %s",
+            not raw.endswith("]") if "raw" in dir() else "unknown",
+            raw[:100] if "raw" in dir() else "<unavailable>",
+            exc,
+        )
+        return {}
     except Exception as exc:
-        logger.warning("Batch sentiment classification failed: %s", exc)
+        logger.error("Batch sentiment classification failed: %s", exc, exc_info=True)
         return {}
 
 

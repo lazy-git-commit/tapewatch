@@ -5,11 +5,18 @@ Initialises the PostgreSQL database and provides typed helpers for:
   - logging news signals
   - recording trades (open + close)
   - portfolio snapshots
+
+Connection retry policy:
+  get_conn() retries up to 3 times with 1s back-off on operational errors
+  (connection refused, server restart, transient TCP drop). It does NOT
+  retry programmer errors (bad SQL, type mismatches).
 """
 
 import logging
+import time
 import psycopg2
 import psycopg2.extras
+import psycopg2.errors
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
@@ -17,6 +24,8 @@ import pytz
 from config.settings import cfg
 
 _LONDON = pytz.timezone("Europe/London")
+_DB_RETRIES = 3
+_DB_RETRY_DELAY = 1.0  # seconds
 
 
 def _now_london() -> str:
@@ -28,9 +37,32 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def get_conn():
-    """Context manager that yields a connection and commits on exit."""
-    conn = psycopg2.connect(cfg.db_url)
-    conn.cursor_factory = psycopg2.extras.RealDictCursor
+    """
+    Context manager that yields a psycopg2 connection, commits on clean exit,
+    and rolls back + closes on exception.
+
+    Retries up to _DB_RETRIES times on OperationalError (transient TCP/server
+    issues). Raises immediately on all other errors.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _DB_RETRIES + 1):
+        try:
+            conn = psycopg2.connect(cfg.db_url)
+            conn.cursor_factory = psycopg2.extras.RealDictCursor
+            break
+        except psycopg2.OperationalError as exc:
+            last_exc = exc
+            if attempt < _DB_RETRIES:
+                logger.warning(
+                    "DB connection failed (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt, _DB_RETRIES, exc, _DB_RETRY_DELAY,
+                )
+                time.sleep(_DB_RETRY_DELAY * attempt)
+            else:
+                logger.error(
+                    "DB connection failed after %d attempts: %s", _DB_RETRIES, exc
+                )
+                raise
     try:
         yield conn
         conn.commit()

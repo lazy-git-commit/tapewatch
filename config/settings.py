@@ -21,6 +21,7 @@ class Settings:
     trading212_demo_api_key_id: str = field(default_factory=lambda: os.getenv("TRADING212_DEMO_API_KEY_ID", ""))
     benzinga_api_key: str = field(default_factory=lambda: os.getenv("MASSIVE_BENZINGA_API_KEY", ""))
     finnhub_api_key: str = field(default_factory=lambda: os.getenv("FINNHUBIO_API_KEY", ""))
+    twelvedata_api_key: str = field(default_factory=lambda: os.getenv("TWELVEDATA_API_KEY", ""))
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
 
     # ── Trading Mode ──────────────────────────────────────────────────────────
@@ -38,6 +39,17 @@ class Settings:
     )
     max_day_drop_pct: float = field(
         default_factory=lambda: float(os.getenv("MAX_DAY_DROP_PCT", "3.0"))
+    )
+    # Minimum daily dollar volume (price × shares traded). Stocks below this
+    # threshold are too illiquid — market sell orders can move price 10%+ vs
+    # the trigger price (observed: GOAI −18.99% on stop-loss exit, $390k ADV).
+    min_daily_dollar_volume: float = field(
+        default_factory=lambda: float(os.getenv("MIN_DAILY_DOLLAR_VOLUME", "1000000"))
+    )
+    # Block trades during the first N minutes after open. Opening auction noise
+    # (1-min observed: GOAI entire spike in 09:30 bar, bought at 09:32 into collapse).
+    open_block_minutes: int = field(
+        default_factory=lambda: int(os.getenv("OPEN_BLOCK_MINUTES", "5"))
     )
     max_position_size_pct: float = field(
         default_factory=lambda: float(os.getenv("MAX_POSITION_SIZE_PCT", "5.0"))
@@ -82,6 +94,8 @@ class Settings:
             missing.append("MASSIVE_BENZINGA_API_KEY")
         if not self.finnhub_api_key:
             missing.append("FINNHUBIO_API_KEY")
+        if not self.twelvedata_api_key:
+            missing.append("TWELVEDATA_API_KEY")
         if not self.anthropic_api_key:
             missing.append("ANTHROPIC_API_KEY")
         if missing:

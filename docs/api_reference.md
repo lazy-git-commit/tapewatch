@@ -81,9 +81,9 @@ Authorization: Bearer <MASSIVE_BENZINGA_API_KEY>
 
 ### Purpose
 
-Acts as an expert day trader to identify news that will cause a stock to move up sharply within the next 15 minutes. Classifies each article as `positive`, `neutral`, or `negative`. Only `positive` articles proceed to price confirmation.
+Acts as an expert day trader to identify news that will cause a stock to move up sharply within the next 5–15 minutes. Classifies each article as `positive`, `neutral`, or `negative`. Only `positive` articles proceed to price confirmation.
 
-The prompt is domain-specific — it explicitly teaches Claude which news types drive intraday momentum (earnings beats, FDA approvals, M&A, contract wins, guidance raises) and which to ignore regardless of tone (analyst price target raises, "Maintains" ratings, sector commentary, conference attendance).
+The prompt is domain-specific — it explicitly teaches Claude which news types drive intraday momentum (earnings beats, FDA approvals, M&A, contract wins, guidance raises) and which to ignore regardless of tone (analyst price target raises, "Maintains" ratings, sector commentary, conference attendance, LOI/MOU non-binding agreements, recap articles, large-cap routine coverage).
 
 ---
 
@@ -218,46 +218,89 @@ GET https://finnhub.io/api/v1/quote?symbol=AAPL&token=<FINNHUBIO_API_KEY>
 
 ---
 
-## 4. yfinance (Yahoo Finance)
+## 4. Twelvedata API
 
-**Package:** `yfinance` (Python library, no API key required)
-**Used by:** `market/price_check.py`
-**Latency:** ~15 minutes delayed
+**Base URL:** `https://api.twelvedata.com`
+**Auth:** `apikey=<TWELVEDATA_API_KEY>` query parameter
+**Plan:** Basic (800 credits/day — 1 credit per symbol per call)
+**Used by:** `market/twelvedata_bars.py`
 
-yfinance is used only for **historical** data where the 15-minute delay is acceptable or intentional.
+### Purpose
 
----
+Provides near-real-time 1-minute intraday bars for the momentum baseline, and 1-day bars for volume statistics. Replaces yfinance, which served stale bars on high-volume days (VECO root cause: bar from 09:56 returned at 11:42, giving a false +1.20% momentum signal).
 
-### Call 1: Momentum baseline (`confirm_price_signal`)
-
-**Purpose:** Fetch 1-minute intraday bars to get the price from ~15 minutes ago as the momentum baseline. The 15-minute delay is intentional — the most recent yfinance bar aligns with `MOMENTUM_WINDOW_MINUTES=15`.
-
-**Code:**
-```python
-yf.Ticker("AAPL").history(period="1d", interval="1m")
-```
-
-**Sample response (DataFrame):**
-```
-                                 Open        High         Low       Close    Volume
-Datetime
-2026-05-21 09:30:00-04:00  291.000000  292.500000  290.800000  292.100000   985432
-2026-05-21 09:31:00-04:00  292.100000  293.200000  291.900000  293.000000   754321
-...
-```
-
-The last bar (`Close.iloc[-1]`) is used as `past_price` for the recent momentum calculation.
+**Credit budget:** At ~50 price checks/day (2 calls per check: 1-min + 1-day), usage is ~100 credits/day — well within the 800/day Basic limit.
 
 ---
 
-### Call 2: 20-day average volume (`confirm_price_signal`)
+### Endpoint: GET `/time_series` (1-min bars — momentum baseline)
 
-**Purpose:** Calculate the 20-day average daily volume to determine if today's volume is elevated (volume ratio ≥ 1.5× average = volume spike).
+**Purpose:** Fetch the last 10 one-minute bars. `values[0]` is the most recent completed bar; `values[5]` is ~5 minutes ago and is used as the momentum baseline.
 
-**Code:**
-```python
-yf.Ticker("AAPL").history(period="21d", interval="1d")
+**Staleness guard:** If `values[0].datetime` is more than 10 minutes old, the data is rejected entirely. This prevents the VECO failure mode where stale bars caused a false positive signal.
+
+**Request:**
 ```
+GET https://api.twelvedata.com/time_series
+  ?symbol=AAPL
+  &interval=1min
+  &outputsize=10
+  &apikey=<TWELVEDATA_API_KEY>
+```
+
+**Sample response (JSON):**
+```json
+{
+  "meta": {"symbol": "AAPL", "interval": "1min", "currency": "USD"},
+  "values": [
+    {"datetime": "2026-06-11 15:45:00", "open": "192.10", "high": "192.50", "low": "192.00", "close": "192.40", "volume": "125430"},
+    {"datetime": "2026-06-11 15:44:00", "open": "191.90", "high": "192.15", "low": "191.85", "close": "192.10", "volume": "98210"},
+    ...
+  ],
+  "status": "ok"
+}
+```
+
+| Field | Used for |
+|---|---|
+| `values[0].close` | `current_bar_price` — most recent completed 1-min close |
+| `values[5].close` | `past_price` — ~5 minute momentum baseline |
+| `values[0].datetime` | Staleness check — reject if >10 min old |
+
+---
+
+### Endpoint: GET `/time_series` (1-day bars — volume stats)
+
+**Purpose:** Fetch 21 daily bars. `values[0]` is today's partial bar; `values[1..20]` are the prior 20 complete trading days used to compute the 20-day average daily volume.
+
+**Request:**
+```
+GET https://api.twelvedata.com/time_series
+  ?symbol=AAPL
+  &interval=1day
+  &outputsize=21
+  &apikey=<TWELVEDATA_API_KEY>
+```
+
+**Key fields used:**
+
+| Field | Used for |
+|---|---|
+| `values[0].volume` | Today's intraday volume (partial — underestimates early in session) |
+| `values[0].close` | Today's close for daily dollar volume calculation |
+| `values[1..20]` average volume | 20-day ADV for volume ratio |
+
+**Daily dollar volume** = `today_close × today_volume`. Used for the illiquidity filter: stocks with DDV < `MIN_DAILY_DOLLAR_VOLUME` ($1M default) are rejected. This guards against GOAI-style catastrophic slippage on market sell orders through thin order books.
+
+---
+
+### Retry policy
+
+Both calls use the same retry logic in `market/twelvedata_bars.py`:
+- 3 attempts
+- Exponential backoff: 1.5s, 3s, 6s
+- Retries on `Timeout`, `ConnectionError`, HTTP 5xx, and HTTP 429 (rate limit)
+- Does NOT retry HTTP 4xx (bad symbol, auth failure — won't self-heal)
 
 ---
 
@@ -436,9 +479,9 @@ Other notable error types:
 | Benzinga (massive.com) | `GET /benzinga/v2/news` | Fetch recent US equity news | `news/fetcher.py` |
 | Anthropic (Claude Haiku) | `messages.create` (batched) | Classify article sentiment | `news/fetcher.py` |
 | Finnhub | `GET /stock/market-status` | Fallback NYSE open/closed check (primary is `pandas_market_calendars`) | `market/price_check.py` |
-| Finnhub | `GET /quote` | Real-time current price | `market/finnhub_bars.py` |
-| yfinance | `<ticker>` 1m history (1d) | Momentum baseline (~15 min ago) | `market/price_check.py` |
-| yfinance | `<ticker>` 1d history (21d) | 20-day average volume | `market/price_check.py` |
+| Finnhub | `GET /quote` | Real-time current price (retried, exp backoff) | `market/finnhub_bars.py` |
+| Twelvedata | `GET /time_series?interval=1min` | 1-min momentum baseline (~5 min ago, staleness guard) | `market/twelvedata_bars.py` |
+| Twelvedata | `GET /time_series?interval=1day` | 20-day ADV + daily dollar volume (liquidity filter) | `market/twelvedata_bars.py` |
 | Trading 212 | `GET /equity/metadata/instruments` | Build shortName→ticker map at startup (handles SPAC/rename mismatches) | `trading/executor.py` |
 | Trading 212 | `GET /equity/account/cash` | Portfolio value + cash for position sizing | `trading/executor.py` |
 | Trading 212 | `POST /equity/orders/market` | Place buy / sell order | `trading/executor.py` |

@@ -32,37 +32,43 @@ class TestExitConditions:
     @patch("monitor.position_monitor.get_current_price", return_value=106.0)
     def test_take_profit_triggered(self, _mock):
         from monitor.position_monitor import check_exit_conditions
-        should_exit, reason = check_exit_conditions(self._trade(buy_price=100.0))
+        should_exit, reason, price = check_exit_conditions(self._trade(buy_price=100.0))
         assert should_exit is True
         assert reason == "take_profit"
+        assert price == 106.0
 
     @patch("monitor.position_monitor.get_current_price", return_value=97.0)
     def test_stop_loss_triggered(self, _mock):
         from monitor.position_monitor import check_exit_conditions
-        should_exit, reason = check_exit_conditions(self._trade(buy_price=100.0))
+        should_exit, reason, price = check_exit_conditions(self._trade(buy_price=100.0))
         assert should_exit is True
         assert reason == "stop_loss"
+        assert price == 97.0
 
     @patch("monitor.position_monitor.get_current_price", return_value=101.0)
     def test_time_stop_triggered(self, _mock):
         from monitor.position_monitor import check_exit_conditions
         # Trade opened 65 minutes ago — past the 60-minute time stop
-        should_exit, reason = check_exit_conditions(self._trade(minutes_ago=65))
+        should_exit, reason, price = check_exit_conditions(self._trade(minutes_ago=65))
         assert should_exit is True
         assert reason == "time_stop"
+        assert price == 101.0
 
     @patch("monitor.position_monitor.get_current_price", return_value=101.5)
     def test_no_exit_when_in_range(self, _mock):
         from monitor.position_monitor import check_exit_conditions
         # Price is +1.5% — not yet at take profit (+5%) or stop loss (-2%)
-        should_exit, reason = check_exit_conditions(self._trade(buy_price=100.0))
+        should_exit, reason, price = check_exit_conditions(self._trade(buy_price=100.0))
         assert should_exit is False
+        assert price == 101.5
 
     @patch("monitor.position_monitor.get_current_price", return_value=None)
     def test_no_exit_when_price_unavailable(self, _mock):
         from monitor.position_monitor import check_exit_conditions
-        should_exit, _ = check_exit_conditions(self._trade())
+        # When price feed is down, skip TP/SL — should_exit=False, price=None
+        should_exit, reason, price = check_exit_conditions(self._trade())
         assert should_exit is False
+        assert price is None
 
 
 # ── Sentiment scoring tests ───────────────────────────────────────────────────
