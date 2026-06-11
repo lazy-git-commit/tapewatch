@@ -119,16 +119,36 @@ class OrderResult:
 
 
 def _fetch_fill(order_id: str) -> dict | None:
-    """Poll history/orders until the given order appears with a fill. Returns the fill dict or None."""
-    for _ in range(6):
-        time.sleep(2)
+    """Poll until the order fill is available. Returns the fill dict or None.
+
+    T212 populates fill data asynchronously — on fast micro-cap orders it can
+    take 15-30s after the order is placed. We poll for up to 30s total:
+      - First try the individual order endpoint (most reliable, direct by ID)
+      - Fall back to history/orders list scan if the direct endpoint 404s
+    Logs a warning if fill is still missing after all retries so blank Grafana
+    columns are traceable to a specific order ID.
+    """
+    for attempt in range(10):
+        time.sleep(3)
         try:
-            data = _get("/equity/history/orders?limit=20")
+            # Try direct order lookup first — avoids the list-scan miss
+            try:
+                item = _get(f"/equity/orders/{order_id}")
+                if "fill" in item:
+                    return item["fill"]
+            except Exception:
+                pass
+            # Fall back to history list scan
+            data = _get("/equity/history/orders?limit=50")
             for item in data.get("items", []):
                 if str(item.get("order", {}).get("id")) == order_id and "fill" in item:
                     return item["fill"]
         except Exception as exc:
-            logger.warning("Failed to fetch fill for order %s: %s", order_id, exc)
+            logger.warning("Failed to fetch fill for order %s (attempt %d): %s", order_id, attempt + 1, exc)
+    logger.warning(
+        "Fill data unavailable for order %s after 30s — buy_net_gbp/fx_rate/fees will be NULL in DB",
+        order_id,
+    )
     return None
 
 
