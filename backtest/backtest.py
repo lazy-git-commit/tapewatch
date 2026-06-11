@@ -3,22 +3,33 @@ backtest/backtest.py
 ────────────────────
 Replays the full trading strategy against historical news + price data.
 
-Mirrors the live v7 logic:
+Mirrors the live v12 logic:
   1. Classify sentiment with Claude Haiku (batched, same as production)
-  2. Block signals in the first minute after open (09:30–09:31 ET)
-  3. Check price momentum: yfinance 1-min bars (15-min delayed baseline)
-     Falls back to open price as baseline in the 1–15 min window
+     Includes all v12 prompt improvements: LOI neutral, recap neutral,
+     large-cap neutral, ticker relevance, acquirer neutral.
+  2. Block signals in the first OPEN_BLOCK_MINUTES (5 min) after open
+  3. Check price momentum: yfinance 1-min bars, ~5-min baseline
+     (bar at t_news - 5 min, to match Twelvedata values[5] in production)
+     Falls back to open price as baseline in the 5–15 min window
   4. Check volume:
-       - 1–15 min after open: current_volume > 0 required
-       - after 15 min: ≥1.5× 20-day average required
-  5. Simulate a buy at the confirmation price, then exit at:
+       - 5–15 min after open: volume_ratio >= 0.5 required
+       - after 15 min: >= 1.5× 20-day average required
+  5. Liquidity filter: daily dollar volume >= MIN_DAILY_DOLLAR_VOLUME ($1M)
+  6. Dead-cat bounce guard: reject if down > MAX_DAY_DROP_PCT from open
+  7. Simulate a buy at the confirmation price, then exit at:
        +5% take profit / -2% stop loss / 60-min time stop
-  6. Show a price window: 15 min before news → 60 min after news
+  8. Show a price window: 5 min before news → news time → 5 min after
+
+Note: yfinance is used here instead of Twelvedata intentionally.
+Production uses Twelvedata for near-real-time 1-min bars. The backtest
+uses yfinance (free, historical, no API credit cost). The 5-min baseline
+logic is identical — we just use historical yfinance bars instead of
+live Twelvedata bars.
 
 Usage:
   python -m backtest.backtest                     # yesterday's market session
   python -m backtest.backtest --date 2026-05-20   # specific date (YYYY-MM-DD)
-  python -m backtest.backtest --date 2026-05-20 --no-sentiment  # skip Claude, use all articles
+  python -m backtest.backtest --no-sentiment       # skip Claude, use all articles
 """
 
 import argparse
@@ -28,6 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import pytz
 import requests
 import yfinance as yf
 
@@ -38,11 +50,18 @@ logging.basicConfig(level=logging.WARNING)
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-TAKE_PROFIT_PCT = cfg.take_profit_pct
-STOP_LOSS_PCT = cfg.stop_loss_pct
-TIME_STOP_MINUTES = cfg.time_stop_minutes
-MIN_PRICE_MOVE_PCT = cfg.min_price_move_pct
-VOLUME_RATIO_MIN = 1.5
+TAKE_PROFIT_PCT      = cfg.take_profit_pct
+STOP_LOSS_PCT        = cfg.stop_loss_pct
+TIME_STOP_MINUTES    = cfg.time_stop_minutes
+MIN_PRICE_MOVE_PCT   = cfg.min_price_move_pct
+VOLUME_RATIO_MIN     = 1.5
+VOLUME_RATIO_EARLY   = 0.5     # v12: 5–15 min window requires >= 0.5× (was > 0)
+OPEN_BLOCK_MINUTES   = cfg.open_block_minutes   # v12: 5 min (was 1 min)
+MIN_DAILY_DOLLAR_VOL = cfg.min_daily_dollar_volume  # v12: $1M liquidity filter
+MAX_DAY_DROP_PCT     = cfg.max_day_drop_pct
+MOMENTUM_BARS_BACK   = 6       # v12: ~5-min baseline (6 bars back at 1-min resolution)
+
+_ET = pytz.timezone("America/New_York")
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -69,12 +88,13 @@ class TradeResult:
     exit_reason: str | None
     pnl_pct: float | None
     # Price window
-    price_minus_15: float | None   # price 15 min before news
-    price_at_news: float | None    # price at publication time
-    price_plus_15: float | None    # price 15 min after news (buy point)
-    momentum_pct: float | None     # % move from price_at_news to price_plus_15
+    price_minus_5: float | None     # price 5 min before news
+    price_at_news: float | None     # price at publication time
+    price_plus_5: float | None      # price 5 min after news (buy point)
+    momentum_pct: float | None      # % move from baseline to entry
     volume_ratio: float | None
-    # Rejection reasons (None = traded)
+    daily_dollar_volume: float | None
+    # Rejection reason (None = traded)
     rejected: str | None = None
 
 
@@ -83,7 +103,6 @@ class TradeResult:
 def _last_market_day() -> datetime:
     """Return the most recent completed NYSE trading day (UTC open)."""
     today = datetime.now(timezone.utc)
-    # Walk back until we find a weekday
     d = today - timedelta(days=1)
     while d.weekday() >= 5:
         d -= timedelta(days=1)
@@ -100,7 +119,6 @@ def _get_intraday(ticker: str, date: datetime) -> pd.DataFrame | None:
         )
         if df.empty:
             return None
-        # Ensure timezone-aware index
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
         else:
@@ -114,11 +132,24 @@ def _price_at(bars: pd.DataFrame, ts: datetime) -> float | None:
     """Return the close price of the 1-min bar that contains ts."""
     if bars is None or bars.empty:
         return None
-    # Find the last bar at or before ts
     mask = bars.index <= ts
     if not mask.any():
         return None
     return float(bars.loc[mask, "Close"].iloc[-1])
+
+
+def _price_n_bars_before(bars: pd.DataFrame, ts: datetime, n: int) -> float | None:
+    """
+    Return the close price of the bar n bars before the bar at ts.
+    Mirrors Twelvedata values[n] logic used in production.
+    """
+    if bars is None or bars.empty:
+        return None
+    mask = bars.index <= ts
+    eligible = bars.loc[mask]
+    if len(eligible) < n + 1:
+        return None
+    return float(eligible["Close"].iloc[-(n + 1)])
 
 
 def _simulate_trade(
@@ -141,17 +172,21 @@ def _simulate_trade(
             pnl_pct = (exit_price - entry_price) / entry_price * 100
             return ts, exit_price, "time_stop", pnl_pct
         if row["High"] >= tp_price:
-            pnl_pct = TAKE_PROFIT_PCT
-            return ts, tp_price, "take_profit", pnl_pct
+            return ts, tp_price, "take_profit", TAKE_PROFIT_PCT
         if row["Low"] <= sl_price:
-            pnl_pct = -STOP_LOSS_PCT
-            return ts, sl_price, "stop_loss", pnl_pct
+            return ts, sl_price, "stop_loss", -STOP_LOSS_PCT
 
     return None, None, "still_open", None
 
 
-def _get_volume_ratio(ticker: str, date: datetime, intraday: pd.DataFrame) -> float:
-    """Compute today's cumulative volume vs 20-day daily average."""
+def _get_volume_stats(
+    ticker: str, date: datetime, intraday: pd.DataFrame, confirm_time: datetime
+) -> tuple[float, float, float | None]:
+    """
+    Returns (volume_ratio, today_volume_at_confirm, daily_dollar_volume).
+    volume_ratio = today volume up to confirm_time / 20-day ADV
+    daily_dollar_volume = today's close × today's full-day volume (projection)
+    """
     try:
         daily = yf.Ticker(ticker).history(
             start=(date - timedelta(days=30)).strftime("%Y-%m-%d"),
@@ -159,20 +194,32 @@ def _get_volume_ratio(ticker: str, date: datetime, intraday: pd.DataFrame) -> fl
             interval="1d",
         )
         if len(daily) < 2:
-            return 0.0
-        avg_vol = float(daily["Volume"].iloc[:-1].mean()) if len(daily) > 1 else 0.0
-        current_vol = float(intraday["Volume"].sum()) if intraday is not None else 0.0
-        return current_vol / avg_vol if avg_vol > 0 else 0.0
+            return 0.0, 0, None
+        avg_vol = float(daily["Volume"].mean()) if not daily.empty else 0.0
+
+        # Volume up to confirmation time
+        bars_to_confirm = intraday[intraday.index <= confirm_time] if intraday is not None else None
+        current_vol = float(bars_to_confirm["Volume"].sum()) if bars_to_confirm is not None and not bars_to_confirm.empty else 0.0
+
+        volume_ratio = current_vol / avg_vol if avg_vol > 0 else 0.0
+
+        # Daily dollar volume: today's close × full-day volume (from last daily bar)
+        last_daily = daily.iloc[-1]
+        daily_dollar_volume = float(last_daily["Close"]) * float(last_daily["Volume"])
+        if daily_dollar_volume == 0:
+            daily_dollar_volume = None
+
+        return volume_ratio, int(current_vol), daily_dollar_volume
     except Exception:
-        return 0.0
+        return 0.0, 0, None
 
 
 # ── Fetch articles ────────────────────────────────────────────────────────────
 
 def fetch_market_day_articles(date: datetime) -> list[dict]:
     """Fetch all Benzinga articles published during market hours on date."""
-    market_open = date.replace(hour=13, minute=30, second=0, microsecond=0)
-    market_close = date.replace(hour=21, minute=0, second=0, microsecond=0)
+    market_open  = date.replace(hour=13, minute=30, second=0, microsecond=0)
+    market_close = date.replace(hour=21, minute=0,  second=0, microsecond=0)
 
     all_articles = []
     seen_ids: set = set()
@@ -187,14 +234,19 @@ def fetch_market_day_articles(date: datetime) -> list[dict]:
             "limit": 100,
             "sort": "published.asc",
         }
-        resp = requests.get(
-            "https://api.massive.com/benzinga/v2/news",
-            headers={"Authorization": f"Bearer {cfg.benzinga_api_key}"},
-            params=params,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        articles = resp.json().get("results", [])
+        try:
+            resp = requests.get(
+                "https://api.massive.com/benzinga/v2/news",
+                headers={"Authorization": f"Bearer {cfg.benzinga_api_key}"},
+                params=params,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            articles = resp.json().get("results", [])
+        except Exception as exc:
+            print(f"  [WARN] Benzinga fetch failed for window {window_start.strftime('%H:%M')}–{window_end.strftime('%H:%M')}: {exc}")
+            articles = []
+
         for a in articles:
             aid = str(a.get("benzinga_id", a.get("url", "")))
             if aid not in seen_ids:
@@ -209,19 +261,36 @@ def fetch_market_day_articles(date: datetime) -> list[dict]:
 
 def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult]:
     date_str = date.strftime("%Y-%m-%d")
-    print(f"\nBacktest — {date_str}  (take-profit={TAKE_PROFIT_PCT}% | stop-loss={STOP_LOSS_PCT}% | time-stop={TIME_STOP_MINUTES}min)")
+    print(f"\nBacktest — {date_str}")
+    print(f"  Strategy: TP={TAKE_PROFIT_PCT}% | SL={STOP_LOSS_PCT}% | time-stop={TIME_STOP_MINUTES}min")
+    print(f"  Filters:  open-block={OPEN_BLOCK_MINUTES}min | momentum>={MIN_PRICE_MOVE_PCT}% | vol>={VOLUME_RATIO_MIN}× | DDV>=${MIN_DAILY_DOLLAR_VOL/1e6:.0f}M")
     print("=" * 72)
 
     print("Fetching news articles...", end=" ", flush=True)
-    articles = fetch_market_day_articles(date)
+    try:
+        articles = fetch_market_day_articles(date)
+    except Exception as exc:
+        print(f"\n  ERROR: {exc}")
+        return []
     print(f"{len(articles)} articles found")
 
-    # Filter to those with tickers
-    articles = [a for a in articles if a.get("tickers")]
-    print(f"With tickers: {len(articles)}")
+    # Apply pre-filters matching production:
+    # 1. Must have tickers
+    # 2. No crypto (X: prefix)
+    # 3. No roundup (>3 tickers)
+    pre_filtered = []
+    for a in articles:
+        tickers = [t for t in (a.get("tickers") or []) if t and not t.startswith("X:")]
+        if not tickers:
+            continue
+        if len(tickers) > 3:
+            continue
+        a["_tickers"] = tickers
+        pre_filtered.append(a)
+    print(f"Pre-filtered (tickers, no crypto, no roundup): {len(pre_filtered)}")
 
-    # Score sentiment in one batched Claude call (or accept all)
-    print(f"Scoring sentiment {'with Claude Haiku (batched)' if use_sentiment else '(skipped — all articles used)'}...")
+    # Score sentiment
+    print(f"Scoring sentiment {'with Claude Haiku (v12 prompt)' if use_sentiment else '(skipped — all articles positive)'}...")
     news_events: list[NewsEvent] = []
     seen_article_tickers: set = set()
 
@@ -233,20 +302,22 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
                 "headline": html.unescape(a.get("title", "")),
                 "teaser": html.unescape(a.get("teaser") or a.get("body", "")[:200]),
             }
-            for a in articles
+            for a in pre_filtered
         ]
-        # Chunk into batches of 20 to stay within Claude's output token limit
+        # Chunk into batches of 20 to stay within Claude token limits
         chunk_size = 20
         for i in range(0, len(to_score), chunk_size):
             chunk = to_score[i:i + chunk_size]
-            scores.update(_batch_score_sentiment(chunk))
+            chunk_scores = _batch_score_sentiment(chunk)
+            scores.update(chunk_scores)
+            print(f"  Scored {min(i + chunk_size, len(to_score))}/{len(to_score)} articles...", end="\r", flush=True)
+        print()
     else:
         scores = {}
 
-    for a in articles:
+    for a in pre_filtered:
         article_id = str(a.get("benzinga_id", ""))
         headline = html.unescape(a.get("title", ""))
-        teaser = html.unescape(a.get("teaser") or a.get("body", "")[:200])
 
         if use_sentiment:
             sentiment, confidence = scores.get(article_id, ("neutral", 0.0))
@@ -262,7 +333,7 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
         except (ValueError, AttributeError):
             continue
 
-        for ticker in a.get("tickers", []):
+        for ticker in a["_tickers"]:
             key = (article_id, ticker)
             if key in seen_article_tickers:
                 continue
@@ -276,7 +347,7 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
                 confidence=confidence,
             ))
 
-    print(f"Positive signals: {len(news_events)}")
+    print(f"Positive ticker signals: {len(news_events)}")
 
     if not news_events:
         print("No signals to backtest.")
@@ -286,12 +357,13 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
     bar_cache: dict[str, pd.DataFrame | None] = {}
     results: list[TradeResult] = []
 
-    print(f"\nRunning price checks and trade simulations...")
+    print(f"\nRunning price checks and simulations...")
     print("-" * 72)
 
     market_open_utc = date.replace(hour=13, minute=30, second=0, microsecond=0, tzinfo=timezone.utc)
 
     for ev in news_events:
+        # Strip T212 suffix to get plain ticker
         yf_ticker = ev.ticker.split("_")[0] if "_" in ev.ticker else ev.ticker
 
         if yf_ticker not in bar_cache:
@@ -304,169 +376,180 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
                 published_at=ev.published_at,
                 entry_time=ev.published_at, entry_price=0,
                 exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
-                price_minus_15=None, price_at_news=None, price_plus_15=None,
-                momentum_pct=None, volume_ratio=None,
+                price_minus_5=None, price_at_news=None, price_plus_5=None,
+                momentum_pct=None, volume_ratio=None, daily_dollar_volume=None,
                 rejected="no_price_data",
             ))
             continue
 
-        # ── v7: block signals in the first minute after open ─────────────────
         minutes_since_open = (ev.published_at - market_open_utc).total_seconds() / 60
-        if minutes_since_open < 1:
+
+        # ── v12: block first OPEN_BLOCK_MINUTES (5 min) after open ───────────
+        if minutes_since_open < OPEN_BLOCK_MINUTES:
             results.append(TradeResult(
                 ticker=ev.ticker, headline=ev.headline,
                 published_at=ev.published_at,
                 entry_time=ev.published_at, entry_price=0,
                 exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
-                price_minus_15=None, price_at_news=None, price_plus_15=None,
-                momentum_pct=None, volume_ratio=None,
-                rejected="first_minute_block",
+                price_minus_5=None, price_at_news=None, price_plus_5=None,
+                momentum_pct=None, volume_ratio=None, daily_dollar_volume=None,
+                rejected=f"opening_block: {minutes_since_open:.1f} min since open (block={OPEN_BLOCK_MINUTES} min)",
             ))
             continue
 
-        # Price window — confirmation point is 15 min after publication
-        t_minus_15 = ev.published_at - timedelta(minutes=15)
-        t_confirm  = ev.published_at + timedelta(minutes=15)
-
-        price_minus_15  = _price_at(bars, t_minus_15)
-        price_at_news   = _price_at(bars, ev.published_at)
-        price_at_confirm = _price_at(bars, t_confirm)
+        # Price window
+        t_confirm = ev.published_at  # In backtest we evaluate at publication time
+        price_at_news = _price_at(bars, t_confirm)
+        price_minus_5 = _price_n_bars_before(bars, t_confirm, 5)  # 5 bars back = ~5 min ago
 
         if price_at_news is None:
             results.append(TradeResult(
                 ticker=ev.ticker, headline=ev.headline,
                 published_at=ev.published_at,
-                entry_time=ev.published_at, entry_price=0,
+                entry_time=t_confirm, entry_price=0,
                 exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
-                price_minus_15=price_minus_15, price_at_news=None,
-                price_plus_15=None, momentum_pct=None,
-                volume_ratio=None, rejected="no_price_data",
+                price_minus_5=price_minus_5, price_at_news=None, price_plus_5=None,
+                momentum_pct=None, volume_ratio=None, daily_dollar_volume=None,
+                rejected="no_price_data",
             ))
             continue
 
-        # ── v7: momentum baseline ─────────────────────────────────────────────
-        # In the 1–15 min window, yfinance has no bars; use the open-bar price
-        # as the baseline (first bar of the day). After 15 min, the last bar
-        # ~15 min ago is the baseline (standard production logic).
+        # ── v12: momentum baseline — 5-min lookback ───────────────────────────
+        # Use the bar 5 bars back (MOMENTUM_BARS_BACK=6 means values[5] in
+        # Twelvedata / iloc[-6] in a sorted DataFrame). In the 5–15 min window
+        # where we don't have 5 full bars yet, fall back to open-bar price.
         if minutes_since_open < 15:
             open_bar = bars.iloc[0] if not bars.empty else None
             baseline_price = float(open_bar["Close"]) if open_bar is not None else price_at_news
-            confirm_price = price_at_news  # enter at current price, baseline is open
         else:
-            # baseline = price 15 min ago (last yfinance bar before news)
-            baseline_price = price_at_news
-            confirm_price = price_at_confirm
+            baseline_price = price_minus_5 if price_minus_5 is not None else price_at_news
 
-        if confirm_price is None:
-            results.append(TradeResult(
-                ticker=ev.ticker, headline=ev.headline,
-                published_at=ev.published_at,
-                entry_time=t_confirm, entry_price=0,
-                exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
-                price_minus_15=price_minus_15, price_at_news=price_at_news,
-                price_plus_15=None, momentum_pct=None,
-                volume_ratio=None, rejected="no_price_data",
-            ))
-            continue
-
-        momentum_pct = (confirm_price - baseline_price) / baseline_price * 100
+        momentum_pct = (price_at_news - baseline_price) / baseline_price * 100 if baseline_price else 0.0
 
         # ── Dead-cat bounce guard ─────────────────────────────────────────────
-        open_price = float(bars.iloc[0]["Open"])
-        day_move_pct = (confirm_price - open_price) / open_price * 100
-        if day_move_pct < -cfg.max_day_drop_pct:
+        open_price = float(bars.iloc[0]["Open"]) if not bars.empty else price_at_news
+        day_move_pct = (price_at_news - open_price) / open_price * 100 if open_price else 0.0
+        if day_move_pct < -MAX_DAY_DROP_PCT:
             results.append(TradeResult(
                 ticker=ev.ticker, headline=ev.headline,
                 published_at=ev.published_at,
-                entry_time=t_confirm, entry_price=confirm_price,
+                entry_time=t_confirm, entry_price=price_at_news,
                 exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
-                price_minus_15=price_minus_15, price_at_news=price_at_news,
-                price_plus_15=confirm_price, momentum_pct=momentum_pct,
-                volume_ratio=volume_ratio,
-                rejected=f"dead_cat: down {day_move_pct:.1f}% on day (max -{cfg.max_day_drop_pct}%)",
+                price_minus_5=price_minus_5, price_at_news=price_at_news, price_plus_5=price_at_news,
+                momentum_pct=momentum_pct, volume_ratio=None, daily_dollar_volume=None,
+                rejected=f"dead_cat: down {day_move_pct:.1f}% on day (max -{MAX_DAY_DROP_PCT}%)",
             ))
             continue
 
-        # ── v7: volume check ──────────────────────────────────────────────────
-        volume_ratio = _get_volume_ratio(yf_ticker, date, bars)
-        # Compute volume at confirmation time (not end of day)
-        bars_at_confirm = bars[bars.index <= t_confirm]
-        current_volume = int(bars_at_confirm["Volume"].sum()) if not bars_at_confirm.empty else 0
+        # ── v12: volume + liquidity filter ────────────────────────────────────
+        volume_ratio, today_volume, daily_dollar_volume = _get_volume_stats(
+            yf_ticker, date, bars, t_confirm
+        )
 
-        if minutes_since_open < 15:
-            volume_ok = current_volume > 0
-            volume_reject_reason = f"no volume yet ({current_volume} shares)"
-        else:
-            volume_ok = volume_ratio >= VOLUME_RATIO_MIN
-            volume_reject_reason = f"volume {volume_ratio:.2f}× < {VOLUME_RATIO_MIN}× threshold"
+        # Liquidity filter: reject below minimum daily dollar volume
+        if daily_dollar_volume is not None and daily_dollar_volume < MIN_DAILY_DOLLAR_VOL:
+            results.append(TradeResult(
+                ticker=ev.ticker, headline=ev.headline,
+                published_at=ev.published_at,
+                entry_time=t_confirm, entry_price=price_at_news,
+                exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
+                price_minus_5=price_minus_5, price_at_news=price_at_news, price_plus_5=price_at_news,
+                momentum_pct=momentum_pct, volume_ratio=volume_ratio,
+                daily_dollar_volume=daily_dollar_volume,
+                rejected=f"illiquid: DDV=${daily_dollar_volume:,.0f} < ${MIN_DAILY_DOLLAR_VOL:,.0f}",
+            ))
+            continue
 
-        # Apply confirmation filters
+        # Momentum filter
         if momentum_pct < MIN_PRICE_MOVE_PCT:
             results.append(TradeResult(
                 ticker=ev.ticker, headline=ev.headline,
                 published_at=ev.published_at,
-                entry_time=t_confirm, entry_price=confirm_price,
+                entry_time=t_confirm, entry_price=price_at_news,
                 exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
-                price_minus_15=price_minus_15, price_at_news=price_at_news,
-                price_plus_15=confirm_price, momentum_pct=momentum_pct,
-                volume_ratio=volume_ratio,
+                price_minus_5=price_minus_5, price_at_news=price_at_news, price_plus_5=price_at_news,
+                momentum_pct=momentum_pct, volume_ratio=volume_ratio,
+                daily_dollar_volume=daily_dollar_volume,
                 rejected=f"momentum {momentum_pct:+.2f}% < {MIN_PRICE_MOVE_PCT}% threshold",
             ))
             continue
+
+        # Volume filter
+        if minutes_since_open < 15:
+            volume_ok = volume_ratio >= VOLUME_RATIO_EARLY
+            volume_reject = f"early-session volume {volume_ratio:.2f}× < {VOLUME_RATIO_EARLY}× threshold"
+        else:
+            volume_ok = volume_ratio >= VOLUME_RATIO_MIN
+            volume_reject = f"volume {volume_ratio:.2f}× < {VOLUME_RATIO_MIN}× threshold"
 
         if not volume_ok:
             results.append(TradeResult(
                 ticker=ev.ticker, headline=ev.headline,
                 published_at=ev.published_at,
-                entry_time=t_confirm, entry_price=confirm_price,
+                entry_time=t_confirm, entry_price=price_at_news,
                 exit_time=None, exit_price=None, exit_reason=None, pnl_pct=None,
-                price_minus_15=price_minus_15, price_at_news=price_at_news,
-                price_plus_15=confirm_price, momentum_pct=momentum_pct,
-                volume_ratio=volume_ratio,
-                rejected=volume_reject_reason,
+                price_minus_5=price_minus_5, price_at_news=price_at_news, price_plus_5=price_at_news,
+                momentum_pct=momentum_pct, volume_ratio=volume_ratio,
+                daily_dollar_volume=daily_dollar_volume,
+                rejected=volume_reject,
             ))
             continue
 
-        # Simulate trade — enter at confirmation price
+        # ── All filters passed — simulate trade ───────────────────────────────
         exit_time, exit_price, exit_reason, pnl_pct = _simulate_trade(
-            bars, t_confirm, confirm_price
+            bars, t_confirm, price_at_news
         )
+
+        # price_plus_5: what happened 5 min after entry (for the price window display)
+        price_plus_5 = _price_at(bars, t_confirm + timedelta(minutes=5))
 
         results.append(TradeResult(
             ticker=ev.ticker, headline=ev.headline,
             published_at=ev.published_at,
-            entry_time=t_confirm, entry_price=confirm_price,
+            entry_time=t_confirm, entry_price=price_at_news,
             exit_time=exit_time, exit_price=exit_price,
             exit_reason=exit_reason, pnl_pct=pnl_pct,
-            price_minus_15=price_minus_15, price_at_news=price_at_news,
-            price_plus_15=confirm_price, momentum_pct=momentum_pct,
-            volume_ratio=volume_ratio, rejected=None,
+            price_minus_5=price_minus_5, price_at_news=price_at_news, price_plus_5=price_plus_5,
+            momentum_pct=momentum_pct, volume_ratio=volume_ratio,
+            daily_dollar_volume=daily_dollar_volume,
+            rejected=None,
         ))
 
     return results
 
 
-def print_results(results: list[TradeResult]) -> None:
-    traded = [r for r in results if r.rejected is None and r.pnl_pct is not None]
+def print_results(results: list[TradeResult], date_str: str = "") -> None:
+    traded  = [r for r in results if r.rejected is None and r.pnl_pct is not None]
     rejected = [r for r in results if r.rejected is not None]
-    still_open = [r for r in results if r.exit_reason == "still_open"]
 
     print(f"\n{'=' * 72}")
-    print(f"RESULTS SUMMARY")
+    print(f"RESULTS SUMMARY{' — ' + date_str if date_str else ''}")
     print(f"{'=' * 72}")
     print(f"  Total signals evaluated : {len(results)}")
     print(f"  Rejected by filters     : {len(rejected)}")
     print(f"  Trades executed         : {len(traded)}")
 
     if traded:
-        wins  = [r for r in traded if r.pnl_pct and r.pnl_pct > 0]
+        wins   = [r for r in traded if r.pnl_pct and r.pnl_pct > 0]
         losses = [r for r in traded if r.pnl_pct and r.pnl_pct <= 0]
-        avg_pnl = sum(r.pnl_pct for r in traded if r.pnl_pct) / len(traded)
+        avg_pnl  = sum(r.pnl_pct for r in traded if r.pnl_pct) / len(traded)
         win_rate = len(wins) / len(traded) * 100 if traded else 0
         print(f"  Win rate                : {win_rate:.0f}%  ({len(wins)} wins / {len(losses)} losses)")
         print(f"  Average P&L per trade   : {avg_pnl:+.2f}%")
-        print(f"  Best trade              : {max(r.pnl_pct for r in traded if r.pnl_pct):+.2f}%")
-        print(f"  Worst trade             : {min(r.pnl_pct for r in traded if r.pnl_pct):+.2f}%")
+        if traded:
+            print(f"  Best trade              : {max(r.pnl_pct for r in traded if r.pnl_pct):+.2f}%")
+            print(f"  Worst trade             : {min(r.pnl_pct for r in traded if r.pnl_pct):+.2f}%")
+
+    # Rejection breakdown
+    if rejected:
+        from collections import Counter
+        codes = Counter()
+        for r in rejected:
+            code = r.rejected.split(":")[0] if r.rejected else "unknown"
+            codes[code] += 1
+        print(f"\n  Rejection breakdown:")
+        for code, count in codes.most_common():
+            print(f"    {code:<30} {count}")
 
     # Detailed trade log
     if traded:
@@ -476,47 +559,123 @@ def print_results(results: list[TradeResult]) -> None:
         for r in traded:
             pnl_str = f"{r.pnl_pct:+.2f}%" if r.pnl_pct is not None else "open"
             vol_str = f"{r.volume_ratio:.1f}×" if r.volume_ratio else "?"
+            ddv_str = f"${r.daily_dollar_volume/1e6:.1f}M" if r.daily_dollar_volume else "?"
+            result_icon = "✓" if (r.pnl_pct or 0) > 0 else "✗"
             print(
-                f"  {r.ticker:<14} {r.published_at.strftime('%H:%MZ')}  "
-                f"mom={r.momentum_pct:+.2f}%  vol={vol_str}  "
-                f"entry=${r.entry_price:.2f}  exit={r.exit_reason}  P&L={pnl_str}"
+                f"  {result_icon} {r.ticker:<14} {r.published_at.strftime('%H:%MZ')}  "
+                f"mom={r.momentum_pct:+.2f}%  vol={vol_str}  ddv={ddv_str}  "
+                f"entry=${r.entry_price:.2f}  {r.exit_reason}  P&L={pnl_str}"
             )
-            print(f"    {r.headline[:68]}")
+            print(f"      {r.headline[:68]}")
 
-    # Price window for all signals that had data (traded + rejected-by-filters)
-    has_window = [r for r in results if r.price_at_news is not None and r.price_plus_15 is not None]
+    # Price window for signals with data
+    has_window = [r for r in results if r.price_at_news is not None]
     if has_window:
         print(f"\n{'─' * 72}")
-        print("PRICE WINDOW (all signals with data: 15min before → news → 15min after)")
-        print(f"{'TICKER':<12} {'NEWS TIME':<10} {'−15min':>8} {'AT NEWS':>8} {'+15min':>8} {'MOVE':>7}  {'VOL':>6}  STATUS")
-        print(f"{'─' * 72}")
+        print("PRICE WINDOW (−5min → news → +5min)")
+        print(f"  {'TICKER':<12} {'TIME':>8} {'−5min':>8} {'AT NEWS':>8} {'+5min':>8} {'MOM':>7} {'VOL':>6} {'DDV':>8}  STATUS")
+        print(f"  {'─' * 72}")
         for r in sorted(has_window, key=lambda x: x.published_at):
-            minus = f"${r.price_minus_15:.2f}" if r.price_minus_15 else "  n/a"
-            at    = f"${r.price_at_news:.2f}" if r.price_at_news else "  n/a"
-            plus  = f"${r.price_plus_15:.2f}" if r.price_plus_15 else "  n/a"
+            minus = f"${r.price_minus_5:.2f}" if r.price_minus_5 else "  n/a"
+            at_n  = f"${r.price_at_news:.2f}" if r.price_at_news else "  n/a"
+            plus  = f"${r.price_plus_5:.2f}"  if r.price_plus_5 else "  n/a"
             mom   = f"{r.momentum_pct:+.2f}%" if r.momentum_pct is not None else "   n/a"
-            vol   = f"{r.volume_ratio:.1f}×" if r.volume_ratio else "  n/a"
+            vol   = f"{r.volume_ratio:.1f}×"  if r.volume_ratio is not None else "  n/a"
+            ddv   = f"${r.daily_dollar_volume/1e6:.1f}M" if r.daily_dollar_volume else "  n/a"
             if r.rejected:
                 status = f"SKIP: {r.rejected}"
             elif r.pnl_pct is not None:
                 status = f"TRADE: {r.exit_reason} {r.pnl_pct:+.2f}%"
             else:
                 status = "TRADE: open"
-            print(f"  {r.ticker:<10} {r.published_at.strftime('%H:%MZ'):<10} {minus:>8} {at:>8} {plus:>8} {mom:>7}  {vol:>6}  {status}")
+            print(f"  {r.ticker:<12} {r.published_at.strftime('%H:%MZ'):>8} {minus:>8} {at_n:>8} {plus:>8} {mom:>7} {vol:>6} {ddv:>8}  {status}")
+
+
+def print_week_summary(all_results: dict[str, list[TradeResult]]) -> None:
+    """Print an aggregated summary across multiple backtest days."""
+    print(f"\n{'#' * 72}")
+    print("  WEEKLY SUMMARY")
+    print(f"{'#' * 72}")
+    all_traded = []
+    for date_str, results in sorted(all_results.items()):
+        traded = [r for r in results if r.rejected is None and r.pnl_pct is not None]
+        rejected = [r for r in results if r.rejected is not None]
+        wins = [r for r in traded if (r.pnl_pct or 0) > 0]
+        if traded:
+            avg_pnl  = sum(r.pnl_pct for r in traded if r.pnl_pct) / len(traded)
+            win_rate = len(wins) / len(traded) * 100
+            print(
+                f"  {date_str}  signals={len(results):>3}  rejected={len(rejected):>3}  "
+                f"trades={len(traded):>2}  wr={win_rate:.0f}%  avg_pnl={avg_pnl:+.2f}%"
+            )
+        else:
+            print(
+                f"  {date_str}  signals={len(results):>3}  rejected={len(rejected):>3}  "
+                f"trades=0"
+            )
+        all_traded.extend(traded)
+
+    if all_traded:
+        total_wins = [r for r in all_traded if (r.pnl_pct or 0) > 0]
+        total_pnl = sum(r.pnl_pct for r in all_traded if r.pnl_pct)
+        avg_pnl = total_pnl / len(all_traded)
+        win_rate = len(total_wins) / len(all_traded) * 100
+        print(f"\n  {'─' * 68}")
+        print(f"  TOTAL  trades={len(all_traded):>2}  wins={len(total_wins)}  losses={len(all_traded)-len(total_wins)}")
+        print(f"         win_rate={win_rate:.0f}%  avg_pnl={avg_pnl:+.2f}%  sum_pnl={total_pnl:+.2f}%")
+        print(f"         best={max(r.pnl_pct for r in all_traded if r.pnl_pct):+.2f}%  "
+              f"worst={min(r.pnl_pct for r in all_traded if r.pnl_pct):+.2f}%")
+
+        # Per-exit-reason breakdown
+        from collections import Counter
+        reasons = Counter(r.exit_reason for r in all_traded if r.exit_reason)
+        print(f"\n  Exit reasons:")
+        for reason, count in reasons.most_common():
+            pnl_for_reason = [r.pnl_pct for r in all_traded if r.exit_reason == reason and r.pnl_pct is not None]
+            avg = sum(pnl_for_reason) / len(pnl_for_reason) if pnl_for_reason else 0
+            print(f"    {reason:<20} {count:>3}  avg={avg:+.2f}%")
+    print(f"{'#' * 72}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Backtest the momentum trading strategy")
+    parser = argparse.ArgumentParser(description="Backtest the momentum trading strategy (v12 logic)")
     parser.add_argument("--date", default=None, help="Date to backtest (YYYY-MM-DD), default: last market day")
+    parser.add_argument("--week", action="store_true", help="Backtest the entire last trading week (Mon–Fri)")
     parser.add_argument("--no-sentiment", action="store_true", help="Skip Claude sentiment and use all articles")
     args = parser.parse_args()
 
-    if args.date:
-        date = datetime.strptime(args.date, "%Y-%m-%d").replace(
-            hour=13, minute=30, second=0, microsecond=0, tzinfo=timezone.utc
-        )
-    else:
-        date = _last_market_day()
+    if args.week:
+        # Last full trading week: find last Friday and go back to its Monday
+        today = datetime.now(timezone.utc)
+        # Walk back to last Friday
+        d = today - timedelta(days=1)
+        while d.weekday() != 4:  # 4 = Friday
+            d -= timedelta(days=1)
+        last_friday = d
+        last_monday = last_friday - timedelta(days=4)
 
-    results = run_backtest(date, use_sentiment=not args.no_sentiment)
-    print_results(results)
+        trading_days = []
+        for i in range(5):
+            day = last_monday + timedelta(days=i)
+            if day.weekday() < 5:
+                trading_days.append(day.replace(hour=13, minute=30, second=0, microsecond=0, tzinfo=timezone.utc))
+
+        print(f"\nRunning weekly backtest: {last_monday.strftime('%Y-%m-%d')} – {last_friday.strftime('%Y-%m-%d')}")
+        all_results: dict[str, list[TradeResult]] = {}
+        for day in trading_days:
+            day_results = run_backtest(day, use_sentiment=not args.no_sentiment)
+            print_results(day_results, date_str=day.strftime("%Y-%m-%d"))
+            all_results[day.strftime("%Y-%m-%d")] = day_results
+
+        print_week_summary(all_results)
+
+    else:
+        if args.date:
+            date = datetime.strptime(args.date, "%Y-%m-%d").replace(
+                hour=13, minute=30, second=0, microsecond=0, tzinfo=timezone.utc
+            )
+        else:
+            date = _last_market_day()
+
+        results = run_backtest(date, use_sentiment=not args.no_sentiment)
+        print_results(results)

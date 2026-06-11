@@ -31,6 +31,15 @@ python -m reporting.report
 python -m backtest.backtest --date 2026-05-21
 python -m backtest.backtest                      # defaults to yesterday
 python -m backtest.backtest --no-sentiment       # skip Claude, use all positive articles
+python -m backtest.backtest --week               # last full Mon–Fri trading week
+
+# DB-replay backtest: replays v12 logic against signals already in the production DB
+# Uses yfinance for prices — no Benzinga API key needed, no Twelvedata credits used.
+# Run this on the VM (or set DB_URL to the VM DB) to analyse last week's performance.
+DB_URL=postgresql://<db-user>:<db-password>@<your-vm-host>:5432/momentum_trader \
+  python -m backtest.backtest_db --week
+DB_URL=postgresql://<db-user>:<db-password>@<your-vm-host>:5432/momentum_trader \
+  python -m backtest.backtest_db --date 2026-06-05
 ```
 
 ## Architecture
