@@ -1,10 +1,15 @@
 {
   "uid": "momentum-trader-v1",
   "title": "Momentum Trader",
-  "tags": ["trading"],
+  "tags": [
+    "trading"
+  ],
   "timezone": "browser",
   "refresh": "1m",
-  "time": { "from": "now-7d", "to": "now" },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
   "templating": {
     "list": [
       {
@@ -12,10 +17,21 @@
         "label": "Mode",
         "type": "custom",
         "query": "demo,live",
-        "current": { "text": "demo", "value": "demo" },
+        "current": {
+          "text": "demo",
+          "value": "demo"
+        },
         "options": [
-          { "text": "demo", "value": "demo", "selected": true },
-          { "text": "live", "value": "live", "selected": false }
+          {
+            "text": "demo",
+            "value": "demo",
+            "selected": true
+          },
+          {
+            "text": "live",
+            "value": "live",
+            "selected": false
+          }
         ],
         "hide": 0,
         "includeAll": false,
@@ -28,8 +44,16 @@
       "id": 1,
       "title": "Open Trades",
       "type": "table",
-      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 6 },
-      "datasource": { "type": "postgres", "uid": "trader-postgres" },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 6
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
       "targets": [
         {
           "rawSql": "SELECT ticker, quantity, buy_price, buy_time, ROUND(EXTRACT(EPOCH FROM (NOW() - buy_time::timestamp)) / 60) AS age_minutes FROM trades WHERE status = 'open' AND mode = '$mode' ORDER BY buy_time DESC",
@@ -42,10 +66,22 @@
       "id": 2,
       "title": "Win Rate",
       "type": "stat",
-      "gridPos": { "x": 0, "y": 6, "w": 4, "h": 4 },
-      "datasource": { "type": "postgres", "uid": "trader-postgres" },
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "textMode": "value",
         "colorMode": "value",
         "graphMode": "none",
@@ -57,9 +93,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 40 },
-              { "color": "green", "value": 55 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 40
+              },
+              {
+                "color": "green",
+                "value": 55
+              }
             ]
           }
         }
@@ -76,10 +121,22 @@
       "id": 3,
       "title": "Total Realised P&L",
       "type": "stat",
-      "gridPos": { "x": 4, "y": 6, "w": 4, "h": 4 },
-      "datasource": { "type": "postgres", "uid": "trader-postgres" },
+      "gridPos": {
+        "x": 4,
+        "y": 6,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "textMode": "value",
         "colorMode": "value",
         "graphMode": "none",
@@ -91,8 +148,14 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 0 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0
+              }
             ]
           }
         }
@@ -109,10 +172,22 @@
       "id": 4,
       "title": "Total Trades",
       "type": "stat",
-      "gridPos": { "x": 8, "y": 6, "w": 4, "h": 4 },
-      "datasource": { "type": "postgres", "uid": "trader-postgres" },
+      "gridPos": {
+        "x": 8,
+        "y": 6,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "textMode": "value",
         "colorMode": "none",
         "graphMode": "none",
@@ -130,8 +205,16 @@
       "id": 5,
       "title": "Portfolio Value Over Time",
       "type": "timeseries",
-      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 8 },
-      "datasource": { "type": "postgres", "uid": "trader-postgres" },
+      "gridPos": {
+        "x": 12,
+        "y": 6,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "currencyGBP"
@@ -149,11 +232,19 @@
       "id": 6,
       "title": "Trade History",
       "type": "table",
-      "gridPos": { "x": 0, "y": 10, "w": 24, "h": 8 },
-      "datasource": { "type": "postgres", "uid": "trader-postgres" },
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
       "targets": [
         {
-          "rawSql": "SELECT ticker, ROUND(quantity::numeric, 4) AS quantity, buy_time, ROUND(buy_price::numeric, 4) AS buy_price_usd, COALESCE(ROUND(buy_net_gbp::numeric, 2)::text, '—') AS buy_total_gbp, COALESCE(ROUND(buy_fees_gbp::numeric, 2)::text, '—') AS buy_fees_gbp, COALESCE(ROUND(buy_fx_rate::numeric, 4)::text, '—') AS buy_fx_rate, sell_time, ROUND(sell_price::numeric, 4) AS sell_price_usd, ROUND(sell_net_gbp::numeric, 2) AS sell_total_gbp, ROUND(sell_fees_gbp::numeric, 2) AS sell_fees_gbp, ROUND(sell_fx_rate::numeric, 4) AS sell_fx_rate, ROUND(profit_loss::numeric, 2) AS pnl_gbp, ROUND(profit_loss_pct::numeric, 2) AS pnl_pct, exit_reason FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
+          "rawSql": "SELECT ticker, ROUND(quantity::numeric, 4) AS quantity, buy_time, ROUND(buy_price::numeric, 4) AS buy_price_usd, COALESCE(ROUND(buy_net_gbp::numeric, 2)::text, '\u2014') AS buy_total_gbp, COALESCE(ROUND(buy_fees_gbp::numeric, 2)::text, '\u2014') AS buy_fees_gbp, COALESCE(ROUND(buy_fx_rate::numeric, 4)::text, '\u2014') AS buy_fx_rate, sell_time, ROUND(sell_price::numeric, 4) AS sell_price_usd, ROUND(sell_net_gbp::numeric, 2) AS sell_total_gbp, ROUND(sell_fees_gbp::numeric, 2) AS sell_fees_gbp, ROUND(sell_fx_rate::numeric, 4) AS sell_fx_rate, ROUND(profit_loss::numeric, 2) AS pnl_gbp, ROUND(profit_loss_pct::numeric, 2) AS pnl_pct, exit_reason FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
           "format": "table",
           "refId": "A"
         }
@@ -163,11 +254,350 @@
       "id": 7,
       "title": "Signal History",
       "type": "table",
-      "gridPos": { "x": 0, "y": 18, "w": 24, "h": 8 },
-      "datasource": { "type": "postgres", "uid": "trader-postgres" },
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
       "targets": [
         {
           "rawSql": "SELECT fetched_at, ticker, confidence, acted_on, rejection_code, rejection_reason, headline, published_at FROM news_signals ORDER BY fetched_at DESC LIMIT 200",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "News Cycle Heartbeat (min ago)",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 3
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(EXTRACT(EPOCH FROM (NOW() - last_beat_at::timestamptz)) / 60) AS minutes_stale FROM heartbeat WHERE job = 'news_cycle'",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Monitor Heartbeat (min ago)",
+      "type": "stat",
+      "gridPos": {
+        "x": 4,
+        "y": 26,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 3
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(EXTRACT(EPOCH FROM (NOW() - last_beat_at::timestamptz)) / 60) AS minutes_stale FROM heartbeat WHERE job = 'monitor'",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Today Realised P&L (kill switch at -2%)",
+      "type": "stat",
+      "gridPos": {
+        "x": 8,
+        "y": 26,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyGBP",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": -10
+              },
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(COALESCE(SUM(profit_loss), 0)::numeric, 2) AS today_pnl FROM trades WHERE mode = '$mode' AND status = 'closed' AND sell_time LIKE TO_CHAR(NOW(), 'YYYY-MM-DD') || '%'",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Trades Today (cap 10)",
+      "type": "stat",
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 7
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(*) AS trades_today FROM trades WHERE mode = '$mode' AND buy_time LIKE TO_CHAR(NOW(), 'YYYY-MM-DD') || '%'",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Rejection Funnel (last 7 days)",
+      "type": "table",
+      "gridPos": {
+        "x": 16,
+        "y": 26,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT rejection_code, COUNT(*) AS signals FROM news_signals WHERE created_at >= TO_CHAR(NOW() - INTERVAL '7 days', 'YYYY-MM-DD') AND rejection_code IS NOT NULL GROUP BY rejection_code ORDER BY signals DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Pre-market Candidates (today)",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 16,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ticker, catalyst_type, ROUND(confidence::numeric, 2) AS conf, status, eval_note, headline FROM premarket_candidates WHERE created_at LIKE TO_CHAR(NOW(), 'YYYY-MM-DD') || '%' ORDER BY confidence DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Classifier Eval: 15-min Forward Return by Sentiment",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT sentiment, COUNT(*) AS n, ROUND(AVG(fwd_return_15m)::numeric, 2) AS avg_15m_pct, ROUND((AVG((fwd_return_15m > 2)::int) * 100)::numeric, 0) AS moved_2pct FROM sentiment_scores WHERE returns_computed_at IS NOT NULL GROUP BY sentiment ORDER BY avg_15m_pct DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Catalyst Classes: 15-min Forward Return (positives)",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 38,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT catalyst_type, COUNT(*) AS n, ROUND(AVG(fwd_return_15m)::numeric, 2) AS avg_15m_pct, ROUND(AVG(fwd_return_60m)::numeric, 2) AS avg_60m_pct FROM sentiment_scores WHERE sentiment = 'positive' AND returns_computed_at IS NOT NULL GROUP BY catalyst_type ORDER BY avg_15m_pct DESC",
           "format": "table",
           "refId": "A"
         }

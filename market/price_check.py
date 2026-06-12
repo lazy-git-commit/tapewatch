@@ -394,10 +394,15 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         )
 
         # ── 4. Dead-cat guard (vs prev close) ────────────────────────────────
-        if day_change_pct is not None and day_change_pct < -cfg.max_day_drop_pct:
+        # If prev close is unavailable from both sources, fall back to the
+        # open-based day move rather than silently disabling the guard —
+        # it misses overnight gaps but still catches intraday knives.
+        drop_metric = day_change_pct if day_change_pct is not None else day_move_pct
+        if drop_metric < -cfg.max_day_drop_pct:
+            baseline_name = "prev close" if day_change_pct is not None else "today's open (prev close unavailable)"
             return _reject(
                 base, "dead_cat",
-                f"Dead-cat guard: {day_change_pct:.2f}% vs prev close "
+                f"Dead-cat guard: {drop_metric:.2f}% vs {baseline_name} "
                 f"(max allowed drop −{cfg.max_day_drop_pct}%) — bullish news on a "
                 f"falling knife is a bounce, not a trend",
             )

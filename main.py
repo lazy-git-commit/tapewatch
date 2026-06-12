@@ -45,13 +45,13 @@ from storage.database import (
     init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded,
     is_article_seen, set_rejection_reason, set_tp_order_id, touch_heartbeat,
     count_open_trades, count_trades_today, get_today_realized_pnl,
-    update_premarket_candidate,
+    update_premarket_candidate, save_snapshot,
 )
 from news.fetcher import fetch_all_news, NewsItem
 from market.price_check import (
     confirm_price_signal, is_market_open, is_too_late_to_buy, PriceConfirmation,
 )
-from trading.executor import buy, build_symbol_map, place_take_profit, get_portfolio_value
+from trading.executor import buy, build_symbol_map, place_take_profit, get_portfolio_value, get_account_summary
 from monitor.position_monitor import monitor_positions
 from premarket.scanner import in_premarket_window, premarket_scan, evaluate_premarket_candidates
 from analysis.forward_returns import compute_forward_returns
@@ -439,6 +439,30 @@ def _nightly_forward_returns() -> None:
         logger.error("Nightly forward-returns job failed: %s", exc, exc_info=True)
 
 
+def portfolio_snapshot() -> None:
+    """
+    Record (total_value, cash) to portfolio_snapshots — the data behind
+    Grafana's "Portfolio Value Over Time" panel. Only during market hours:
+    the value doesn't move while the market is closed, and flat weekend
+    lines just compress the interesting part of the chart.
+
+    (save_snapshot() existed since v1 but nothing ever called it — the
+    Grafana panel was empty from day one.)
+    """
+    if not is_market_open():
+        return
+    try:
+        summary = get_account_summary()
+        if summary is None:
+            logger.warning("portfolio_snapshot: account summary unavailable — skipping")
+            return
+        total, free = summary
+        save_snapshot(total, free)
+        logger.debug("Portfolio snapshot: total=£%.2f cash=£%.2f", total, free)
+    except Exception as exc:
+        logger.error("portfolio_snapshot failed: %s", exc)
+
+
 def main() -> None:
     version = _read_version()
     logger.info("=" * 60)
@@ -495,6 +519,16 @@ def main() -> None:
         id="symbol_map_rebuild",
         name="T212 symbol map rebuild",
         misfire_grace_time=3600,
+    )
+
+    # Portfolio value snapshots for the Grafana time-series panel.
+    # Every 5 min; the job itself returns immediately when the market is closed.
+    _scheduler.add_job(
+        portfolio_snapshot,
+        trigger=IntervalTrigger(minutes=5),
+        id="portfolio_snapshot",
+        name="Portfolio value snapshot",
+        misfire_grace_time=60,
     )
 
     # Run once immediately on startup

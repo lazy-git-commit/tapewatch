@@ -224,6 +224,14 @@ def get_available_cash() -> float | None:
     return float(data["free"]) if data else None
 
 
+def get_account_summary() -> tuple[float, float] | None:
+    """(total_value, free_cash) in one API call — used by the snapshot job."""
+    data = _fetch_cash()
+    if not data:
+        return None
+    return float(data.get("total", 0)), float(data.get("free", 0))
+
+
 def calculate_quantity(
     ticker: str,
     price: float,
@@ -471,8 +479,11 @@ def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult
             for _ in range(10):  # up to ~20s
                 time.sleep(2)
                 status = get_order_status(order_id)
-                if status == "FILLED" or status is None:
-                    # None = no longer in pending orders → moved to history (filled)
+                # "GONE" = order left the pending book (filled → history).
+                # None = NETWORK ERROR, status unknown — keep polling. Treating
+                # None as filled would record the trade closed in the DB while
+                # the real order may still be live on the book (position desync).
+                if status in ("FILLED", "GONE"):
                     filled = True
                     break
                 if status in ("CANCELLED", "REJECTED"):

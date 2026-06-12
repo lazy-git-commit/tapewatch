@@ -218,6 +218,22 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
 
         # ── Standard confirmation: post-open follow-through required ────────
         if not conf.is_confirmed:
+            # The opening block is NOT a verdict on the candidate — it is a
+            # deterministic timing gate that lifts at open+5min. The news
+            # cycle runs every minute from 09:30, so without this exception
+            # every candidate would be permanently rejected on the 09:30/09:31
+            # cycles before it could ever be legitimately evaluated.
+            if conf.reason_code == "opening_block":
+                logger.debug(
+                    "Pre-market eval [%s]: opening block active — re-evaluating after it lifts",
+                    ticker,
+                )
+                continue  # stays pending
+            # All other rejections are final: re-evaluating every cycle for
+            # 30 min would cost up to ~60 Twelvedata credits per candidate
+            # (2 calls/eval), and a candidate that fails momentum/volume
+            # confirmation at its one post-block evaluation is gap-and-crap,
+            # not gap-and-go.
             update_premarket_candidate(
                 cand_id, "rejected", f"{conf.reason_code}: {conf.reason}"
             )

@@ -94,6 +94,27 @@ asymmetry was inverted vs design (+5%/−2% designed; avg win £5.52 / avg loss
 - Cost model: 0.30% FX round trip + liquidity-tiered slippage per side.
 - RVOL via the same production helper.
 
+### Same-day review fixes
+- **sell() status race** — a network error during fill polling (`status=None`)
+  was treated as "filled", which would close the trade in the DB while the
+  real order stayed live on the book (position desync). None now means
+  UNKNOWN → keep polling; only `FILLED`/`GONE` count as fills.
+- **Pre-market candidates survived the opening block** — candidates evaluated
+  on the 09:30/09:31 cycles were permanently rejected with `opening_block`
+  before the block lifted at 09:35; the pipeline would never have traded.
+  `opening_block` now leaves the candidate pending (it is a timing gate, not
+  a verdict); all other rejections remain final (credit budget).
+- **`portfolio_snapshots` was never written** — `save_snapshot()` existed
+  since v1 with zero callers; Grafana's "Portfolio Value Over Time" panel was
+  empty from day one. New 5-min `portfolio_snapshot` job (market hours only).
+- **Dead-cat guard fallback** — when prev close is unavailable from both
+  sources, fall back to the open-based day move instead of silently
+  disabling the guard.
+- **8 new Grafana panels** — news-cycle/monitor heartbeats (the 18h-outage
+  panel), today's realized P&L vs kill switch, trades-today vs cap,
+  7-day rejection funnel, today's pre-market candidates, classifier forward
+  returns by sentiment and by catalyst class.
+
 ---
 
 ## v13 — 2026-06-11
