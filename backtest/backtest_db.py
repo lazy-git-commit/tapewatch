@@ -29,26 +29,59 @@ import pandas as pd
 import yfinance as yf
 
 from config.settings import cfg
+from market.price_check import compute_rvol  # same RVOL math as production
 from storage.database import get_conn
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-# ── v13 strategy constants (mirrors config/settings.py defaults) ──────────────
+# ── v14 strategy constants (mirrors config/settings.py defaults) ──────────────
 TAKE_PROFIT_PCT      = cfg.take_profit_pct           # 5.0
 STOP_LOSS_PCT        = cfg.stop_loss_pct             # 2.0
 TIME_STOP_MINUTES    = cfg.time_stop_minutes         # 60
-MIN_PRICE_MOVE_PCT   = cfg.min_price_move_pct        # 1.5 (raised from 0.5 in v13)
-MAX_PRICE_MOVE_PCT   = cfg.max_price_move_pct        # 15.0 (new in v13 — halt article ceiling)
-MAX_VOLUME_RATIO     = cfg.max_volume_ratio          # 20.0 (new in v13 — halt pattern ceiling)
-MIN_STOCK_PRICE      = cfg.min_stock_price           # 2.0  (new in v13 — penny stock filter)
-VOLUME_RATIO_MIN     = 1.5
-VOLUME_RATIO_EARLY   = 0.5
+MIN_PRICE_MOVE_PCT   = cfg.min_price_move_pct        # 1.5
+MAX_PRICE_MOVE_PCT   = cfg.max_price_move_pct        # 15.0 (halt-article ceiling)
+MIN_RVOL             = cfg.min_rvol                  # 1.5  (time-normalized in v14)
+MAX_RVOL             = cfg.max_rvol                  # 20.0 (halt-pattern ceiling)
+MIN_STOCK_PRICE      = cfg.min_stock_price           # 5.0  (penny-stock filter)
 OPEN_BLOCK_MINUTES   = cfg.open_block_minutes        # 5
-MIN_DAILY_DOLLAR_VOL = cfg.min_daily_dollar_volume   # 1_000_000
+MIN_DAILY_DOLLAR_VOL = cfg.min_daily_dollar_volume   # 5_000_000 (ADV-based)
 MAX_DAY_DROP_PCT     = cfg.max_day_drop_pct          # 3.0
+MAX_DAY_MOVE_PCT     = cfg.max_day_move_pct          # 25.0 (extended-move ceiling)
 MOMENTUM_BARS_BACK   = 6   # ~5 min ago
+
+# ── Cost model (v14) ──────────────────────────────────────────────────────────
+# The old backtest assumed frictionless fills, making every projection an
+# upper bound. Real round-trip costs on T212 (GBP account, USD stocks):
+#   - FX conversion fee: 0.15% each way = 0.30% round trip
+#   - slippage: spread crossing + book impact, scaled by liquidity
+ENTRY_LATENCY_BARS = 1     # production enters ~10–90s after publication:
+                           # fill at the NEXT bar's open, not the signal bar's close
+FX_COST_RT_PCT     = 0.30  # T212 currency conversion, round trip
+
+
+def _slippage_pct(avg_dollar_volume: float | None) -> float:
+    """
+    Estimated one-way slippage (%) by liquidity tier. Calibrated against
+    observed fills: large caps fill near-touch; GOAI ($390k ADV) filled
+    −16.99% past its trigger. Tiers are deliberately coarse — the point is
+    to stop pretending fills are free, not to model microstructure.
+    """
+    if avg_dollar_volume is None or avg_dollar_volume <= 0:
+        return 0.50  # unknown liquidity — assume thin
+    if avg_dollar_volume >= 50_000_000:
+        return 0.05
+    if avg_dollar_volume >= 5_000_000:
+        return 0.15
+    if avg_dollar_volume >= 1_000_000:
+        return 0.50
+    return 1.00
+
+
+def _apply_costs(gross_pnl_pct: float, avg_dollar_volume: float | None) -> float:
+    """Gross → net P&L: FX round trip + slippage on both sides."""
+    return gross_pnl_pct - FX_COST_RT_PCT - 2 * _slippage_pct(avg_dollar_volume)
 
 
 @dataclass
@@ -172,7 +205,11 @@ def _get_intraday(ticker: str, date: datetime) -> pd.DataFrame | None:
 
 
 def _get_volume_stats_yf(ticker: str, date: datetime, intraday: pd.DataFrame, t_confirm: datetime) -> tuple:
-    """Returns (volume_ratio, daily_dollar_volume|None)"""
+    """
+    Returns (cum_volume, avg_daily_volume, avg_dollar_volume|None).
+    avg_dollar_volume is ADV-based (20-day avg volume × last close) — the same
+    liquidity definition production uses, immune to spike-day inflation.
+    """
     cache_key = f"{ticker}_{date.strftime('%Y-%m-%d')}"
     if cache_key in _vol_cache:
         avg_vol, last_price = _vol_cache[cache_key]
@@ -185,24 +222,21 @@ def _get_volume_stats_yf(ticker: str, date: datetime, intraday: pd.DataFrame, t_
             )
             if len(daily) < 2:
                 _vol_cache[cache_key] = (0, 0)
-                return 0.0, None
+                return 0.0, 0.0, None
             avg_vol = float(daily["Volume"].mean())
             last_price = float(daily["Close"].iloc[-1])
             _vol_cache[cache_key] = (avg_vol, last_price)
         except Exception:
             _vol_cache[cache_key] = (0, 0)
-            return 0.0, None
+            return 0.0, 0.0, None
 
     try:
         bars_to_confirm = intraday[intraday.index <= t_confirm]
-        current_vol = float(bars_to_confirm["Volume"].sum()) if not bars_to_confirm.empty else 0.0
-        volume_ratio = current_vol / avg_vol if avg_vol > 0 else 0.0
-
-        # Full-day dollar volume from daily history (conservative — use avg_vol × last_price)
-        daily_dollar_volume = avg_vol * last_price if avg_vol > 0 and last_price > 0 else None
-        return volume_ratio, daily_dollar_volume
+        cum_vol = float(bars_to_confirm["Volume"].sum()) if not bars_to_confirm.empty else 0.0
+        avg_dollar_volume = avg_vol * last_price if avg_vol > 0 and last_price > 0 else None
+        return cum_vol, avg_vol, avg_dollar_volume
     except Exception:
-        return 0.0, None
+        return 0.0, avg_vol, None
 
 
 def _price_at(bars: pd.DataFrame, ts: datetime) -> float | None:
@@ -224,7 +258,31 @@ def _price_n_bars_before(bars: pd.DataFrame, ts: datetime, n: int) -> float | No
     return float(eligible["Close"].iloc[-(n + 1)])
 
 
+def _entry_fill(bars: pd.DataFrame, signal_time: datetime) -> tuple:
+    """
+    Realistic entry: production is ~10–90s late by construction (poll cadence
+    + Claude + price checks + order placement), so the fill is the OPEN of
+    the bar AFTER the signal bar — never the signal bar's own close, which
+    assumed an impossible zero-latency entry.
+    Returns (entry_time, entry_price) or (None, None) if no later bar exists.
+    """
+    future = bars[bars.index > signal_time]
+    if len(future) < ENTRY_LATENCY_BARS:
+        return None, None
+    idx = ENTRY_LATENCY_BARS - 1
+    return future.index[idx], float(future.iloc[idx]["Open"])
+
+
 def _simulate_trade(bars: pd.DataFrame, entry_time: datetime, entry_price: float) -> tuple:
+    """
+    Walk forward bar-by-bar from entry. Conservative fill assumptions:
+      - If a single bar touches BOTH the stop and the target, assume the
+        STOP filled first. We can't know the intra-bar path; optimistic
+        tie-breaking (the old behaviour) systematically inflated win rate.
+      - Stops fill AT the stop price (production's bounded-limit sell caps
+        the damage near the trigger, so this is now a fair assumption).
+    Returns (exit_time, exit_price, exit_reason, gross_pnl_pct).
+    """
     tp = entry_price * (1 + TAKE_PROFIT_PCT / 100)
     sl = entry_price * (1 - STOP_LOSS_PCT / 100)
     time_stop_at = entry_time + timedelta(minutes=TIME_STOP_MINUTES)
@@ -233,10 +291,11 @@ def _simulate_trade(bars: pd.DataFrame, entry_time: datetime, entry_price: float
         if ts >= time_stop_at:
             exit_price = float(row["Close"])
             return ts, exit_price, "time_stop", (exit_price - entry_price) / entry_price * 100
-        if row["High"] >= tp:
-            return ts, tp, "take_profit", TAKE_PROFIT_PCT
+        # Stop checked BEFORE target — conservative same-bar tie-breaking.
         if row["Low"] <= sl:
             return ts, sl, "stop_loss", -STOP_LOSS_PCT
+        if row["High"] >= tp:
+            return ts, tp, "take_profit", TAKE_PROFIT_PCT
     return None, None, "still_open", None
 
 
@@ -332,8 +391,25 @@ def run_v12_check(signal: SignalRecord) -> BacktestResult:
             v12_outcome=f"rejected:dead_cat ({day_move_pct:.1f}%)",
         )
 
-    # Volume + liquidity
-    volume_ratio, daily_dollar_volume = _get_volume_stats_yf(yf_ticker, date, bars, pub)
+    # Extended-move ceiling — vs prev close (gap included). Uses the cached
+    # daily history's last close as prev close, mirroring production's
+    # max_day_move_pct check.
+    cum_vol, avg_vol, daily_dollar_volume = _get_volume_stats_yf(yf_ticker, date, bars, pub)
+    prev_close = _vol_cache.get(f"{yf_ticker}_{date.strftime('%Y-%m-%d')}", (0, 0))[1]
+    day_change_pct = (price_now - prev_close) / prev_close * 100 if prev_close else None
+    if day_change_pct is not None and day_change_pct > MAX_DAY_MOVE_PCT:
+        return BacktestResult(
+            signal_id=signal.signal_id, ticker=signal.ticker,
+            headline=signal.headline, published_at=pub,
+            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=None,
+            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
+            exit_reason=None, exit_price=None, pnl_pct=None,
+            production_outcome=prod_outcome,
+            v12_outcome=f"rejected:extended_move ({day_change_pct:+.1f}% vs prev close)",
+        )
+
+    # RVOL — time-of-day normalized, same helper production uses.
+    volume_ratio = compute_rvol(int(cum_vol), int(avg_vol), minutes_since_open)
 
     if daily_dollar_volume is not None and daily_dollar_volume < MIN_DAILY_DOLLAR_VOL:
         return BacktestResult(
@@ -370,15 +446,8 @@ def run_v12_check(signal: SignalRecord) -> BacktestResult:
             v12_outcome=f"rejected:high_momentum ({momentum_pct:+.2f}%)",
         )
 
-    # Volume filter
-    if minutes_since_open < 15:
-        vol_ok = volume_ratio >= VOLUME_RATIO_EARLY
-        vol_reason = f"early vol {volume_ratio:.2f}× < {VOLUME_RATIO_EARLY}×"
-    else:
-        vol_ok = volume_ratio >= VOLUME_RATIO_MIN
-        vol_reason = f"vol {volume_ratio:.2f}× < {VOLUME_RATIO_MIN}×"
-
-    if not vol_ok:
+    # RVOL band — time-normalized floor and halt-pattern ceiling
+    if avg_vol > 0 and volume_ratio < MIN_RVOL:
         return BacktestResult(
             signal_id=signal.signal_id, ticker=signal.ticker,
             headline=signal.headline, published_at=pub,
@@ -386,11 +455,9 @@ def run_v12_check(signal: SignalRecord) -> BacktestResult:
             daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
             exit_reason=None, exit_price=None, pnl_pct=None,
             production_outcome=prod_outcome,
-            v12_outcome=f"rejected:low_volume ({vol_reason})",
+            v12_outcome=f"rejected:low_volume (RVOL {volume_ratio:.2f} < {MIN_RVOL})",
         )
-
-    # Volume ceiling filter — extreme volume = halt pattern
-    if volume_ratio > MAX_VOLUME_RATIO:
+    if avg_vol > 0 and volume_ratio > MAX_RVOL:
         return BacktestResult(
             signal_id=signal.signal_id, ticker=signal.ticker,
             headline=signal.headline, published_at=pub,
@@ -398,16 +465,32 @@ def run_v12_check(signal: SignalRecord) -> BacktestResult:
             daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
             exit_reason=None, exit_price=None, pnl_pct=None,
             production_outcome=prod_outcome,
-            v12_outcome=f"rejected:high_volume ({volume_ratio:.1f}×)",
+            v12_outcome=f"rejected:high_volume (RVOL {volume_ratio:.1f})",
         )
 
-    # All filters passed — simulate trade
-    exit_time, exit_price, exit_reason, pnl_pct = _simulate_trade(bars, pub, price_now)
+    # All filters passed — realistic entry (next-bar open) + cost model
+    entry_time, entry_price = _entry_fill(bars, pub)
+    if entry_time is None:
+        return BacktestResult(
+            signal_id=signal.signal_id, ticker=signal.ticker,
+            headline=signal.headline, published_at=pub,
+            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
+            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
+            exit_reason=None, exit_price=None, pnl_pct=None,
+            production_outcome=prod_outcome, v12_outcome="no_data",
+        )
+
+    exit_time, exit_price, exit_reason, gross_pnl_pct = _simulate_trade(bars, entry_time, entry_price)
+    # Net of FX round trip + liquidity-tiered slippage on both sides.
+    pnl_pct = (
+        _apply_costs(gross_pnl_pct, daily_dollar_volume)
+        if gross_pnl_pct is not None else None
+    )
 
     return BacktestResult(
         signal_id=signal.signal_id, ticker=signal.ticker,
         headline=signal.headline, published_at=pub,
-        entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
+        entry_price=entry_price, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
         daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
         exit_reason=exit_reason, exit_price=exit_price, pnl_pct=pnl_pct,
         production_outcome=prod_outcome, v12_outcome="traded",
@@ -581,13 +664,14 @@ if __name__ == "__main__":
     else:
         start, end = _trading_week(now)
 
-    print(f"\nDB-Replay Backtest (v13): {start} → {end}")
+    print(f"\nDB-Replay Backtest (v14): {start} → {end}")
     print(f"  Strategy: TP={TAKE_PROFIT_PCT}% | SL={STOP_LOSS_PCT}% | time-stop={TIME_STOP_MINUTES}min")
     print(f"  Filters:  open-block={OPEN_BLOCK_MINUTES}min | "
           f"momentum {MIN_PRICE_MOVE_PCT}%–{MAX_PRICE_MOVE_PCT}% | "
-          f"vol {VOLUME_RATIO_MIN}×–{MAX_VOLUME_RATIO:.0f}× | "
-          f"DDV>=${MIN_DAILY_DOLLAR_VOL/1e6:.0f}M | "
-          f"price>=${MIN_STOCK_PRICE:.2f} | 24h ticker cooldown")
+          f"RVOL {MIN_RVOL}–{MAX_RVOL:.0f} | "
+          f"ADV$>={MIN_DAILY_DOLLAR_VOL/1e6:.0f}M | "
+          f"price>=${MIN_STOCK_PRICE:.2f} | day<=+{MAX_DAY_MOVE_PCT:.0f}% | 24h cooldown")
+    print(f"  Costs:    FX {FX_COST_RT_PCT}% RT | tiered slippage | entry at next-bar open | SL-priority fills")
     print(f"  DB: {cfg.db_url.split('@')[-1]}")
 
     try:

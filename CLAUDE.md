@@ -44,24 +44,32 @@ DB_URL=postgresql://<db-user>:<db-password>@<your-vm-host>:5432/momentum_trader 
 
 ## Architecture
 
-The system runs two APScheduler background jobs from `main.py`:
+**Full algorithm documentation lives in `docs/algorithm.md`** — every filter,
+threshold, and the incident that motivated it. Keep it updated with any rule change.
+
+The system runs four APScheduler background jobs from `main.py`:
 
 **`news_cycle`** (every 1 minute, unconditional):
-`news/fetcher.py` → `market/price_check.py` → `trading/executor.py` → `storage/database.py`
+Market open → pre-market candidate evaluation (first 30 min) → retry queue → `news/fetcher.py` → `market/price_check.py` → risk gates → `trading/executor.py` (buy + resting TP) → `storage/database.py`. Market closed but in the pre-market window (08:00–09:30 ET) → `premarket/scanner.py` builds the at-open watchlist. Otherwise returns immediately (checked via `pandas_market_calendars` — no network call). Never reschedules its own trigger; rescheduling from within a running job causes APScheduler to silently drop the replacement.
 
-Returns immediately when the market is closed (checked via `pandas_market_calendars` — no network call). Never reschedules its own trigger; rescheduling from within a running job causes APScheduler to silently drop the replacement.
+**`monitor_positions`** (every `MONITOR_INTERVAL_SECONDS`, default 20s):
+`monitor/position_monitor.py` manages exits: notices resting take-profit fills (order-status check), polls stop-loss (−2%) and time-stop (60 min), and force-flattens everything `EOD_FLATTEN_MINUTES` (10) before the close. Before any stop sell it cancels the resting TP and handles the cancel/fill race. Stop sells are bounded LIMIT orders (`SELL_LIMIT_SLACK_PCT`), with market fallback.
 
-**`monitor_positions`** (every 60 seconds):
-`monitor/position_monitor.py` checks every open trade in the DB and calls `trading/executor.sell()` if take-profit (+5%), stop-loss (−2%), or time-stop (60 min) is triggered.
+**`forward_returns`** (nightly 22:30 UTC): `analysis/forward_returns.py` fills 5/15/60-min forward returns for every Claude classification in `sentiment_scores` (yfinance — free, retrospective). This is the prompt-eval feedback loop.
+
+**`symbol_map_rebuild`** (daily 08:00 UTC): refreshes the T212 symbol map.
+
+Portfolio risk gates in `main.py` (checked before every entry, re-checked after every fill): daily kill switch (`MAX_DAILY_LOSS_PCT` realized → stand down until tomorrow, fail-closed), `MAX_OPEN_POSITIONS`, `MAX_TRADES_PER_DAY`, 24h per-ticker cooldown.
 
 ### Key data contracts
 
-- `news/fetcher.py` fetches articles from Benzinga via massive.com and applies three pre-filters before Claude: (1) freshness — articles older than 60 seconds are dropped; (2) crypto tickers — `X:`-prefixed tickers (e.g. `X:BTCUSD`) are stripped; (3) roundup articles — articles tagging more than 3 tickers are skipped as market digests with no per-stock catalyst. Remaining articles are scored by Claude Haiku acting as an expert momentum day trader. Produces `NewsItem` dataclasses (ticker, headline, body, source, published_at, sentiment, confidence). Only `"positive"` articles proceed further.
-- `market/price_check.py` confirms a signal using Finnhub REST quote for the real-time current price, and Twelvedata `/time_series` 1-min bars for the momentum baseline (`values[5]` = ~5 min ago, staleness guard rejects bars >10 min old). Market open/close is determined by `pandas_market_calendars` (local, no network). Volume ratio and daily dollar volume use Twelvedata 1-day bars. Blocks trades in the first `OPEN_BLOCK_MINUTES` (default 5) after open. Rejection filters (in order): `opening_block`, `penny_stock` (price < `MIN_STOCK_PRICE` $2.00), `dead_cat` (day drop > `MAX_DAY_DROP_PCT`), `illiquid` (DDV < `MIN_DAILY_DOLLAR_VOLUME` $1M), `low_momentum` (< `MIN_PRICE_MOVE_PCT` 1.5%), `high_momentum` (> `MAX_PRICE_MOVE_PCT` 15%), `low_volume`, `high_volume` (> `MAX_VOLUME_RATIO` 20×).
-- `market/finnhub_bars.py` provides `get_finnhub_quote()` — Finnhub REST quote wrapper with 3-attempt exponential backoff retry (1s/2s/4s). Used for real-time current price in both signal confirmation and the position monitor.
-- `market/twelvedata_bars.py` provides `get_momentum_baseline()` and `get_volume_stats()` — Twelvedata `/time_series` wrappers with retry logic. Replaces yfinance as the momentum baseline and volume source. Basic plan: 800 credits/day, 1 credit per symbol per call.
-- `trading/executor.py` calls the Trading 212 REST API directly via `requests`. At startup, `build_symbol_map()` fetches T212's full instrument catalogue and builds a `shortName → ticker` map used by `fetcher.py` to resolve Benzinga symbols to correct T212 codes (handles post-SPAC/rename mismatches where `SUNE_US_EQ` 404s but `JCS_US_EQ` exists). On a `quantity-precision-mismatch` error, it parses the allowed decimal places from the response and retries once. In demo mode (`cfg.is_live == False`) it logs simulated orders without hitting the API. Sell orders use a negative quantity.
-- `storage/database.py` manages a PostgreSQL DB (`DB_URL`) with tables: `news_signals`, `trades`, `portfolio_snapshots`. All DB access goes through the `get_conn()` context manager.
+- `news/fetcher.py` fetches articles from Benzinga via massive.com and applies pre-filters before Claude: (1) freshness — older than `max_age_minutes` (60s during RTH) dropped; (2) crypto tickers — `X:`-prefixed stripped; (3) roundup articles — >3 tickers skipped. Remaining articles are scored by Claude Haiku in one batched call: `temperature=0`, rubric in a **cached system prompt**, **forced tool use** (schema-validated output). Each article gets `sentiment`, `confidence`, `catalyst_type` (14-class taxonomy), `already_moved`. **Every score is persisted to `sentiment_scores`** (eval loop). Positives must then pass three code gates to trade: confidence ≥ `MIN_SENTIMENT_CONFIDENCE`, catalyst in `TRADEABLE_CATALYSTS`, `already_moved == False`. Produces `NewsItem` dataclasses.
+- `market/price_check.py` confirms a signal using Finnhub REST quote (current price, open, **previous close** `pc`) and Twelvedata bars. Momentum baseline selected **by timestamp** (`MOMENTUM_LOOKBACK_MINUTES`, staleness guard >10 min). Rejection filters (in order, with `reason_code`): `opening_block` (5 min), `penny_stock` (< `MIN_STOCK_PRICE` $5), `wide_spread` (last-bar range > `MAX_SPREAD_PCT`), `dead_cat` (< −`MAX_DAY_DROP_PCT` vs prev close), `extended_move` (> `MAX_DAY_MOVE_PCT` 25% vs prev close), `illiquid` (20-day ADV×price < `MIN_DAILY_DOLLAR_VOLUME` $5M — ADV-based, NOT today's volume), `low_momentum`/`high_momentum` (1.5%–15% band), `low_volume`/`high_volume` (RVOL band `MIN_RVOL`–`MAX_RVOL`, time-of-day normalized via `compute_rvol`).
+- `market/finnhub_bars.py` provides `get_finnhub_quote()` — 3-attempt exponential backoff retry. Used for real-time price in confirmation and the monitor.
+- `market/twelvedata_bars.py` provides `get_momentum_baseline()` (returns `(past_price, current_bar_price, spread_proxy_pct)`) and `get_volume_stats()` (returns `(today_volume, avg_daily_volume, avg_dollar_volume, prev_close)`). In-process credit metering warns at 80% of the 800/day budget.
+- `trading/executor.py` calls the Trading 212 REST API directly. `build_symbol_map()` (retried, rebuilt daily) maps Benzinga symbols to T212 codes. `calculate_quantity()` sizes positions as min(hard cap, risk budget, ADV participation cap, cash). `buy()` retries once on `quantity-precision-mismatch`. `place_take_profit()` rests a limit sell at TP. `sell()` uses bounded limit orders with cancel-and-retry and market fallback. `get_order_status()` returns `"GONE"` for 404 (filled→history) vs `None` for network errors — callers must never treat `None` as filled.
+- `premarket/scanner.py` — pre-market watchlist + at-open gap-and-go evaluation (gap band `MIN_GAP_PCT`–`MAX_GAP_PCT` + full standard confirmation). Never pre-places orders.
+- `storage/database.py` manages a PostgreSQL DB (`DB_URL`) with tables: `news_signals`, `trades` (incl. `tp_order_id`), `portfolio_snapshots`, `sentiment_scores`, `premarket_candidates`, `heartbeat`. All DB access goes through the `get_conn()` context manager.
 
 ### Configuration
 

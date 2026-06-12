@@ -1,38 +1,47 @@
 """
 market/price_check.py
 ──────────────────────
-Fetches live price data and checks whether a signal is confirmed by actual
-price movement and elevated volume.
+Fetches live price data and checks whether a news signal is confirmed by actual
+price movement and elevated volume. This is the last gate before money moves.
 
 Price sources:
-  - Current price       — Finnhub REST quote (real-time, <1s latency, with retries)
-  - Momentum baseline   — Twelvedata /time_series 1-min bars (bar[5] = ~5 min ago)
-  - Volume stats        — Twelvedata /time_series 1-day bars (20-day ADV)
+  - Current price       — Finnhub REST quote (real-time, <1s latency, retried)
+  - Previous close      — Finnhub quote `pc` field (cross-checked w/ Twelvedata)
+  - Momentum baseline   — Twelvedata 1-min bars, selected by TIMESTAMP
+  - Volume stats        — Twelvedata 1-day bars (20-day ADV)
 
-A signal is confirmed when ALL of the following hold:
-  1. Opening block      — signal arrives at least cfg.open_block_minutes (5 min)
-                          after the session open. The opening auction produces
-                          violent noise (entire GOAI spike was in the 09:30 bar;
-                          system bought at 09:32 into full collapse).
-  2. Recent momentum    — price is up >= cfg.min_price_move_pct over the last
-                          5 minutes (Twelvedata baseline)
-  3. Volume spike       — today's volume > 1.5× the 20-day average after
-                          cfg.open_block_minutes; in the open window, require
-                          at least 0.5× average (not just non-zero).
-  4. Liquidity          — daily dollar volume >= cfg.min_daily_dollar_volume
-                          ($1M default). GOAI had ~$390k ADV — thin order book
-                          meant our market sell moved price 11.7% below trigger.
-  5. No dead-cat bounce — stock is not down more than cfg.max_day_drop_pct
-                          from today's open.
-  6. Min stock price     — current price >= cfg.min_stock_price ($2.00 default).
-                          Sub-$2 stocks have catastrophic spread/slippage.
-  7. Max momentum cap    — recent_move_pct <= cfg.max_price_move_pct (15% default).
-                          A +15%+ reading means we are buying a post-halt top.
-                          Circuit-breaker halt articles publish AFTER the spike —
-                          every Jun 8–11 loss was a halt-article trade.
-  8. Max volume ceiling  — volume_ratio <= cfg.max_volume_ratio (20× default).
-                          Extreme volume (>20×) on micro-caps = circuit-breaker
-                          halt pattern, not a genuine catalyst.
+A signal is confirmed when ALL of the following hold (in evaluation order —
+cheapest checks first so we fail fast and spend fewer API credits):
+
+  1. opening_block   — at least cfg.open_block_minutes after the open. The
+                       opening auction produces violent noise (GOAI: entire
+                       spike was in the 09:30 bar; bought 09:32 into collapse).
+  2. penny_stock     — price >= cfg.min_stock_price. Sub-$5 names carry
+                       outsized spread %, halt frequency, and manipulation
+                       risk; every Jun 8–11 loss was sub-$5.
+  3. wide_spread     — latest 1-min bar range (high−low)/close must be under
+                       cfg.max_spread_pct. Bar-range proxy for effective
+                       spread (no bid/ask feed available on our data plan).
+  4. dead_cat        — not down more than cfg.max_day_drop_pct vs the PREVIOUS
+                       CLOSE. Prev close (not today's open) so overnight
+                       gap-downs are caught: a stock that gapped −25% and is
+                       flat since open is still a falling knife.
+  5. extended_move   — not UP more than cfg.max_day_move_pct vs prev close.
+                       A stock already up 30%+ on the day has paid out its
+                       catalyst; late articles on it are recaps. Closes the
+                       hole where a stock up 80% on the day but flat in the
+                       last 5 min passed the 5-min momentum ceiling.
+  6. illiquid        — 20-day ADV × price >= cfg.min_daily_dollar_volume.
+                       ADV-based on purpose: spike-day volume would let halt
+                       patterns through (GOAI: $390k ADV → −18.99% stop fill).
+  7. low_momentum    — up at least cfg.min_price_move_pct over the momentum
+                       look-back window (cfg.momentum_lookback_minutes).
+  8. high_momentum   — but NOT up more than cfg.max_price_move_pct in that
+                       window — that is a post-halt spike, not an entry.
+  9. low_volume /    — RVOL (time-of-day normalized relative volume) within
+     high_volume       [cfg.min_rvol, cfg.max_rvol]. See _expected_volume_
+                       fraction() for why raw volume ratios are meaningless
+                       without time normalization.
 """
 
 import logging
@@ -53,6 +62,67 @@ logger = logging.getLogger(__name__)
 _ET = pytz.timezone("America/New_York")
 _MARKET_OPEN = (9, 30)   # 09:30 ET
 _MARKET_CLOSE = (16, 0)  # 16:00 ET
+
+
+# ── Intraday volume curve ─────────────────────────────────────────────────────
+# Equity volume is U-shaped: heavy at the open, dead at lunch, heavy at the
+# close. These anchor points give the typical cumulative fraction of a full
+# day's volume traded by each time of day (ET). Derived from the well-known
+# U-curve; linearly interpolated between anchors.
+#
+# Why it matters: "today's volume >= 1.5× the 20-day FULL-DAY average" is
+# nearly impossible at 10:00 (only ~16% of a normal day has traded) and
+# trivially true at 15:45. Normalizing by this curve makes the RVOL floor and
+# ceiling mean the same thing all session long.
+_VOLUME_CURVE: list[tuple[float, float]] = [
+    # (minutes since 09:30 open, cumulative fraction of typical daily volume)
+    (0,    0.00),
+    (5,    0.05),
+    (15,   0.10),
+    (30,   0.16),
+    (60,   0.25),
+    (90,   0.32),
+    (150,  0.42),
+    (210,  0.50),
+    (270,  0.59),
+    (330,  0.71),
+    (360,  0.80),
+    (380,  0.88),
+    (390,  1.00),
+]
+
+
+def _expected_volume_fraction(minutes_since_open: float) -> float:
+    """
+    Return the typical cumulative fraction of a day's volume traded by
+    `minutes_since_open` (linear interpolation over _VOLUME_CURVE).
+
+    Floored at 0.04 so RVOL doesn't divide by a near-zero denominator in the
+    first minutes after the open (which would make every stock look like 50×).
+    """
+    m = max(0.0, min(390.0, minutes_since_open))
+    for (m0, f0), (m1, f1) in zip(_VOLUME_CURVE, _VOLUME_CURVE[1:]):
+        if m0 <= m <= m1:
+            # Linear interpolation between the two anchors
+            frac = f0 + (f1 - f0) * ((m - m0) / (m1 - m0)) if m1 > m0 else f0
+            return max(0.04, frac)
+    return 1.0
+
+
+def compute_rvol(today_volume: int, avg_daily_volume: int, minutes_since_open: float) -> float:
+    """
+    Time-of-day normalized relative volume:
+      rvol = today's cumulative volume
+             / (20-day ADV × expected fraction traded by this time of day)
+
+    rvol == 1.0 means "trading exactly like a normal day so far".
+    rvol >= cfg.min_rvol confirms genuine participation behind the move;
+    rvol >  cfg.max_rvol is the parabolic halt-pattern signature.
+    """
+    if avg_daily_volume <= 0:
+        return 0.0
+    expected = avg_daily_volume * _expected_volume_fraction(minutes_since_open)
+    return today_volume / expected if expected > 0 else 0.0
 
 
 def next_market_open() -> datetime:
@@ -77,6 +147,26 @@ def next_market_open() -> datetime:
 def _to_yf_ticker(t212_ticker: str) -> str:
     """Strip Trading 212 suffix to get a Finnhub/Twelvedata-compatible ticker."""
     return t212_ticker.split("_")[0]
+
+
+def minutes_until_close() -> float | None:
+    """
+    Minutes until today's actual market close (handles early-close days via
+    the exchange calendar). Returns None outside a trading session or if the
+    calendar lookup fails. Used by the position monitor's EOD flatten.
+    """
+    try:
+        now_utc = pd.Timestamp.now("UTC")
+        today = now_utc.strftime("%Y-%m-%d")
+        sched = _NYSE.schedule(today, today)
+        if sched.empty:
+            return None
+        close_utc = sched.iloc[0]["market_close"]
+        delta = (close_utc - now_utc).total_seconds() / 60
+        return delta if delta > 0 else None
+    except Exception as exc:
+        logger.warning("minutes_until_close: calendar lookup failed: %s", exc)
+        return None
 
 
 def is_too_late_to_buy() -> bool:
@@ -135,25 +225,44 @@ def is_market_open() -> bool:
 
 @dataclass
 class PriceConfirmation:
-    ticker: str
-    symbol: str
+    ticker: str                     # T212 instrument code, e.g. AAPL_US_EQ
+    symbol: str                     # exchange symbol, e.g. AAPL
     current_price: float
     open_price: float
-    day_move_pct: float
-    recent_move_pct: float      # price vs ~5 min ago (Twelvedata baseline)
+    prev_close: float | None        # previous session close (gap baseline)
+    day_move_pct: float             # vs today's open (informational/logging)
+    day_change_pct: float | None    # vs PREVIOUS CLOSE — used by filters
+    recent_move_pct: float          # vs momentum baseline (~5 min ago)
     current_volume: int
     avg_volume: int
-    volume_ratio: float
-    daily_dollar_volume: float | None
+    rvol: float                     # time-of-day normalized relative volume
+    avg_dollar_volume: float | None # 20-day ADV × price (liquidity metric)
+    spread_proxy_pct: float | None  # latest bar (high−low)/close, %
     is_confirmed: bool
     reason: str
-    reason_code: str            # approved | low_momentum | high_momentum | low_volume | high_volume | dead_cat | no_price_data | illiquid | opening_block | penny_stock
+    # approved | opening_block | penny_stock | wide_spread | dead_cat |
+    # extended_move | illiquid | low_momentum | high_momentum |
+    # low_volume | high_volume | no_price_data
+    reason_code: str
+
+
+def _reject(base: dict, code: str, reason: str) -> "PriceConfirmation":
+    """Build a rejected PriceConfirmation and log it uniformly."""
+    logger.info(
+        "Price check [%s]: recent=%+.2f%% day_chg=%s rvol=%.1f adv$=%s — rejected: %s (%s)",
+        base["symbol"], base.get("recent_move_pct", 0.0),
+        f"{base['day_change_pct']:+.2f}%" if base.get("day_change_pct") is not None else "n/a",
+        base.get("rvol", 0.0),
+        f"${base['avg_dollar_volume']:,.0f}" if base.get("avg_dollar_volume") else "n/a",
+        code, reason,
+    )
+    return PriceConfirmation(**base, is_confirmed=False, reason=reason, reason_code=code)
 
 
 def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
     """
-    Check whether a ticker is experiencing active upward momentum that
-    corroborates a bullish news signal.
+    Check whether a ticker is experiencing active, tradeable upward momentum
+    that corroborates a bullish news signal.
 
     Returns None only when a hard data failure makes it impossible to evaluate
     the signal (Finnhub down, Twelvedata down). Confirmed/rejected signals
@@ -162,7 +271,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
     symbol = _to_yf_ticker(t212_ticker)
 
     try:
-        # ── Current price via Finnhub REST (real-time, retried) ───────────────
+        # ── Current price + previous close via Finnhub (real-time, retried) ──
         quote = get_finnhub_quote(symbol)
         if quote is None:
             logger.warning(
@@ -175,6 +284,10 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         open_price = float(quote["o"]) if quote.get("o") else current_price
         if open_price == 0:
             open_price = current_price
+        # `pc` = previous close. The baseline for gap/day-change math: using
+        # today's open instead silently ignores overnight gaps in both
+        # directions (the old dead-cat hole).
+        finnhub_prev_close = float(quote.get("pc") or 0) or None
         day_move_pct = ((current_price - open_price) / open_price) * 100
 
         # ── Time since open ───────────────────────────────────────────────────
@@ -184,67 +297,40 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         )
         minutes_since_open = (now_et - market_open_et).total_seconds() / 60
 
-        # Hard opening-auction block. The first cfg.open_block_minutes (default 5)
-        # after open are off-limits. GOAI: entire spike was in the 09:30 bar;
-        # the system bought at 09:32 into full collapse. Extending to 5 min.
+        # Template for every PriceConfirmation built before later data arrives.
+        base = dict(
+            ticker=t212_ticker, symbol=symbol,
+            current_price=current_price, open_price=open_price,
+            prev_close=finnhub_prev_close,
+            day_move_pct=day_move_pct, day_change_pct=None,
+            recent_move_pct=0.0, current_volume=0, avg_volume=0,
+            rvol=0.0, avg_dollar_volume=None, spread_proxy_pct=None,
+        )
+
+        # ── 1. Opening block ─────────────────────────────────────────────────
+        # Costs nothing to check; rejects before any Twelvedata credit is spent.
         if minutes_since_open < cfg.open_block_minutes:
-            logger.info(
-                "Price check [%s]: opening block active (%.1f min since open, block=%d min) — skipping",
-                symbol, minutes_since_open, cfg.open_block_minutes,
-            )
-            return PriceConfirmation(
-                ticker=t212_ticker,
-                symbol=symbol,
-                current_price=current_price,
-                open_price=open_price,
-                day_move_pct=day_move_pct,
-                recent_move_pct=0.0,
-                current_volume=0,
-                avg_volume=0,
-                volume_ratio=0.0,
-                daily_dollar_volume=None,
-                is_confirmed=False,
-                reason=(
-                    f"Opening auction block: {minutes_since_open:.1f} min since open "
-                    f"(block lasts {cfg.open_block_minutes} min to avoid auction noise)"
-                ),
-                reason_code="opening_block",
+            return _reject(
+                base, "opening_block",
+                f"Opening auction block: {minutes_since_open:.1f} min since open "
+                f"(block lasts {cfg.open_block_minutes} min to avoid auction noise)",
             )
 
-        # ── Penny stock guard ────────────────────────────────────────────────────
-        # Stocks below min_stock_price ($2 default) have extreme bid-ask spreads
-        # relative to price and are frequently the subject of halt-pump patterns.
-        # All Jun 8–11 losses were on stocks priced < $5 at entry.
+        # ── 2. Penny stock floor ─────────────────────────────────────────────
         if current_price < cfg.min_stock_price:
-            reason = (
+            return _reject(
+                base, "penny_stock",
                 f"Penny stock filter: price ${current_price:.4f} "
-                f"< ${cfg.min_stock_price:.2f} minimum — extreme spread/slippage risk"
-            )
-            logger.info("Price check [%s]: rejected — %s", symbol, reason)
-            return PriceConfirmation(
-                ticker=t212_ticker,
-                symbol=symbol,
-                current_price=current_price,
-                open_price=open_price,
-                day_move_pct=day_move_pct,
-                recent_move_pct=0.0,
-                current_volume=0,
-                avg_volume=0,
-                volume_ratio=0.0,
-                daily_dollar_volume=None,
-                is_confirmed=False,
-                reason=reason,
-                reason_code="penny_stock",
+                f"< ${cfg.min_stock_price:.2f} minimum — spread/halt/manipulation risk",
             )
 
-        # ── Momentum baseline via Twelvedata 1-min bars ───────────────────────
-        # bar[5] = price ~5 min ago; bar[0] = most recent completed bar.
-        # Staleness guard built into get_momentum_baseline() — rejects bars >10 min old.
-        past_price, current_bar_price = get_momentum_baseline(symbol)
+        # ── Momentum baseline + spread proxy (Twelvedata 1-min bars) ─────────
+        past_price, current_bar_price, spread_proxy_pct = get_momentum_baseline(symbol)
+        base["spread_proxy_pct"] = spread_proxy_pct
 
         if past_price is None:
-            # Fall back to Finnhub open price in the early session window
-            # (session not yet 15 min old, Twelvedata may not have enough bars)
+            # Early-session fallback: Twelvedata may not have enough bars in
+            # the first ~15 min; the official open price is a fair baseline.
             if minutes_since_open < 15 and open_price and open_price > 0:
                 past_price = open_price
                 logger.info(
@@ -253,196 +339,139 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                 )
             else:
                 logger.warning(
-                    "Price check [%s]: Twelvedata momentum baseline unavailable and not in open window — cannot evaluate",
+                    "Price check [%s]: Twelvedata momentum baseline unavailable and "
+                    "not in open window — cannot evaluate",
                     symbol,
                 )
                 return None
 
         recent_move_pct = ((current_price - past_price) / past_price) * 100 if past_price else 0.0
+        base["recent_move_pct"] = recent_move_pct
 
-        # ── Volume stats via Twelvedata 1-day bars ────────────────────────────
-        today_volume, avg_daily_volume, daily_dollar_volume = get_volume_stats(symbol)
+        # ── 3. Spread proxy ──────────────────────────────────────────────────
+        # No bid/ask feed on our data plan, so the latest 1-min bar's range is
+        # the proxy. Permissive default — only the truly untradeable get cut.
+        if spread_proxy_pct is not None and spread_proxy_pct > cfg.max_spread_pct:
+            return _reject(
+                base, "wide_spread",
+                f"Spread proxy {spread_proxy_pct:.2f}% (last bar range) exceeds "
+                f"{cfg.max_spread_pct}% — effective spread would eat the edge",
+            )
+
+        # ── Volume stats + prev close (Twelvedata 1-day bars) ────────────────
+        today_volume, avg_daily_volume, avg_dollar_volume, td_prev_close = get_volume_stats(symbol)
+
+        # Prefer Finnhub's prev close (real-time source); Twelvedata's daily
+        # bar is the backup when the quote lacks `pc`.
+        prev_close = finnhub_prev_close or td_prev_close
+        base["prev_close"] = prev_close
+        day_change_pct = (
+            ((current_price - prev_close) / prev_close) * 100 if prev_close else None
+        )
+        base["day_change_pct"] = day_change_pct
 
         if today_volume is None:
-            # Volume data unavailable — use Finnhub quote's own volume field as fallback
+            # Volume data unavailable — fall back to the quote's own volume
+            # field (no RVOL possible; RVOL checks are skipped below).
             current_volume = int(quote.get("v", 0))
             avg_daily_volume = 0
-            volume_ratio = 0.0
-            daily_dollar_volume = None
+            rvol = 0.0
+            avg_dollar_volume = None
             logger.warning(
-                "Price check [%s]: Twelvedata volume unavailable — using Finnhub quote volume=%d (no ratio)",
+                "Price check [%s]: Twelvedata volume unavailable — using Finnhub "
+                "quote volume=%d (no RVOL)",
                 symbol, current_volume,
             )
         else:
             current_volume = today_volume
-            volume_ratio = (current_volume / avg_daily_volume) if avg_daily_volume > 0 else 0.0
+            rvol = compute_rvol(current_volume, avg_daily_volume or 0, minutes_since_open)
 
-        # ── Evaluate conditions ───────────────────────────────────────────────
+        base.update(
+            current_volume=current_volume,
+            avg_volume=avg_daily_volume or 0,
+            rvol=rvol,
+            avg_dollar_volume=avg_dollar_volume,
+        )
 
-        # 1. Dead-cat bounce guard
-        dead_cat = day_move_pct < -cfg.max_day_drop_pct
-        if dead_cat:
-            reason = (
-                f"Dead-cat bounce guard: stock is down {day_move_pct:.2f}% on the day "
-                f"(max allowed drop: -{cfg.max_day_drop_pct}%) — skipping"
-            )
-            logger.info("Price check [%s]: rejected — %s", symbol, reason)
-            return PriceConfirmation(
-                ticker=t212_ticker, symbol=symbol,
-                current_price=current_price, open_price=open_price,
-                day_move_pct=day_move_pct, recent_move_pct=recent_move_pct,
-                current_volume=current_volume, avg_volume=avg_daily_volume or 0,
-                volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
-                is_confirmed=False, reason=reason, reason_code="dead_cat",
+        # ── 4. Dead-cat guard (vs prev close) ────────────────────────────────
+        if day_change_pct is not None and day_change_pct < -cfg.max_day_drop_pct:
+            return _reject(
+                base, "dead_cat",
+                f"Dead-cat guard: {day_change_pct:.2f}% vs prev close "
+                f"(max allowed drop −{cfg.max_day_drop_pct}%) — bullish news on a "
+                f"falling knife is a bounce, not a trend",
             )
 
-        # 2. Liquidity filter — reject stocks with insufficient daily dollar volume.
-        # Thin order books cause catastrophic slippage on market sell orders.
-        if daily_dollar_volume is not None and daily_dollar_volume < cfg.min_daily_dollar_volume:
-            reason = (
-                f"Liquidity filter: daily dollar volume ${daily_dollar_volume:,.0f} "
-                f"< ${cfg.min_daily_dollar_volume:,.0f} minimum — market orders would cause severe slippage"
-            )
-            logger.info("Price check [%s]: rejected — %s", symbol, reason)
-            return PriceConfirmation(
-                ticker=t212_ticker, symbol=symbol,
-                current_price=current_price, open_price=open_price,
-                day_move_pct=day_move_pct, recent_move_pct=recent_move_pct,
-                current_volume=current_volume, avg_volume=avg_daily_volume or 0,
-                volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
-                is_confirmed=False, reason=reason, reason_code="illiquid",
+        # ── 5. Extended-move ceiling (vs prev close, gap included) ───────────
+        if day_change_pct is not None and day_change_pct > cfg.max_day_move_pct:
+            return _reject(
+                base, "extended_move",
+                f"Extended-move ceiling: {day_change_pct:+.2f}% vs prev close exceeds "
+                f"+{cfg.max_day_move_pct}% — catalyst already paid out, entries here "
+                f"buy exhaustion",
             )
 
-        # 3. Momentum floor check
-        momentum_ok = recent_move_pct >= cfg.min_price_move_pct
-        if not momentum_ok:
-            reason = (
-                f"Insufficient recent momentum: {recent_move_pct:+.2f}% "
-                f"over last ~5 min "
-                f"(threshold: +{cfg.min_price_move_pct}%)"
-            )
-            logger.info(
-                "Price check [%s]: recent=%+.2f%% day=%+.2f%% vol=%.1f× ddv=%s — rejected: low_momentum",
-                symbol, recent_move_pct, day_move_pct, volume_ratio,
-                f"${daily_dollar_volume:,.0f}" if daily_dollar_volume else "n/a",
-            )
-            return PriceConfirmation(
-                ticker=t212_ticker, symbol=symbol,
-                current_price=current_price, open_price=open_price,
-                day_move_pct=day_move_pct, recent_move_pct=recent_move_pct,
-                current_volume=current_volume, avg_volume=avg_daily_volume or 0,
-                volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
-                is_confirmed=False, reason=reason, reason_code="low_momentum",
+        # ── 6. Liquidity floor (ADV-based) ───────────────────────────────────
+        if avg_dollar_volume is not None and avg_dollar_volume < cfg.min_daily_dollar_volume:
+            return _reject(
+                base, "illiquid",
+                f"Liquidity filter: avg daily dollar volume ${avg_dollar_volume:,.0f} "
+                f"< ${cfg.min_daily_dollar_volume:,.0f} — normal book too thin for a "
+                f"clean exit",
             )
 
-        # 3b. Momentum ceiling check — reject stocks that have already moved too far.
-        # A recent_move_pct > cfg.max_price_move_pct means we're likely reading a
-        # post-halt spike. Circuit-breaker halt articles publish AFTER the 30–120% move;
-        # buying here = buying the top. All Jun 8–11 losses triggered this pattern.
+        # ── 7. Momentum floor ────────────────────────────────────────────────
+        if recent_move_pct < cfg.min_price_move_pct:
+            return _reject(
+                base, "low_momentum",
+                f"Insufficient momentum: {recent_move_pct:+.2f}% over last "
+                f"~{cfg.momentum_lookback_minutes} min (need +{cfg.min_price_move_pct}%)",
+            )
+
+        # ── 8. Momentum ceiling ──────────────────────────────────────────────
         if recent_move_pct > cfg.max_price_move_pct:
-            reason = (
-                f"Momentum ceiling breached: {recent_move_pct:+.2f}% over last ~5 min "
-                f"exceeds max {cfg.max_price_move_pct}% — likely a post-halt article, "
-                f"not a live catalyst"
-            )
-            logger.info(
-                "Price check [%s]: recent=%+.2f%% day=%+.2f%% vol=%.1f× ddv=%s — rejected: high_momentum",
-                symbol, recent_move_pct, day_move_pct, volume_ratio,
-                f"${daily_dollar_volume:,.0f}" if daily_dollar_volume else "n/a",
-            )
-            return PriceConfirmation(
-                ticker=t212_ticker, symbol=symbol,
-                current_price=current_price, open_price=open_price,
-                day_move_pct=day_move_pct, recent_move_pct=recent_move_pct,
-                current_volume=current_volume, avg_volume=avg_daily_volume or 0,
-                volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
-                is_confirmed=False, reason=reason, reason_code="high_momentum",
+            return _reject(
+                base, "high_momentum",
+                f"Momentum ceiling: {recent_move_pct:+.2f}% in "
+                f"~{cfg.momentum_lookback_minutes} min exceeds +{cfg.max_price_move_pct}% "
+                f"— post-halt spike, not a live catalyst",
             )
 
-        # 4. Volume check
-        # After the open block (5+ min): require ≥1.5× average daily volume.
-        # During the open block window (already rejected above, but keeping logic clean):
-        # require ≥0.5× — eliminates zero-volume auction ticks while allowing
-        # genuine gap-ups with lower early volume. This is stricter than the old
-        # "current_volume > 0" check that let GOAI through at 0.7×.
-        if minutes_since_open >= 15:
-            volume_ok = volume_ratio >= 1.5
-        elif minutes_since_open >= cfg.open_block_minutes:
-            # 5–15 min window: require 0.5× minimum
-            volume_ok = volume_ratio >= 0.5
-        else:
-            volume_ok = current_volume > 0  # Shouldn't reach here (opening_block above)
-
-        if not volume_ok:
-            if minutes_since_open < 15:
-                reason = (
-                    f"+{recent_move_pct:.2f}% momentum but volume {volume_ratio:.2f}× avg "
-                    f"({current_volume:,} shares) — too thin in early session (need ≥0.5×)"
+        # ── 9. RVOL band ─────────────────────────────────────────────────────
+        # Skip when we have no average volume to normalize against (RVOL would
+        # be meaningless either way) — the liquidity filter above still applies.
+        if avg_daily_volume and avg_daily_volume > 0:
+            if rvol < cfg.min_rvol:
+                return _reject(
+                    base, "low_volume",
+                    f"RVOL {rvol:.2f} below {cfg.min_rvol} — price move lacks real "
+                    f"participation (time-normalized vs 20-day avg)",
                 )
-            else:
-                reason = (
-                    f"+{recent_move_pct:.2f}% momentum but low volume "
-                    f"({volume_ratio:.1f}× avg, threshold 1.5×) — rejected"
+            if rvol > cfg.max_rvol:
+                return _reject(
+                    base, "high_volume",
+                    f"RVOL {rvol:.1f} above {cfg.max_rvol} — parabolic volume is the "
+                    f"halt-pattern signature, not a tradeable catalyst",
                 )
-            logger.info(
-                "Price check [%s]: recent=%+.2f%% day=%+.2f%% vol=%.1f× ddv=%s — rejected: low_volume",
-                symbol, recent_move_pct, day_move_pct, volume_ratio,
-                f"${daily_dollar_volume:,.0f}" if daily_dollar_volume else "n/a",
-            )
-            return PriceConfirmation(
-                ticker=t212_ticker, symbol=symbol,
-                current_price=current_price, open_price=open_price,
-                day_move_pct=day_move_pct, recent_move_pct=recent_move_pct,
-                current_volume=current_volume, avg_volume=avg_daily_volume or 0,
-                volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
-                is_confirmed=False, reason=reason, reason_code="low_volume",
-            )
-
-        # 4b. Volume ceiling check — extreme volume on micro-caps = halt pattern.
-        # All Jun 8–11 halt-article trades had volume_ratio > 30×. A genuine
-        # momentum catalyst has elevated but not parabolic volume (5–15× is the
-        # sweet spot). Above cfg.max_volume_ratio (20×) the risk/reward inverts.
-        if volume_ratio > cfg.max_volume_ratio:
-            reason = (
-                f"Volume ceiling breached: {volume_ratio:.1f}× avg volume "
-                f"exceeds max {cfg.max_volume_ratio:.0f}× — "
-                f"extreme volume pattern consistent with circuit-breaker halt"
-            )
-            logger.info(
-                "Price check [%s]: recent=%+.2f%% day=%+.2f%% vol=%.1f× ddv=%s — rejected: high_volume",
-                symbol, recent_move_pct, day_move_pct, volume_ratio,
-                f"${daily_dollar_volume:,.0f}" if daily_dollar_volume else "n/a",
-            )
-            return PriceConfirmation(
-                ticker=t212_ticker, symbol=symbol,
-                current_price=current_price, open_price=open_price,
-                day_move_pct=day_move_pct, recent_move_pct=recent_move_pct,
-                current_volume=current_volume, avg_volume=avg_daily_volume or 0,
-                volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
-                is_confirmed=False, reason=reason, reason_code="high_volume",
-            )
 
         # ── All conditions met — signal confirmed ─────────────────────────────
-        ddv_str = f" | ddv=${daily_dollar_volume:,.0f}" if daily_dollar_volume else ""
+        adv_str = f" | adv$={avg_dollar_volume:,.0f}" if avg_dollar_volume else ""
         reason = (
-            f"+{recent_move_pct:.2f}% in last ~5 min "
-            f"| {volume_ratio:.1f}× avg volume "
-            f"| day: {day_move_pct:+.2f}%"
-            f"{ddv_str}"
+            f"+{recent_move_pct:.2f}% in ~{cfg.momentum_lookback_minutes} min "
+            f"| RVOL {rvol:.1f} "
+            f"| day {day_change_pct:+.2f}% vs prev close"
+            f"{adv_str}"
+        ) if day_change_pct is not None else (
+            f"+{recent_move_pct:.2f}% | RVOL {rvol:.1f}{adv_str}"
         )
         logger.info(
-            "Price check [%s]: recent=%+.2f%% day=%+.2f%% vol=%.1f× ddv=%s — APPROVED",
-            symbol, recent_move_pct, day_move_pct, volume_ratio,
-            f"${daily_dollar_volume:,.0f}" if daily_dollar_volume else "n/a",
+            "Price check [%s]: recent=%+.2f%% day_chg=%s rvol=%.1f adv$=%s — APPROVED",
+            symbol, recent_move_pct,
+            f"{day_change_pct:+.2f}%" if day_change_pct is not None else "n/a",
+            rvol,
+            f"${avg_dollar_volume:,.0f}" if avg_dollar_volume else "n/a",
         )
-        return PriceConfirmation(
-            ticker=t212_ticker, symbol=symbol,
-            current_price=current_price, open_price=open_price,
-            day_move_pct=day_move_pct, recent_move_pct=recent_move_pct,
-            current_volume=current_volume, avg_volume=avg_daily_volume or 0,
-            volume_ratio=volume_ratio, daily_dollar_volume=daily_dollar_volume,
-            is_confirmed=True, reason=reason, reason_code="approved",
-        )
+        return PriceConfirmation(**base, is_confirmed=True, reason=reason, reason_code="approved")
 
     except Exception as exc:
         logger.error("Price check failed for %s: %s", symbol, exc, exc_info=True)
@@ -451,9 +480,10 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
 
 def get_current_price(t212_ticker: str) -> float | None:
     """
-    Fast lookup of the latest price for an open position monitor.
+    Fast lookup of the latest price for the open-position monitor.
     Primary: Finnhub REST quote (real-time, retried).
-    Returns None if Finnhub is unavailable — callers must handle this explicitly.
+    Fallback: most recent Twelvedata 1-min bar close.
+    Returns None if both are unavailable — callers must handle this explicitly.
     """
     symbol = _to_yf_ticker(t212_ticker)
     quote = get_finnhub_quote(symbol)
@@ -463,7 +493,7 @@ def get_current_price(t212_ticker: str) -> float | None:
         return price
     # Twelvedata fallback: use most recent 1-min bar close
     try:
-        past_price, current_bar_price = get_momentum_baseline(symbol)
+        _past, current_bar_price, _spread = get_momentum_baseline(symbol)
         if current_bar_price is not None:
             logger.warning(
                 "get_current_price [%s]: Finnhub unavailable — using Twelvedata bar close %.4f",

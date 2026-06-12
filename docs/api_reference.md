@@ -87,60 +87,46 @@ The prompt is domain-specific — it explicitly teaches Claude which news types 
 
 ---
 
-### API call
+### API call (v14)
 
-All eligible articles in a single news cycle are scored in **one batched call** — not one call per article. Articles are pre-filtered (must have tickers, not blocklisted, not already seen in DB, published within the last 60 seconds) before the call is made. `max_tokens` scales dynamically with batch size (~40 tokens per article).
+All eligible articles in a single news cycle are scored in **one batched call** — not one call per article. Articles are pre-filtered (must have tickers, not blocklisted, not already seen in DB, fresh enough) before the call is made.
+
+Three v14 design choices (see `news/fetcher.py` for the full implementation):
+
+1. **`temperature=0`** — this is a classifier; sampling noise on borderline calls is pure harm.
+2. **Cached system prompt** — the static rubric lives in the `system` parameter with `cache_control: {"type": "ephemeral"}`. The news cycle runs every 60s and the prompt cache TTL is 5 minutes, so the rubric is a cache hit on every call after the first (~90% input-cost reduction on the rubric tokens). Only the per-cycle articles go in the user message, keeping the cache prefix stable.
+3. **Forced tool use** — `tool_choice={"type": "tool", "name": "classify_articles"}` guarantees schema-validated structured output. No JSON string parsing, no markdown-fence stripping, no truncation recovery.
 
 **Code:**
 ```python
 client = anthropic.Anthropic()
 msg = client.messages.create(
     model="claude-haiku-4-5-20251001",
-    max_tokens=max(512, len(articles) * 40 + 64),
-    messages=[{"role": "user", "content": prompt}],
+    max_tokens=max(1024, len(articles) * 80 + 128),
+    temperature=0,
+    system=[{"type": "text", "text": RUBRIC, "cache_control": {"type": "ephemeral"}}],
+    messages=[{"role": "user", "content": articles_text}],
+    tools=[CLASSIFY_TOOL],
+    tool_choice={"type": "tool", "name": "classify_articles"},
 )
+# Result arrives as a tool_use content block:
+for block in msg.content:
+    if block.type == "tool_use":
+        classifications = block.input["classifications"]
 ```
 
-**Prompt structure:**
-```
-You are an expert day trader specialising in US equity momentum trading.
-Your job is to identify news that will cause a stock to move UP sharply
-within the next 15 minutes of market trading.
+**Rubric structure (system prompt):** a decision tree — (1) is this NEW information or a recap/halt article describing a move that already happened? (2) is the tagged ticker the actual subject (acquirer vs target)? (3) is the catalyst binding and material (LOI/MOU → neutral, offerings/dilution → negative)? (4) is the company small enough to move? — followed by a 14-class catalyst taxonomy and few-shot examples. Full text in `news/fetcher.py::_SYSTEM_PROMPT`.
 
-POSITIVE (high confidence 0.8–1.0) — genuine catalysts that move stocks NOW:
-- Earnings beats: revenue or EPS above analyst estimates
-- FDA approvals, drug trial success, regulatory green lights
-- M&A: acquisition announcements, buyout offers, merger deals
-- Major contract wins with concrete dollar values
-- Guidance raises: company raises full-year revenue or earnings outlook
-- Short squeeze signals: stock halted to the upside, unusual volume surge
-- Surprise CEO/product announcements with material business impact
-
-NEUTRAL (do not mark positive) — these almost never move a stock in 15 min:
-- Analyst price target raises or reiterations with no new information
-- 'Maintains Buy/Overweight' — the analyst already had this rating
-- General market or sector commentary
-- Conference attendance, awards, ESG reports
-- Articles that summarise news published days ago
-
-Articles:
-[{"id": "...", "headline": "...", "teaser": "..."}, ...]
-```
-
-**Sample response:**
-```json
-[
-  {"id": "52736856", "sentiment": "positive", "confidence": 0.92},
-  {"id": "52736901", "sentiment": "neutral",  "confidence": 0.10}
-]
-```
-
-**Output mapping:**
+**Per-article output (tool input schema):**
 
 | Field | Description |
 |---|---|
-| `sentiment` | `"positive"` → proceeds to price check; others are dropped |
-| `confidence` | 0.0–1.0, multiplied by 10 and rounded to store as `news_signals.confidence` (1–10) |
+| `sentiment` | `"positive"`, `"neutral"`, or `"negative"` |
+| `confidence` | 0.0–1.0; ×10 rounded → `news_signals.confidence` (1–10) |
+| `catalyst_type` | one of 14 classes (`earnings_beat`, `fda_approval`, `ma_target`, `halt_or_resume`, `offering_dilution`, ...) |
+| `already_moved` | `true` if the move pre-dates the article (halt/recap pattern) |
+
+**Trade gates (code, not model):** a positive only trades if `confidence ≥ MIN_SENTIMENT_CONFIDENCE`, `catalyst_type ∈ TRADEABLE_CATALYSTS`, and `already_moved == false`. **Every** classification is persisted to `sentiment_scores` for the nightly forward-returns eval loop (`analysis/forward_returns.py`).
 
 ---
 
@@ -472,16 +458,40 @@ Other notable error types:
 
 ---
 
+### Endpoint: POST `/equity/orders/limit` (v14)
+
+**Purpose:** Two uses. (1) **Resting take-profit** — placed immediately after every buy at `buy_price × (1 + TAKE_PROFIT_PCT%)`, `timeValidity: "DAY"`; the exchange fills it with zero polling latency. (2) **Bounded-slippage exits** — stop-loss/time-stop/EOD sells go out as limits at `trigger × (1 − SELL_LIMIT_SLACK_PCT%)` so a collapsing book can cost at most ~1%, not GOAI's −18.99%.
+
+**Request body:**
+```json
+{"ticker": "AAPL_US_EQ", "quantity": -5.0, "limitPrice": 105.00, "timeValidity": "DAY"}
+```
+Negative quantity = sell. Prices rounded to 2dp (≥$1) / 4dp (<$1).
+
+### Endpoint: GET `/equity/orders/{id}` (v14)
+
+**Purpose:** Order status polling. Statuses: `NEW`, `CONFIRMED`, `FILLED`, `CANCELLED`, `REJECTED`. A **404 means the order left the book** (filled → history) — `get_order_status()` maps it to `"GONE"`. Network errors return `None` = status UNKNOWN; callers must never treat `None` as filled.
+
+### Endpoint: DELETE `/equity/orders/{id}` (v14)
+
+**Purpose:** Cancel a pending order. Used to cancel the resting TP before a stop/time-stop/EOD sell (T212 has no OCO — the resting order reserves the shares). A failed cancel usually means the order filled mid-cancel: the monitor re-checks status and records a take_profit instead of double-selling.
+
+---
+
 ## Summary Table
 
 | API | Endpoint / Call | Purpose | File |
 |---|---|---|---|
-| Benzinga (massive.com) | `GET /benzinga/v2/news` | Fetch recent US equity news | `news/fetcher.py` |
-| Anthropic (Claude Haiku) | `messages.create` (batched) | Classify article sentiment | `news/fetcher.py` |
+| Benzinga (massive.com) | `GET /benzinga/v2/news` | Fetch recent US equity news (RTH + pre-market scanner) | `news/fetcher.py` |
+| Anthropic (Claude Haiku) | `messages.create` (batched, temp 0, cached system, forced tool use) | Classify sentiment + catalyst type | `news/fetcher.py` |
 | Finnhub | `GET /stock/market-status` | Fallback NYSE open/closed check (primary is `pandas_market_calendars`) | `market/price_check.py` |
-| Finnhub | `GET /quote` | Real-time current price (retried, exp backoff) | `market/finnhub_bars.py` |
-| Twelvedata | `GET /time_series?interval=1min` | 1-min momentum baseline (~5 min ago, staleness guard) | `market/twelvedata_bars.py` |
-| Twelvedata | `GET /time_series?interval=1day` | 20-day ADV + daily dollar volume (liquidity filter) | `market/twelvedata_bars.py` |
-| Trading 212 | `GET /equity/metadata/instruments` | Build shortName→ticker map at startup (handles SPAC/rename mismatches) | `trading/executor.py` |
-| Trading 212 | `GET /equity/account/cash` | Portfolio value + cash for position sizing | `trading/executor.py` |
-| Trading 212 | `POST /equity/orders/market` | Place buy / sell order | `trading/executor.py` |
+| Finnhub | `GET /quote` | Real-time price + previous close `pc` (retried, exp backoff) | `market/finnhub_bars.py` |
+| Twelvedata | `GET /time_series?interval=1min` | Momentum baseline (by timestamp) + spread proxy; credit-metered | `market/twelvedata_bars.py` |
+| Twelvedata | `GET /time_series?interval=1day` | 20-day ADV dollar volume (liquidity filter) + prev close backup | `market/twelvedata_bars.py` |
+| yfinance | `Ticker.history(interval="1m")` | Nightly forward returns for the eval loop (free, retrospective) | `analysis/forward_returns.py` |
+| Trading 212 | `GET /equity/metadata/instruments` | shortName→ticker map (startup, retried + daily rebuild) | `trading/executor.py` |
+| Trading 212 | `GET /equity/account/cash` | Portfolio value + cash for risk-based sizing | `trading/executor.py` |
+| Trading 212 | `POST /equity/orders/market` | Buy orders; sell fallback when limit placement fails | `trading/executor.py` |
+| Trading 212 | `POST /equity/orders/limit` | Resting take-profit + bounded-slippage exits | `trading/executor.py` |
+| Trading 212 | `GET /equity/orders/{id}` | Order status (TP fill detection) | `trading/executor.py` |
+| Trading 212 | `DELETE /equity/orders/{id}` | Cancel resting TP before stop sells | `trading/executor.py` |

@@ -45,7 +45,7 @@ def _auth_header() -> dict:
     return {"Authorization": f"Basic {encoded}"}
 
 
-def build_symbol_map() -> None:
+def build_symbol_map(retries: int = 3) -> bool:
     """
     Fetch T212's full instrument catalogue and build a shortName → ticker map.
 
@@ -53,29 +53,54 @@ def build_symbol_map() -> None:
     its exchange symbol (e.g. SUNE → JCS_US_EQ after a reverse merger).
     Without this map, ~16% of small-cap tickers 404 when we append _US_EQ.
 
-    Called once at startup from main.py. Safe to call again to refresh.
+    Retries with backoff: the metadata endpoint rate-limits aggressively, and
+    a single startup 429 used to leave the whole session running on the bad
+    `shortName_US_EQ` fallback (observed 2026-06-12). main.py also schedules
+    a daily rebuild as a second line of defence.
+
+    Returns True if the map was built, False if all attempts failed.
     """
     global _symbol_to_t212
-    try:
-        resp = requests.get(
-            f"{_base_url()}/equity/metadata/instruments",
-            headers=_auth_header(),
-            timeout=15,
-        )
-        resp.raise_for_status()
-        instruments = resp.json()
-        mapping = {}
-        for inst in instruments:
-            if not isinstance(inst, dict):
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(
+                f"{_base_url()}/equity/metadata/instruments",
+                headers=_auth_header(),
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                # Rate-limited: this endpoint allows ~1 req/30s — wait it out.
+                wait = 30 * attempt
+                logger.warning(
+                    "T212 instrument metadata rate-limited (attempt %d/%d) — waiting %ds",
+                    attempt, retries, wait,
+                )
+                time.sleep(wait)
                 continue
-            ticker = inst.get("ticker", "")
-            short = inst.get("shortName", "")
-            if ticker and short and inst.get("currencyCode") == "USD":
-                mapping[short.upper()] = ticker
-        _symbol_to_t212 = mapping
-        logger.info("T212 symbol map built: %d USD instruments", len(mapping))
-    except Exception as exc:
-        logger.warning("Could not build T212 symbol map: %s — will use shortName_US_EQ fallback", exc)
+            resp.raise_for_status()
+            instruments = resp.json()
+            mapping = {}
+            for inst in instruments:
+                if not isinstance(inst, dict):
+                    continue
+                ticker = inst.get("ticker", "")
+                short = inst.get("shortName", "")
+                if ticker and short and inst.get("currencyCode") == "USD":
+                    mapping[short.upper()] = ticker
+            _symbol_to_t212 = mapping
+            logger.info("T212 symbol map built: %d USD instruments", len(mapping))
+            return True
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(5 * attempt)
+    logger.warning(
+        "Could not build T212 symbol map after %d attempts (%s) — using "
+        "shortName_US_EQ fallback until the daily rebuild",
+        retries, last_exc,
+    )
+    return False
 
 
 def resolve_t212_ticker(exchange_symbol: str) -> str:
@@ -103,6 +128,22 @@ def _post(path: str, payload: dict) -> dict:
     if not resp.ok:
         raise Exception(f"HTTP {resp.status_code} - {resp.text}")
     return resp.json()
+
+
+def _delete(path: str) -> dict:
+    resp = requests.delete(f"{_base_url()}{path}", headers=_auth_header(), timeout=10)
+    if not resp.ok:
+        raise Exception(f"HTTP {resp.status_code} - {resp.text}")
+    # T212 DELETE may return an empty body on success
+    try:
+        return resp.json()
+    except ValueError:
+        return {}
+
+
+def _round_price(price: float) -> float:
+    """Round a limit price to a precision T212 accepts (2dp ≥ $1, 4dp below)."""
+    return round(price, 2) if price >= 1 else round(price, 4)
 
 
 @dataclass
@@ -183,8 +224,29 @@ def get_available_cash() -> float | None:
     return float(data["free"]) if data else None
 
 
-def calculate_quantity(ticker: str, price: float) -> tuple[float | None, str | None]:
-    """Returns (quantity, error_reason). error_reason is None on success."""
+def calculate_quantity(
+    ticker: str,
+    price: float,
+    avg_dollar_volume: float | None = None,
+) -> tuple[float | None, str | None]:
+    """
+    Risk-based position sizing. Returns (quantity, error_reason).
+
+    The position size is the MINIMUM of four constraints:
+      1. Hard cap        — max_position_size_pct of portfolio value.
+      2. Risk budget     — equity × risk_per_trade_pct / stop_loss_pct.
+                           Sizes the position so a stop-loss hit costs at most
+                           risk_per_trade_pct of the account. With the fixed
+                           2% stop the hard cap usually binds first; this term
+                           becomes active if stops are widened/dynamic.
+      3. Liquidity cap   — max_adv_participation_pct of the stock's average
+                           daily dollar volume, so our own exit order can't
+                           move the price (GOAI: our market sell alone pushed
+                           the fill 11.7% below trigger). Approximation: ADV
+                           is USD, equity is GBP — the small FX difference is
+                           within the cap's safety margin.
+      4. Available cash.
+    """
     try:
         data = _get("/equity/account/cash")
     except Exception as exc:
@@ -200,22 +262,105 @@ def calculate_quantity(ticker: str, price: float) -> tuple[float | None, str | N
         logger.warning("calculate_quantity for %s: %s", ticker, reason)
         return None, reason
 
-    max_spend = min(
-        portfolio_value * (cfg.max_position_size_pct / 100),
-        available_cash,
+    hard_cap = portfolio_value * (cfg.max_position_size_pct / 100)
+    risk_cap = (
+        portfolio_value * (cfg.risk_per_trade_pct / 100) / (cfg.stop_loss_pct / 100)
+        if cfg.stop_loss_pct > 0 else hard_cap
     )
+    constraints = [hard_cap, risk_cap, available_cash]
+    if avg_dollar_volume is not None and avg_dollar_volume > 0:
+        constraints.append(avg_dollar_volume * (cfg.max_adv_participation_pct / 100))
+
+    max_spend = min(constraints)
+    if max_spend <= 0:
+        return None, "position size computed as zero"
 
     # Trading 212 allows at most 4 decimal places for fractional quantities
     quantity = round(max_spend / price, 4)
     logger.info(
-        "Position size for %s: £%.2f → %.4f shares @ £%.4f",
-        ticker, max_spend, quantity, price,
+        "Position size for %s: £%.2f (caps: hard=£%.0f risk=£%.0f adv=%s cash=£%.0f) "
+        "→ %.4f shares @ $%.4f",
+        ticker, max_spend, hard_cap, risk_cap,
+        f"£{avg_dollar_volume * cfg.max_adv_participation_pct / 100:.0f}" if avg_dollar_volume else "n/a",
+        available_cash, quantity, price,
     )
     return quantity, None
 
 
-def buy(ticker: str, price: float) -> OrderResult:
-    quantity, err = calculate_quantity(ticker, price)
+# ── Order management (v14) ────────────────────────────────────────────────────
+
+def get_order_status(order_id: str) -> str | None:
+    """
+    Return the T212 order status (NEW, FILLED, CANCELLED, REJECTED, ...).
+
+    Special values:
+      "GONE" — the order 404s on the pending-orders endpoint, which means it
+               left the book (filled and moved to history, normally).
+      None   — network/API error: status UNKNOWN. Callers must NOT treat
+               None as filled — closing a DB trade on a transient timeout
+               while the real position is still open would desync the book.
+    """
+    try:
+        item = _get(f"/equity/orders/{order_id}")
+        return str(item.get("status", "")) or None
+    except Exception as exc:
+        if "HTTP 404" in str(exc):
+            return "GONE"
+        logger.warning("get_order_status(%s): %s", order_id, exc)
+        return None
+
+
+def cancel_order(order_id: str) -> bool:
+    """
+    Cancel a pending order. Returns True if cancelled (or already gone),
+    False if the cancel failed — the caller MUST then re-check the order
+    status, because the most common failure is "already filled" (the
+    cancel/fill race the monitor has to handle before placing a stop sell).
+    """
+    try:
+        _delete(f"/equity/orders/{order_id}")
+        logger.info("Order %s cancelled", order_id)
+        return True
+    except Exception as exc:
+        logger.warning("Cancel failed for order %s: %s", order_id, exc)
+        return False
+
+
+def place_take_profit(ticker: str, quantity: float, tp_price: float) -> str | None:
+    """
+    Place a resting LIMIT sell at the take-profit price, immediately after a
+    buy fills. This removes ALL polling latency from the profit side: the
+    exchange executes the moment the price touches TP, instead of waiting up
+    to monitor_interval_seconds and then crossing the spread with a market
+    order (the old way realized +3.1% on a +5% target).
+
+    Returns the order id, or None if placement failed — the monitor then
+    falls back to polled TP checking for this position, so a failed placement
+    degrades gracefully rather than leaving the position unmanaged.
+    """
+    try:
+        order = _post("/equity/orders/limit", {
+            "quantity": -quantity,           # negative = sell
+            "ticker": ticker,
+            "limitPrice": _round_price(tp_price),
+            "timeValidity": "DAY",           # EOD flatten covers the close anyway
+        })
+        order_id = str(order.get("id", "")) or None
+        logger.info(
+            "Resting TP placed: %s × %.4f @ $%.4f | order_id=%s",
+            ticker, quantity, tp_price, order_id,
+        )
+        return order_id
+    except Exception as exc:
+        logger.warning(
+            "Could not place resting TP for %s (monitor will poll TP instead): %s",
+            ticker, exc,
+        )
+        return None
+
+
+def buy(ticker: str, price: float, avg_dollar_volume: float | None = None) -> OrderResult:
+    quantity, err = calculate_quantity(ticker, price, avg_dollar_volume)
     if quantity is None:
         return OrderResult(
             success=False, ticker=ticker, quantity=0,
@@ -259,7 +404,7 @@ def buy(ticker: str, price: float) -> OrderResult:
         filled_price, net_gbp, fx_rate, fees_gbp = _parse_fill(fill)
         actual_price = filled_price if filled_price is not None else price
         logger.info(
-            "BUY executed: %s × %.4f @ £%.4f | net=£%.2f fx=%.4f fees=£%.2f | order_id=%s",
+            "BUY executed: %s × %.4f @ $%.4f | net=£%.2f fx=%.4f fees=£%.2f | order_id=%s",
             ticker, quantity, actual_price,
             net_gbp or 0, fx_rate or 0, fees_gbp or 0, order_id,
         )
@@ -277,16 +422,91 @@ def buy(ticker: str, price: float) -> OrderResult:
 
 
 def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult:
+    """
+    Close a position with BOUNDED slippage.
+
+    Instead of a pure market order, we place a marketable LIMIT sell at
+    (price × (1 − sell_limit_slack_pct%)). Because the limit sits below the
+    current price it fills immediately in any normal book — but in a thin or
+    collapsing book it caps the damage at the slack instead of chasing the
+    bid down (GOAI: market sell filled −18.99% on a −2% stop trigger).
+
+    Fill handling:
+      - FILLED within the poll window → success with real fill data.
+      - Unfilled after the window → cancel and report failure; the monitor
+        keeps the position open and retries next cycle (20s later) at the
+        then-current price. An unfilled retry beats an unbounded fill.
+      - Cancel fails (the cancel/fill race — order filled while we were
+        cancelling) → re-check status; if FILLED treat as success.
+      - Limit placement itself rejected → fall back to a market order.
+        An exit we can always execute matters more than slippage protection.
+    """
+    limit_price = _round_price(price * (1 - cfg.sell_limit_slack_pct / 100))
+    order_id: str | None = None
+    used_market_fallback = False
     try:
-        order = _post("/equity/orders/market", {"quantity": -quantity, "ticker": ticker})
-        order_id = str(order.get("id", ""))
+        try:
+            order = _post("/equity/orders/limit", {
+                "quantity": -quantity,
+                "ticker": ticker,
+                "limitPrice": limit_price,
+                "timeValidity": "DAY",
+            })
+            order_id = str(order.get("id", ""))
+        except Exception as limit_exc:
+            # Limit rejected (precision, instrument restrictions, ...) —
+            # fall back to market so the position is never stuck unmanaged.
+            logger.warning(
+                "SELL limit placement failed for %s (%s) — falling back to market order",
+                ticker, limit_exc,
+            )
+            order = _post("/equity/orders/market", {"quantity": -quantity, "ticker": ticker})
+            order_id = str(order.get("id", ""))
+            used_market_fallback = True
+
+        # ── Wait for the fill ────────────────────────────────────────────────
+        # Poll status first (fast, definitive), then fetch fill details.
+        filled = used_market_fallback  # market orders: assume fill, fetch details
+        if not used_market_fallback:
+            for _ in range(10):  # up to ~20s
+                time.sleep(2)
+                status = get_order_status(order_id)
+                if status == "FILLED" or status is None:
+                    # None = no longer in pending orders → moved to history (filled)
+                    filled = True
+                    break
+                if status in ("CANCELLED", "REJECTED"):
+                    return OrderResult(
+                        success=False, ticker=ticker, quantity=quantity,
+                        price=price, order_id=order_id,
+                        error=f"limit sell {status}",
+                    )
+
+        if not filled:
+            # Book never reached our limit — cancel and let the monitor retry.
+            if cancel_order(order_id):
+                logger.warning(
+                    "SELL [%s] limit $%.4f unfilled after 20s — cancelled, monitor "
+                    "will retry next cycle at current price",
+                    ticker, limit_price,
+                )
+                return OrderResult(
+                    success=False, ticker=ticker, quantity=quantity,
+                    price=price, order_id=order_id,
+                    error="limit sell unfilled — cancelled for retry",
+                )
+            # Cancel failed → most likely filled while cancelling. Fall through
+            # and treat as filled; fill fetch below confirms the price.
+            logger.info("SELL [%s] cancel/fill race — treating order %s as filled", ticker, order_id)
+
         fill = _fetch_fill(order_id)
         filled_price, net_gbp, fx_rate, fees_gbp = _parse_fill(fill)
         actual_price = filled_price if filled_price is not None else price
         logger.info(
-            "SELL executed: %s × %.4f @ £%.4f | net=£%.2f fx=%.4f fees=£%.2f | reason=%s | order_id=%s",
+            "SELL executed: %s × %.4f @ $%.4f | net=£%.2f fx=%.4f fees=£%.2f | reason=%s | order_id=%s%s",
             ticker, quantity, actual_price,
             net_gbp or 0, fx_rate or 0, fees_gbp or 0, reason, order_id,
+            " (market fallback)" if used_market_fallback else "",
         )
         return OrderResult(
             success=True, ticker=ticker, quantity=quantity,
@@ -297,5 +517,5 @@ def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult
         logger.error("SELL failed for %s: %s", ticker, exc)
         return OrderResult(
             success=False, ticker=ticker, quantity=quantity,
-            price=price, order_id=None, error=str(exc),
+            price=price, order_id=order_id, error=str(exc),
         )

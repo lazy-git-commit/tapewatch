@@ -3,8 +3,11 @@ tests/test_core.py
 ───────────────────
 Unit tests for the most critical logic:
   - Exit condition evaluation (no external calls)
-  - Sentiment scoring (news/fetcher.py)
-  - Position sizing (trading/executor.py)
+  - Sentiment scoring via forced tool use (news/fetcher.py)
+  - Position sizing incl. risk/liquidity caps (trading/executor.py)
+  - T212 precision-mismatch auto-retry (trading/executor.py)
+  - RVOL time-of-day normalization (market/price_check.py)
+  - Backtest cost model (backtest/backtest_db.py)
 
 Run with: pytest tests/
 """
@@ -37,6 +40,17 @@ class TestExitConditions:
         assert reason == "take_profit"
         assert price == 106.0
 
+    @patch("monitor.position_monitor.get_current_price", return_value=106.0)
+    def test_take_profit_skipped_when_resting_tp(self, _mock):
+        from monitor.position_monitor import check_exit_conditions
+        # A resting limit order owns the profit side — the polled TP branch
+        # must not fire, otherwise the same shares get sold twice.
+        should_exit, reason, price = check_exit_conditions(
+            self._trade(buy_price=100.0), has_resting_tp=True
+        )
+        assert should_exit is False
+        assert price == 106.0
+
     @patch("monitor.position_monitor.get_current_price", return_value=97.0)
     def test_stop_loss_triggered(self, _mock):
         from monitor.position_monitor import check_exit_conditions
@@ -44,6 +58,16 @@ class TestExitConditions:
         assert should_exit is True
         assert reason == "stop_loss"
         assert price == 97.0
+
+    @patch("monitor.position_monitor.get_current_price", return_value=97.0)
+    def test_stop_loss_fires_even_with_resting_tp(self, _mock):
+        from monitor.position_monitor import check_exit_conditions
+        # has_resting_tp only suppresses the TP branch — never the stop.
+        should_exit, reason, price = check_exit_conditions(
+            self._trade(buy_price=100.0), has_resting_tp=True
+        )
+        assert should_exit is True
+        assert reason == "stop_loss"
 
     @patch("monitor.position_monitor.get_current_price", return_value=101.0)
     def test_time_stop_triggered(self, _mock):
@@ -71,15 +95,19 @@ class TestExitConditions:
         assert price is None
 
 
-# ── Sentiment scoring tests ───────────────────────────────────────────────────
+# ── Sentiment scoring tests (forced tool use) ─────────────────────────────────
 
 class TestSentimentScoring:
     """Tests for news/fetcher.py::_batch_score_sentiment"""
 
-    def _mock_claude_response(self, text: str) -> MagicMock:
-        mock_msg = MagicMock()
-        mock_msg.content = [MagicMock(text=text)]
-        return mock_msg
+    def _mock_tool_response(self, classifications: list[dict]) -> MagicMock:
+        """Build a mock Claude message containing a tool_use content block."""
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": classifications}
+        msg = MagicMock()
+        msg.content = [block]
+        return msg
 
     def _article(self, id="1", headline="Earnings beat", teaser="Revenue up"):
         return {"id": id, "headline": headline, "teaser": teaser}
@@ -87,36 +115,50 @@ class TestSentimentScoring:
     @patch("news.fetcher._claude")
     def test_positive_sentiment_parsed(self, mock_claude):
         from news.fetcher import _batch_score_sentiment
-        mock_claude.messages.create.return_value = self._mock_claude_response(
-            '[{"id": "1", "sentiment": "positive", "confidence": 0.9}]'
-        )
+        mock_claude.messages.create.return_value = self._mock_tool_response([
+            {"id": "1", "sentiment": "positive", "confidence": 0.9,
+             "catalyst_type": "earnings_beat", "already_moved": False},
+        ])
         scores = _batch_score_sentiment([self._article()])
-        assert scores["1"] == ("positive", pytest.approx(0.9))
+        assert scores["1"]["sentiment"] == "positive"
+        assert scores["1"]["confidence"] == pytest.approx(0.9)
+        assert scores["1"]["catalyst_type"] == "earnings_beat"
+        assert scores["1"]["already_moved"] is False
 
     @patch("news.fetcher._claude")
-    def test_neutral_sentiment_parsed(self, mock_claude):
+    def test_halt_article_classified(self, mock_claude):
         from news.fetcher import _batch_score_sentiment
-        mock_claude.messages.create.return_value = self._mock_claude_response(
-            '[{"id": "1", "sentiment": "neutral", "confidence": 0.2}]'
-        )
-        scores = _batch_score_sentiment([self._article()])
-        assert scores["1"][0] == "neutral"
+        mock_claude.messages.create.return_value = self._mock_tool_response([
+            {"id": "1", "sentiment": "neutral", "confidence": 0.2,
+             "catalyst_type": "halt_or_resume", "already_moved": True},
+        ])
+        scores = _batch_score_sentiment([self._article(headline="X Shares Halted On Circuit Breaker")])
+        assert scores["1"]["sentiment"] == "neutral"
+        assert scores["1"]["already_moved"] is True
 
     @patch("news.fetcher._claude")
-    def test_malformed_json_returns_empty(self, mock_claude):
+    def test_missing_id_skipped(self, mock_claude):
         from news.fetcher import _batch_score_sentiment
-        mock_claude.messages.create.return_value = self._mock_claude_response("not json")
+        mock_claude.messages.create.return_value = self._mock_tool_response([
+            {"sentiment": "positive", "confidence": 0.9,
+             "catalyst_type": "other", "already_moved": False},  # no id
+            {"id": "2", "sentiment": "neutral", "confidence": 0.3,
+             "catalyst_type": "analyst_action", "already_moved": False},
+        ])
+        scores = _batch_score_sentiment([self._article("1"), self._article("2")])
+        assert "1" not in scores
+        assert scores["2"]["sentiment"] == "neutral"
+
+    @patch("news.fetcher._claude")
+    def test_no_tool_block_returns_empty(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
+        text_block = MagicMock()
+        text_block.type = "text"
+        msg = MagicMock()
+        msg.content = [text_block]
+        mock_claude.messages.create.return_value = msg
         scores = _batch_score_sentiment([self._article()])
         assert scores == {}
-
-    @patch("news.fetcher._claude")
-    def test_markdown_fenced_json_parsed(self, mock_claude):
-        from news.fetcher import _batch_score_sentiment
-        mock_claude.messages.create.return_value = self._mock_claude_response(
-            '```json\n[{"id": "1", "sentiment": "positive", "confidence": 0.85}]\n```'
-        )
-        scores = _batch_score_sentiment([self._article()])
-        assert scores["1"] == ("positive", pytest.approx(0.85))
 
     @patch("news.fetcher._claude")
     def test_api_exception_returns_empty(self, mock_claude):
@@ -126,21 +168,22 @@ class TestSentimentScoring:
         assert scores == {}
 
     @patch("news.fetcher._claude")
-    def test_truncated_json_recovered(self, mock_claude):
-        from news.fetcher import _batch_score_sentiment
-        # Simulates a truncated response with only the first of two objects complete
-        truncated = '[{"id": "1", "sentiment": "positive", "confidence": 0.9}, {"id": "2"'
-        mock_claude.messages.create.return_value = self._mock_claude_response(truncated)
-        scores = _batch_score_sentiment([self._article("1"), self._article("2")])
-        assert "1" in scores
-        assert scores["1"][0] == "positive"
-
-    @patch("news.fetcher._claude")
     def test_empty_articles_returns_empty(self, mock_claude):
         from news.fetcher import _batch_score_sentiment
         scores = _batch_score_sentiment([])
         mock_claude.messages.create.assert_not_called()
         assert scores == {}
+
+    @patch("news.fetcher._claude")
+    def test_temperature_zero_and_forced_tool(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
+        mock_claude.messages.create.return_value = self._mock_tool_response([])
+        _batch_score_sentiment([self._article()])
+        kwargs = mock_claude.messages.create.call_args.kwargs
+        assert kwargs["temperature"] == 0
+        assert kwargs["tool_choice"] == {"type": "tool", "name": "classify_articles"}
+        # Rubric must be in the (cached) system block, not the user message
+        assert kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
 
 
 # ── Position sizing tests ─────────────────────────────────────────────────────
@@ -155,7 +198,8 @@ class TestPositionSizing:
     def test_quantity_respects_max_position_pct(self, mock_get):
         from trading.executor import calculate_quantity
         mock_get.return_value = self._mock_cash(total=10000.0, free=10000.0)
-        # 5% of £10,000 = £500. At £100/share = 5 shares
+        # Hard cap binds: 5% of £10,000 = £500 (risk cap is 0.25%/2% = £1,250).
+        # At £100/share = 5 shares
         quantity, err = calculate_quantity("AAPL_US_EQ", price=100.0)
         assert err is None
         assert quantity == pytest.approx(5.0, rel=1e-4)
@@ -168,6 +212,16 @@ class TestPositionSizing:
         quantity, err = calculate_quantity("AAPL_US_EQ", price=100.0)
         assert err is None
         assert quantity == pytest.approx(2.0, rel=1e-4)
+
+    @patch("trading.executor._get")
+    def test_quantity_capped_by_adv_participation(self, mock_get):
+        from trading.executor import calculate_quantity
+        mock_get.return_value = self._mock_cash(total=10000.0, free=10000.0)
+        # ADV participation cap: 0.5% of $20,000 ADV = £100 — binds below the
+        # £500 hard cap. This is what keeps exits from moving thin books.
+        quantity, err = calculate_quantity("THIN_US_EQ", price=100.0, avg_dollar_volume=20_000)
+        assert err is None
+        assert quantity == pytest.approx(1.0, rel=1e-4)
 
     @patch("trading.executor._get")
     def test_zero_cash_returns_none(self, mock_get):
@@ -215,11 +269,8 @@ class TestBuyPrecisionRetry:
         result = buy("BCDA_US_EQ", price=1.51)
         assert result.success is True
         assert mock_post.call_count == 2
-        # Second call should use quantity rounded to 2 decimal places
-        # _post is called as _post(path, payload_dict)
         second_call_payload = mock_post.call_args[0][1]
         second_call_qty = second_call_payload["quantity"]
-        # str(165.93) → "165.93" → split on "." → ["165", "93"] → len("93") == 2
         qty_str = str(second_call_qty)
         if "." in qty_str:
             decimal_places = len(qty_str.rstrip("0").split(".")[-1])
@@ -247,3 +298,63 @@ class TestBuyPrecisionRetry:
         result = buy("BCDA_US_EQ", price=1.51)
         assert result.success is False
         assert mock_post.call_count == 2
+
+
+# ── RVOL normalization tests ──────────────────────────────────────────────────
+
+class TestRvol:
+    """Tests for market/price_check.py::compute_rvol / _expected_volume_fraction"""
+
+    def test_volume_fraction_monotonic(self):
+        from market.price_check import _expected_volume_fraction
+        fractions = [_expected_volume_fraction(m) for m in range(0, 391, 15)]
+        assert all(b >= a for a, b in zip(fractions, fractions[1:]))
+        assert fractions[-1] == 1.0
+
+    def test_volume_fraction_floor_at_open(self):
+        from market.price_check import _expected_volume_fraction
+        # Floored so RVOL can't divide by ~0 right at the open
+        assert _expected_volume_fraction(0) >= 0.04
+
+    def test_rvol_normal_day_is_one(self):
+        from market.price_check import compute_rvol, _expected_volume_fraction
+        # A stock trading exactly its typical pace shows RVOL ≈ 1.0 at any time
+        avg = 1_000_000
+        for minutes in (30, 120, 300):
+            cum = int(avg * _expected_volume_fraction(minutes))
+            assert compute_rvol(cum, avg, minutes) == pytest.approx(1.0, rel=1e-3)
+
+    def test_rvol_zero_avg_volume(self):
+        from market.price_check import compute_rvol
+        assert compute_rvol(100_000, 0, 60) == 0.0
+
+    def test_morning_volume_not_penalized(self):
+        from market.price_check import compute_rvol
+        # 25% of ADV traded by 10:30 is a NORMAL day (RVOL ≈ 1), not "low volume".
+        # The old full-day ratio would have called this 0.25× and rejected it.
+        rvol = compute_rvol(250_000, 1_000_000, 60)
+        assert rvol == pytest.approx(1.0, rel=1e-3)
+
+
+# ── Backtest cost model tests ─────────────────────────────────────────────────
+
+class TestBacktestCosts:
+    """Tests for backtest/backtest_db.py::_slippage_pct / _apply_costs"""
+
+    def test_slippage_tiers_decrease_with_liquidity(self):
+        from backtest.backtest_db import _slippage_pct
+        assert _slippage_pct(100_000_000) < _slippage_pct(10_000_000)
+        assert _slippage_pct(10_000_000) < _slippage_pct(2_000_000)
+        assert _slippage_pct(2_000_000) < _slippage_pct(500_000)
+
+    def test_unknown_liquidity_assumed_thin(self):
+        from backtest.backtest_db import _slippage_pct
+        assert _slippage_pct(None) >= 0.5
+
+    def test_costs_reduce_pnl(self):
+        from backtest.backtest_db import _apply_costs, FX_COST_RT_PCT
+        gross = 5.0
+        net = _apply_costs(gross, 100_000_000)
+        # Net = gross − FX RT − 2× slippage; always strictly below gross
+        assert net < gross
+        assert net == pytest.approx(gross - FX_COST_RT_PCT - 2 * 0.05)

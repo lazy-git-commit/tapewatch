@@ -3,6 +3,11 @@ backtest/backtest.py
 ────────────────────
 Replays the full trading strategy against historical news + price data.
 
+NOTE (v14): this Benzinga-replay tool still mirrors v12 entry logic and
+frictionless fills. For current-strategy analysis use backtest/backtest_db.py,
+which applies the v14 filter set, realistic next-bar entries, stop-priority
+fills, and the FX + slippage cost model.
+
 Mirrors the live v12 logic:
   1. Classify sentiment with Claude Haiku (batched, same as production)
      Includes all v12 prompt improvements: LOI neutral, recap neutral,

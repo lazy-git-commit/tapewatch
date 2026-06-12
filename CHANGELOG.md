@@ -7,6 +7,95 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v14 — 2026-06-12
+
+The "execution & risk" release. Root cause addressed: the realized win/loss
+asymmetry was inverted vs design (+5%/−2% designed; avg win £5.52 / avg loss
+£10.37 realized). Full algorithm documentation added at `docs/algorithm.md`.
+
+### Exit execution (the #1 P&L leak)
+- **Resting take-profit limit order** placed at the exchange immediately after
+  every buy (`tp_order_id` on trades). Zero polling latency, zero
+  spread-crossing on the profit side (old polled TP realized +3.1% on a +5% target).
+- **Bounded-slippage stop sells** — exits are LIMIT orders at trigger ×
+  (1 − `SELL_LIMIT_SLACK_PCT` 1%), with market fallback if the limit is
+  rejected and cancel-and-retry if unfilled. GOAI's −18.99% fill on a −2%
+  market stop cannot recur.
+- **Cancel/fill race handled** — resting TP is cancelled before any stop sell;
+  if it filled mid-cancel, the trade closes as take_profit, never double-sold.
+- **Monitor every 20s** (was 60s) — `MONITOR_INTERVAL_SECONDS`.
+- **EOD flatten** — all positions force-closed `EOD_FLATTEN_MINUTES` (10)
+  before the close. No overnight gap risk, ever.
+- **Market-hours guard in monitor** — never sells into a closed market.
+
+### Entry filter fixes
+- **Dead-cat and day-change vs PREVIOUS CLOSE** (Finnhub `pc`) — overnight
+  gap-downs now count; using today's open silently ignored them.
+- **Extended-move ceiling `MAX_DAY_MOVE_PCT=25%`** vs prev close — closes the
+  v13 hole where a stock up 80% on the day but flat in the last 5 min passed.
+- **ADV-based liquidity filter** — was today's volume × price, which EXPLODES
+  during a halt-spike and passed exactly the names it should block. Now
+  20-day ADV × price. Floor raised $1M → **$5M**.
+- **RVOL (time-of-day normalized volume)** replaces raw full-day volume ratio
+  — `MIN_RVOL=1.5` / `MAX_RVOL=20`. The old "1.5× full-day average" was
+  near-impossible at 10:00 and trivial at 15:45.
+- **Momentum baseline by timestamp** — thin stocks skip 1-min bars; `values[5]`
+  could silently be 20 min old. Bars now selected by actual age;
+  `MOMENTUM_LOOKBACK_MINUTES=5` (removes dead `MOMENTUM_WINDOW_MINUTES`).
+- **Spread proxy filter `MAX_SPREAD_PCT=3%`** — latest 1-min bar range/close.
+- **Penny floor raised $2 → $5** (`MIN_STOCK_PRICE`).
+- **`MIN_SENTIMENT_CONFIDENCE` finally enforced** — existed since v1, was
+  never checked anywhere.
+
+### Portfolio risk controls (new)
+- **Daily kill switch** `MAX_DAILY_LOSS_PCT=2%` — realized daily loss beyond
+  this stops all new entries until tomorrow. Fail-closed.
+- **`MAX_OPEN_POSITIONS=3`**, **`MAX_TRADES_PER_DAY=10`** — re-checked after
+  every fill (Jun 3: four correlated semi buys in 2 minutes).
+- **Risk-based, liquidity-capped sizing** — min(5% hard cap, equity×0.25%/stop,
+  0.5% of ADV dollars, cash).
+
+### Pre-market pipeline (new)
+- `premarket/scanner.py` — scores 08:00–09:30 ET news into a watchlist
+  (`premarket_candidates`), evaluates at the open with a gap gate
+  (`MIN_GAP_PCT=1%`–`MAX_GAP_PCT=20%`) plus full standard confirmation.
+  Deliberately does NOT pre-place orders (gap-and-crap). Same risk gates and
+  buy path as RTH.
+
+### Claude prompt & classifier
+- `temperature=0`; rubric moved to cached system prompt (~90% input-cost cut);
+  **forced tool use** replaces JSON string parsing and truncation recovery.
+- Rubric restructured as a decision tree with few-shot examples.
+- New fields per article: **`catalyst_type`** (14-class taxonomy) and
+  **`already_moved`**. Code gates trading on `TRADEABLE_CATALYSTS` — the model
+  classifies, the system decides.
+- **Offerings/dilution → negative** (small caps sell offerings into spikes).
+
+### Eval loop (new)
+- **Every classification persisted** to `sentiment_scores`; nightly job
+  (`analysis/forward_returns.py`, 22:30 UTC) fills 5/15/60-min forward
+  returns via yfinance. Prompt changes are now measurable (queries in
+  docs/algorithm.md §9).
+
+### Reliability
+- **Retry queue** for signals hit by transient data outages — "will retry next
+  cycle" used to be impossible (freshness filter ate the article; SPCX Jun 12).
+  Scored signals now park for up to 5 min and bypass the fetch path.
+- **Symbol-map startup retry** (30s backoff on 429) + daily 08:00 UTC rebuild.
+- **Twelvedata credit metering** — WARNING at 80% of the 800/day budget.
+- **Heartbeat table** per job + Grafana staleness alert query.
+- **Deploy pipeline**: pytest gate before deploy; on-VM `cfg.validate()`
+  BEFORE service restart; post-restart health check that fails the workflow
+  on tracebacks. (All three would have caught the 2026-06-11 18-hour outage.)
+
+### Backtest realism
+- Entry at next-bar open (production is 10–90s late by construction).
+- Same-bar stop-priority fills (was target-first — inflated win rate).
+- Cost model: 0.30% FX round trip + liquidity-tiered slippage per side.
+- RVOL via the same production helper.
+
+---
+
 ## v13 — 2026-06-11
 
 ### Changes

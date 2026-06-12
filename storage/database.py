@@ -134,6 +134,65 @@ def init_db() -> None:
                     snapshot_at TEXT    NOT NULL
                 )
             """)
+            # ── v14 migrations ────────────────────────────────────────────────
+            # tp_order_id: the resting take-profit LIMIT order placed right
+            # after the buy fills. The monitor checks its status each cycle;
+            # it must be cancelled before any stop-loss/time-stop sell.
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS tp_order_id TEXT
+            """)
+            # catalyst_type on signals: which catalyst class Claude assigned.
+            cur.execute("""
+                ALTER TABLE news_signals
+                ADD COLUMN IF NOT EXISTS catalyst_type TEXT
+            """)
+            # Eval-loop table: EVERY Claude classification (positive, neutral,
+            # negative) is stored here; a nightly job fills in forward returns
+            # so prompt changes can be measured, not guessed.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sentiment_scores (
+                    id             SERIAL PRIMARY KEY,
+                    article_id     TEXT,
+                    ticker         TEXT    NOT NULL,
+                    headline       TEXT,
+                    sentiment      TEXT    NOT NULL,
+                    confidence     REAL    NOT NULL,
+                    catalyst_type  TEXT,
+                    already_moved  INTEGER NOT NULL DEFAULT 0,
+                    published_at   TEXT,
+                    scored_at      TEXT    NOT NULL,
+                    fwd_return_5m  REAL,
+                    fwd_return_15m REAL,
+                    fwd_return_60m REAL,
+                    returns_computed_at TEXT
+                )
+            """)
+            # Pre-market watchlist: news scored before the open, evaluated at
+            # open + open_block with gap/momentum confirmation. status:
+            # pending → traded | rejected | expired.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS premarket_candidates (
+                    id            SERIAL PRIMARY KEY,
+                    article_id    TEXT,
+                    ticker        TEXT    NOT NULL,
+                    headline      TEXT,
+                    catalyst_type TEXT,
+                    confidence    REAL,
+                    published_at  TEXT,
+                    created_at    TEXT    NOT NULL,
+                    status        TEXT    NOT NULL DEFAULT 'pending',
+                    eval_note     TEXT
+                )
+            """)
+            # Liveness heartbeat: one row per job, updated every cycle.
+            # Grafana alerts when last_beat_at goes stale (see docs/algorithm.md).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS heartbeat (
+                    job          TEXT PRIMARY KEY,
+                    last_beat_at TEXT NOT NULL
+                )
+            """)
     logger.info("Database initialised at %s", cfg.db_url.split("@")[-1])
 
 
@@ -159,6 +218,7 @@ def save_signal(
     article_id: str | None = None,
     published_at: str | None = None,
     fetched_at: str | None = None,
+    catalyst_type: str | None = None,
 ) -> int:
     """Insert a news signal. Returns the new row id."""
     now = _now_london()
@@ -167,11 +227,11 @@ def save_signal(
             cur.execute(
                 """INSERT INTO news_signals
                    (article_id, ticker, headline, source, sentiment, confidence,
-                    published_at, fetched_at, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    published_at, fetched_at, created_at, catalyst_type)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (article_id, ticker, headline, source, sentiment, confidence,
-                 published_at, fetched_at or now, now),
+                 published_at, fetched_at or now, now, catalyst_type),
             )
             return cur.fetchone()["id"]
 
@@ -220,7 +280,9 @@ def open_trade(
                  buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp),
             )
             row_id = cur.fetchone()["id"]
-            logger.info("Trade opened: %s × %.4f @ £%.4f", ticker, quantity, buy_price)
+            # buy_price is in USD (T212 quotes US equities in USD); GBP cash
+            # impact is tracked separately in buy_net_gbp.
+            logger.info("Trade opened: %s × %.4f @ $%.4f", ticker, quantity, buy_price)
             return row_id
 
 
@@ -293,6 +355,181 @@ def was_recently_traded(ticker: str, hours: int = 24) -> bool:
                 (ticker, cfg.trading_mode, hours),
             )
             return cur.fetchone() is not None
+
+
+# ── Risk-control queries (v14) ────────────────────────────────────────────────
+# All three back the portfolio-level gates in main.py: max open positions,
+# max trades per day, and the daily loss kill switch.
+
+def count_open_trades() -> int:
+    """Number of currently open positions in the active trading mode."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM trades WHERE status = 'open' AND mode = %s",
+                (cfg.trading_mode,),
+            )
+            return int(cur.fetchone()["n"])
+
+
+def count_trades_today() -> int:
+    """Number of positions opened today (London calendar day, matching buy_time storage)."""
+    today_prefix = datetime.now(_LONDON).strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM trades WHERE mode = %s AND buy_time LIKE %s",
+                (cfg.trading_mode, f"{today_prefix}%"),
+            )
+            return int(cur.fetchone()["n"])
+
+
+def get_today_realized_pnl() -> float:
+    """
+    Sum of realized P&L (GBP) for trades CLOSED today. Backs the daily kill
+    switch: once this drops below −(max_daily_loss_pct% of portfolio), no new
+    positions are opened until tomorrow. Realized-only by design — unrealized
+    swings on open positions shouldn't toggle the switch on and off.
+    """
+    today_prefix = datetime.now(_LONDON).strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COALESCE(SUM(profit_loss), 0) AS pnl FROM trades
+                   WHERE mode = %s AND status = 'closed' AND sell_time LIKE %s""",
+                (cfg.trading_mode, f"{today_prefix}%"),
+            )
+            return float(cur.fetchone()["pnl"])
+
+
+def set_tp_order_id(trade_id: int, tp_order_id: str | None) -> None:
+    """Attach (or clear) the resting take-profit limit order id on a trade."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trades SET tp_order_id = %s WHERE id = %s",
+                (tp_order_id, trade_id),
+            )
+
+
+# ── Sentiment eval loop (v14) ─────────────────────────────────────────────────
+
+def save_sentiment_scores(rows: list[dict]) -> None:
+    """
+    Persist a batch of Claude classifications (one row per article+ticker).
+    Called for EVERY scored article regardless of sentiment — this is the
+    dataset the nightly forward-returns job and prompt evaluation run on.
+    """
+    if not rows:
+        return
+    now = _now_london()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO sentiment_scores
+                   (article_id, ticker, headline, sentiment, confidence,
+                    catalyst_type, already_moved, published_at, scored_at)
+                   VALUES (%(article_id)s, %(ticker)s, %(headline)s, %(sentiment)s,
+                           %(confidence)s, %(catalyst_type)s, %(already_moved)s,
+                           %(published_at)s, %(scored_at)s)""",
+                [{**r, "already_moved": int(r.get("already_moved", False)), "scored_at": now}
+                 for r in rows],
+            )
+
+
+def get_scores_missing_returns(limit: int = 500) -> list[dict]:
+    """Scored articles that don't yet have forward returns computed."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT * FROM sentiment_scores
+                   WHERE returns_computed_at IS NULL
+                   ORDER BY id ASC LIMIT %s""",
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def update_forward_returns(score_id: int, r5: float | None, r15: float | None, r60: float | None) -> None:
+    """Fill in the 5/15/60-min forward returns for one scored article."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE sentiment_scores
+                   SET fwd_return_5m = %s, fwd_return_15m = %s, fwd_return_60m = %s,
+                       returns_computed_at = %s
+                   WHERE id = %s""",
+                (r5, r15, r60, _now_london(), score_id),
+            )
+
+
+# ── Pre-market candidates (v14) ───────────────────────────────────────────────
+
+def is_premarket_candidate_seen(article_id: str, ticker: str) -> bool:
+    """Dedup predicate for the pre-market scanner (mirrors is_article_seen)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM premarket_candidates WHERE article_id = %s AND ticker = %s LIMIT 1",
+                (article_id, ticker),
+            )
+            return cur.fetchone() is not None
+
+
+def save_premarket_candidate(
+    article_id: str, ticker: str, headline: str,
+    catalyst_type: str, confidence: float, published_at: str,
+) -> int:
+    """Add a scored pre-market article to the at-open watchlist."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO premarket_candidates
+                   (article_id, ticker, headline, catalyst_type, confidence,
+                    published_at, created_at, status)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
+                   RETURNING id""",
+                (article_id, ticker, headline, catalyst_type, confidence,
+                 published_at, _now_london()),
+            )
+            return cur.fetchone()["id"]
+
+
+def get_pending_premarket_candidates() -> list[dict]:
+    """All watchlist entries awaiting at-open evaluation."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM premarket_candidates WHERE status = 'pending' ORDER BY confidence DESC"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def update_premarket_candidate(candidate_id: int, status: str, eval_note: str | None = None) -> None:
+    """Mark a candidate traded / rejected / expired after at-open evaluation."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE premarket_candidates SET status = %s, eval_note = %s WHERE id = %s",
+                (status, eval_note, candidate_id),
+            )
+
+
+# ── Heartbeat (v14) ───────────────────────────────────────────────────────────
+
+def touch_heartbeat(job: str) -> None:
+    """
+    Record liveness for a scheduler job. The 2026-06-11 outage (18h crash
+    loop) went unnoticed because nothing watched the process — Grafana now
+    alerts when this timestamp goes stale (query in docs/algorithm.md).
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO heartbeat (job, last_beat_at) VALUES (%s, %s)
+                   ON CONFLICT (job) DO UPDATE SET last_beat_at = EXCLUDED.last_beat_at""",
+                (job, _now_london()),
+            )
 
 
 # ── Portfolio snapshots ───────────────────────────────────────────────────────
