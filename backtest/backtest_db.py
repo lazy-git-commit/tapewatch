@@ -1,11 +1,19 @@
 """
 backtest/backtest_db.py
 ────────────────────────
-Replays v12 trading logic against signals already stored in the production DB.
+Replays the CURRENT (v15) trading logic against signals already stored in the
+production DB.
 
 Unlike backtest.py (which re-fetches Benzinga articles), this module reads the
 news_signals table for a given date range and replays every positive signal
-through the v12 price-confirmation and simulation logic using yfinance price data.
+through run_v15_check() — which mirrors market/price_check.py gate-for-gate
+(opening block, penny, spread, dead-cat & extended-move vs prev close, ADV
+liquidity, dead-tape momentum floor, momentum ceiling, RVOL band, VWAP) — using
+yfinance price data.
+
+PARITY IS THE WHOLE POINT: if run_v15_check drifts from confirm_price_signal,
+the backtest lies. The constants are sourced from cfg and a test
+(TestBacktestParity) asserts they match production.
 
 This is the right tool for retroactive analysis — it doesn't need the Benzinga
 API key (articles are already in the DB) and uses free yfinance for prices.
@@ -36,19 +44,25 @@ logging.basicConfig(level=logging.WARNING)
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-# ── v14 strategy constants (mirrors config/settings.py defaults) ──────────────
+# ── v15 strategy constants (mirrors config/settings.py defaults) ──────────────
+# CARDINAL RULE: this list and run_v15_check() must stay in lockstep with
+# market/price_check.py. A backtest that tests different logic than production
+# is worse than no backtest — it manufactures false confidence.
 TAKE_PROFIT_PCT      = cfg.take_profit_pct           # 5.0
 STOP_LOSS_PCT        = cfg.stop_loss_pct             # 2.0
 TIME_STOP_MINUTES    = cfg.time_stop_minutes         # 60
-MIN_PRICE_MOVE_PCT   = cfg.min_price_move_pct        # 1.5
+MIN_PRICE_MOVE_PCT   = cfg.min_price_move_pct        # 0.2  (v15: dead-tape floor only)
 MAX_PRICE_MOVE_PCT   = cfg.max_price_move_pct        # 15.0 (halt-article ceiling)
-MIN_RVOL             = cfg.min_rvol                  # 1.5  (time-normalized in v14)
+MIN_RVOL             = cfg.min_rvol                  # 1.5  (time-normalized)
 MAX_RVOL             = cfg.max_rvol                  # 20.0 (halt-pattern ceiling)
 MIN_STOCK_PRICE      = cfg.min_stock_price           # 5.0  (penny-stock filter)
+MAX_SPREAD_PCT       = cfg.max_spread_pct            # 3.0  (v15 parity)
 OPEN_BLOCK_MINUTES   = cfg.open_block_minutes        # 5
 MIN_DAILY_DOLLAR_VOL = cfg.min_daily_dollar_volume   # 5_000_000 (ADV-based)
 MAX_DAY_DROP_PCT     = cfg.max_day_drop_pct          # 3.0
 MAX_DAY_MOVE_PCT     = cfg.max_day_move_pct          # 25.0 (extended-move ceiling)
+REQUIRE_VWAP_CONFIRM = cfg.require_vwap_confirmation # True (v15 size-neutral gate)
+VWAP_TOLERANCE_PCT   = cfg.vwap_tolerance_pct        # 0.1
 MOMENTUM_BARS_BACK   = 6   # ~5 min ago
 
 # ── Cost model (v14) ──────────────────────────────────────────────────────────
@@ -258,6 +272,31 @@ def _price_n_bars_before(bars: pd.DataFrame, ts: datetime, n: int) -> float | No
     return float(eligible["Close"].iloc[-(n + 1)])
 
 
+def _session_vwap_at(bars: pd.DataFrame, ts: datetime) -> float | None:
+    """
+    Session VWAP up to (and including) the bar at `ts`, computed from the
+    intraday DataFrame we already hold. Mirrors production's
+    twelvedata_bars.get_session_vwap():
+        VWAP = Σ(typical × volume) / Σ(volume),  typical = (H+L+C)/3
+    accumulated from the session open. Returns None if no volume yet.
+
+    This keeps the BACKTEST's VWAP gate identical in spirit to production —
+    the whole point of v15 backtest parity. (Production fetches VWAP from
+    Twelvedata; here we compute the same quantity from the yfinance bars.)
+    """
+    if bars is None or bars.empty:
+        return None
+    session = bars[bars.index <= ts]
+    if session.empty:
+        return None
+    typical = (session["High"] + session["Low"] + session["Close"]) / 3.0
+    vol = session["Volume"]
+    total_vol = float(vol.sum())
+    if total_vol <= 0:
+        return None
+    return float((typical * vol).sum() / total_vol)
+
+
 def _entry_fill(bars: pd.DataFrame, signal_time: datetime) -> tuple:
     """
     Realistic entry: production is ~10–90s late by construction (poll cadence
@@ -299,16 +338,25 @@ def _simulate_trade(bars: pd.DataFrame, entry_time: datetime, entry_price: float
     return None, None, "still_open", None
 
 
-# ── v12 price confirmation logic ──────────────────────────────────────────────
+# ── v15 price confirmation logic (PARITY with market/price_check.py) ──────────
 
-def run_v12_check(signal: SignalRecord) -> BacktestResult:
-    """Apply v12 price confirmation logic to a signal. Returns BacktestResult."""
+def run_v15_check(signal: SignalRecord) -> BacktestResult:
+    """
+    Apply v15 price-confirmation logic to a historical signal.
+
+    Filter order and semantics MIRROR confirm_price_signal() exactly:
+      1 opening_block  2 penny_stock  3 wide_spread  4 dead_cat (vs prev close)
+      5 extended_move (vs prev close)  6 illiquid (ADV$)  7 low_momentum
+      (dead-tape floor)  8 high_momentum  9 low/high_volume (RVOL)
+      10 below_vwap (size-neutral accumulation test)
+    Any drift between this and production makes the backtest lie, so every
+    branch is annotated with the production step it corresponds to.
+    """
     yf_ticker = signal.ticker.split("_")[0]
     pub = signal.published_at
     date = pub.replace(hour=0, minute=0, second=0, microsecond=0)
     market_open_utc = date.replace(hour=13, minute=30, second=0)
 
-    # Production outcome
     if signal.acted_on:
         prod_outcome = "traded"
     elif signal.rejection_code:
@@ -316,185 +364,156 @@ def run_v12_check(signal: SignalRecord) -> BacktestResult:
     else:
         prod_outcome = "rejected:unknown"
 
-    bars = _get_intraday(yf_ticker, date)
-    if bars is None:
+    def _result(v15_outcome, *, entry=None, mom=None, vr=None, ddv=None, daymove=None,
+                exit_reason=None, exit_price=None, pnl=None):
+        """Compact BacktestResult builder — keeps the 10 branches readable."""
         return BacktestResult(
             signal_id=signal.signal_id, ticker=signal.ticker,
             headline=signal.headline, published_at=pub,
-            entry_price=None, momentum_pct=None, volume_ratio=None,
-            daily_dollar_volume=None, day_move_pct=None,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome, v12_outcome="no_data",
+            entry_price=entry, momentum_pct=mom, volume_ratio=vr,
+            daily_dollar_volume=ddv, day_move_pct=daymove,
+            exit_reason=exit_reason, exit_price=exit_price, pnl_pct=pnl,
+            production_outcome=prod_outcome, v12_outcome=v15_outcome,
         )
+
+    bars = _get_intraday(yf_ticker, date)
+    if bars is None:
+        return _result("no_data")
 
     minutes_since_open = (pub - market_open_utc).total_seconds() / 60
 
-    # Opening block
+    # ── 1. Opening block ──────────────────────────────────────────────────────
     if minutes_since_open < OPEN_BLOCK_MINUTES:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=None, momentum_pct=None, volume_ratio=None,
-            daily_dollar_volume=None, day_move_pct=None,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome,
-            v12_outcome=f"rejected:opening_block ({minutes_since_open:.1f} min)",
-        )
+        return _result(f"rejected:opening_block ({minutes_since_open:.1f} min)")
 
     price_now = _price_at(bars, pub)
     if price_now is None:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=None, momentum_pct=None, volume_ratio=None,
-            daily_dollar_volume=None, day_move_pct=None,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome, v12_outcome="no_data",
-        )
+        return _result("no_data")
 
-    # Penny stock filter
+    # ── 2. Penny stock floor ──────────────────────────────────────────────────
     if price_now < MIN_STOCK_PRICE:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=price_now, momentum_pct=None, volume_ratio=None,
-            daily_dollar_volume=None, day_move_pct=None,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome,
-            v12_outcome=f"rejected:penny_stock (${price_now:.4f})",
-        )
+        return _result(f"rejected:penny_stock (${price_now:.4f})", entry=price_now)
 
-    # Momentum baseline (~5 min back)
+    # ── 3. Spread proxy (v15 parity): latest-bar range / close ────────────────
+    bar_at = bars[bars.index <= pub]
+    if not bar_at.empty:
+        last = bar_at.iloc[-1]
+        spread_proxy_pct = (
+            (float(last["High"]) - float(last["Low"])) / price_now * 100
+            if price_now > 0 else 0.0
+        )
+        if spread_proxy_pct > MAX_SPREAD_PCT:
+            return _result(
+                f"rejected:wide_spread ({spread_proxy_pct:.2f}%)", entry=price_now
+            )
+
+    # ── Momentum baseline (~5 min back, with degenerate-guard parity) ─────────
     if minutes_since_open < 15:
-        open_bar = bars.iloc[0] if not bars.empty else None
-        baseline = float(open_bar["Close"]) if open_bar is not None else price_now
+        baseline = float(bars.iloc[0]["Close"]) if not bars.empty else None
     else:
         baseline = _price_n_bars_before(bars, pub, MOMENTUM_BARS_BACK - 1)
-        if baseline is None:
-            baseline = price_now
-
+    # If baseline is missing or equals current price (degenerate → false 0%),
+    # treat momentum as 0 — same conservative stance as production's guard.
     momentum_pct = (price_now - baseline) / baseline * 100 if baseline else 0.0
 
-    # Day move
-    open_price = float(bars.iloc[0]["Open"]) if not bars.empty else price_now
-    day_move_pct = (price_now - open_price) / open_price * 100 if open_price else 0.0
-
-    # Dead-cat
-    if day_move_pct < -MAX_DAY_DROP_PCT:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=None,
-            daily_dollar_volume=None, day_move_pct=day_move_pct,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome,
-            v12_outcome=f"rejected:dead_cat ({day_move_pct:.1f}%)",
-        )
-
-    # Extended-move ceiling — vs prev close (gap included). Uses the cached
-    # daily history's last close as prev close, mirroring production's
-    # max_day_move_pct check.
+    # ── Volume + prev close (fetched here, BEFORE dead-cat, matching prod) ────
     cum_vol, avg_vol, daily_dollar_volume = _get_volume_stats_yf(yf_ticker, date, bars, pub)
     prev_close = _vol_cache.get(f"{yf_ticker}_{date.strftime('%Y-%m-%d')}", (0, 0))[1]
+    # day_change is vs PREV CLOSE (gap included) — the production metric for
+    # both dead_cat and extended_move. day_move (vs open) is kept only for
+    # reporting/the result row.
+    open_price = float(bars.iloc[0]["Open"]) if not bars.empty else price_now
+    day_move_pct = (price_now - open_price) / open_price * 100 if open_price else 0.0
     day_change_pct = (price_now - prev_close) / prev_close * 100 if prev_close else None
-    if day_change_pct is not None and day_change_pct > MAX_DAY_MOVE_PCT:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=None,
-            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome,
-            v12_outcome=f"rejected:extended_move ({day_change_pct:+.1f}% vs prev close)",
+
+    # ── 4. Dead-cat guard (vs prev close; fall back to open like production) ──
+    drop_metric = day_change_pct if day_change_pct is not None else day_move_pct
+    if drop_metric < -MAX_DAY_DROP_PCT:
+        return _result(
+            f"rejected:dead_cat ({drop_metric:.1f}%)",
+            entry=price_now, mom=momentum_pct, ddv=daily_dollar_volume, daymove=day_move_pct,
         )
 
-    # RVOL — time-of-day normalized, same helper production uses.
+    # ── 5. Extended-move ceiling (vs prev close) ──────────────────────────────
+    if day_change_pct is not None and day_change_pct > MAX_DAY_MOVE_PCT:
+        return _result(
+            f"rejected:extended_move ({day_change_pct:+.1f}% vs prev close)",
+            entry=price_now, mom=momentum_pct, ddv=daily_dollar_volume, daymove=day_move_pct,
+        )
+
+    # ── 6. Liquidity floor (ADV$) ─────────────────────────────────────────────
+    if daily_dollar_volume is not None and daily_dollar_volume < MIN_DAILY_DOLLAR_VOL:
+        return _result(
+            f"rejected:illiquid (DDV=${daily_dollar_volume:,.0f})",
+            entry=price_now, mom=momentum_pct, ddv=daily_dollar_volume, daymove=day_move_pct,
+        )
+
     volume_ratio = compute_rvol(int(cum_vol), int(avg_vol), minutes_since_open)
 
-    if daily_dollar_volume is not None and daily_dollar_volume < MIN_DAILY_DOLLAR_VOL:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
-            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome,
-            v12_outcome=f"rejected:illiquid (DDV=${daily_dollar_volume:,.0f})",
-        )
-
-    # Momentum floor filter
+    # ── 7. Momentum noise floor (v15: dead-tape only) ─────────────────────────
     if momentum_pct < MIN_PRICE_MOVE_PCT:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
-            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome,
-            v12_outcome=f"rejected:low_momentum ({momentum_pct:+.2f}%)",
+        return _result(
+            f"rejected:low_momentum ({momentum_pct:+.2f}%)",
+            entry=price_now, mom=momentum_pct, vr=volume_ratio,
+            ddv=daily_dollar_volume, daymove=day_move_pct,
         )
 
-    # Momentum ceiling filter — halt-article top guard
+    # ── 8. Momentum ceiling (before VWAP, matching prod ordering) ─────────────
     if momentum_pct > MAX_PRICE_MOVE_PCT:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
-            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome,
-            v12_outcome=f"rejected:high_momentum ({momentum_pct:+.2f}%)",
+        return _result(
+            f"rejected:high_momentum ({momentum_pct:+.2f}%)",
+            entry=price_now, mom=momentum_pct, vr=volume_ratio,
+            ddv=daily_dollar_volume, daymove=day_move_pct,
         )
 
-    # RVOL band — time-normalized floor and halt-pattern ceiling
+    # ── 9. RVOL band ──────────────────────────────────────────────────────────
     if avg_vol > 0 and volume_ratio < MIN_RVOL:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
-            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome,
-            v12_outcome=f"rejected:low_volume (RVOL {volume_ratio:.2f} < {MIN_RVOL})",
+        return _result(
+            f"rejected:low_volume (RVOL {volume_ratio:.2f} < {MIN_RVOL})",
+            entry=price_now, mom=momentum_pct, vr=volume_ratio,
+            ddv=daily_dollar_volume, daymove=day_move_pct,
         )
     if avg_vol > 0 and volume_ratio > MAX_RVOL:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
-            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome,
-            v12_outcome=f"rejected:high_volume (RVOL {volume_ratio:.1f})",
+        return _result(
+            f"rejected:high_volume (RVOL {volume_ratio:.1f})",
+            entry=price_now, mom=momentum_pct, vr=volume_ratio,
+            ddv=daily_dollar_volume, daymove=day_move_pct,
         )
 
-    # All filters passed — realistic entry (next-bar open) + cost model
+    # ── 10. VWAP confirmation (size-neutral accumulation test) ────────────────
+    if REQUIRE_VWAP_CONFIRM:
+        vwap = _session_vwap_at(bars, pub)
+        if vwap is not None and vwap > 0:
+            if price_now < vwap * (1 - VWAP_TOLERANCE_PCT / 100):
+                return _result(
+                    f"rejected:below_vwap (px ${price_now:.2f} < vwap ${vwap:.2f})",
+                    entry=price_now, mom=momentum_pct, vr=volume_ratio,
+                    ddv=daily_dollar_volume, daymove=day_move_pct,
+                )
+        # vwap None (no volume) → fall through, same as production.
+
+    # ── All gates passed — realistic entry (next-bar open) + cost model ───────
     entry_time, entry_price = _entry_fill(bars, pub)
     if entry_time is None:
-        return BacktestResult(
-            signal_id=signal.signal_id, ticker=signal.ticker,
-            headline=signal.headline, published_at=pub,
-            entry_price=price_now, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
-            daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
-            exit_reason=None, exit_price=None, pnl_pct=None,
-            production_outcome=prod_outcome, v12_outcome="no_data",
+        return _result(
+            "no_data", entry=price_now, mom=momentum_pct, vr=volume_ratio,
+            ddv=daily_dollar_volume, daymove=day_move_pct,
         )
 
     exit_time, exit_price, exit_reason, gross_pnl_pct = _simulate_trade(bars, entry_time, entry_price)
-    # Net of FX round trip + liquidity-tiered slippage on both sides.
     pnl_pct = (
         _apply_costs(gross_pnl_pct, daily_dollar_volume)
         if gross_pnl_pct is not None else None
     )
-
-    return BacktestResult(
-        signal_id=signal.signal_id, ticker=signal.ticker,
-        headline=signal.headline, published_at=pub,
-        entry_price=entry_price, momentum_pct=momentum_pct, volume_ratio=volume_ratio,
-        daily_dollar_volume=daily_dollar_volume, day_move_pct=day_move_pct,
-        exit_reason=exit_reason, exit_price=exit_price, pnl_pct=pnl_pct,
-        production_outcome=prod_outcome, v12_outcome="traded",
+    return _result(
+        "traded", entry=entry_price, mom=momentum_pct, vr=volume_ratio,
+        ddv=daily_dollar_volume, daymove=day_move_pct,
+        exit_reason=exit_reason, exit_price=exit_price, pnl=pnl_pct,
     )
+
+
+# Back-compat alias (callers / older invocations may reference the old name).
+run_v12_check = run_v15_check
 
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
@@ -507,8 +526,8 @@ def print_day_results(results: list[BacktestResult], date_str: str) -> None:
     print(f"  {date_str}")
     print(f"{'═' * 72}")
     print(f"  Signals in DB       : {len(results)}")
-    print(f"  v12 rejected        : {len(rejected)}")
-    print(f"  v12 trades          : {len(traded)}")
+    print(f"  v15 rejected        : {len(rejected)}")
+    print(f"  v15 trades          : {len(traded)}")
 
     if traded:
         wins   = [r for r in traded if (r.pnl_pct or 0) > 0]
@@ -524,7 +543,7 @@ def print_day_results(results: list[BacktestResult], date_str: str) -> None:
         code = r.v12_outcome.split(":")[1].split(" ")[0] if ":" in r.v12_outcome else r.v12_outcome
         codes[code] += 1
     if codes:
-        print(f"  v12 rejection codes : {dict(codes)}")
+        print(f"  v15 rejection codes : {dict(codes)}")
 
     # Production vs v12 comparison
     prod_traded = [r for r in results if r.production_outcome == "traded"]
@@ -532,16 +551,16 @@ def print_day_results(results: list[BacktestResult], date_str: str) -> None:
     v12_new_trades = [r for r in traded if r.production_outcome != "traded"]
 
     if prod_traded or traded:
-        print(f"\n  Production/v12 diff:")
+        print(f"\n  Production/v15 diff:")
         print(f"    Production traded                  : {len(prod_traded)}")
-        print(f"    v12 traded                         : {len(traded)}")
+        print(f"    v15 traded                         : {len(traded)}")
         if v12_would_block_prod:
-            print(f"    v12 would have BLOCKED (saved loss): {len(v12_would_block_prod)}")
+            print(f"    v15 would have BLOCKED (saved loss): {len(v12_would_block_prod)}")
             for r in v12_would_block_prod:
                 print(f"      ✗ {r.ticker:<14} {r.published_at.strftime('%H:%MZ')}  blocked: {r.v12_outcome}")
                 print(f"        {r.headline[:66]}")
         if v12_new_trades:
-            print(f"    v12 NEW trades not in production   : {len(v12_new_trades)}")
+            print(f"    v15 NEW trades not in production   : {len(v12_new_trades)}")
             for r in v12_new_trades:
                 pnl = f"{r.pnl_pct:+.2f}%" if r.pnl_pct is not None else "open"
                 print(f"      {'✓' if (r.pnl_pct or 0) > 0 else '✗'} {r.ticker:<14} "
@@ -553,7 +572,7 @@ def print_day_results(results: list[BacktestResult], date_str: str) -> None:
     # Full v12 trade log
     if traded:
         print(f"\n  {'─' * 68}")
-        print(f"  V12 EXECUTED TRADES")
+        print(f"  V15 EXECUTED TRADES")
         print(f"  {'─' * 68}")
         for r in sorted(traded, key=lambda x: x.published_at):
             pnl  = f"{r.pnl_pct:+.2f}%" if r.pnl_pct is not None else "open"
@@ -570,7 +589,7 @@ def print_day_results(results: list[BacktestResult], date_str: str) -> None:
 
 def print_weekly_summary(all_results: dict[str, list[BacktestResult]]) -> None:
     print(f"\n{'#' * 72}")
-    print("  WEEKLY SUMMARY — v12 logic replay")
+    print("  WEEKLY SUMMARY — v15 logic replay")
     print(f"{'#' * 72}")
     all_traded: list[BacktestResult] = []
     all_prod_traded: list[BacktestResult] = []
@@ -586,13 +605,13 @@ def print_weekly_summary(all_results: dict[str, list[BacktestResult]]) -> None:
             win_rate = len(wins) / len(traded) * 100
             print(
                 f"  {date_str}  signals={len(results):>3}  "
-                f"v12_trades={len(traded):>2}  wr={win_rate:.0f}%  avg={avg_pnl:+.2f}%  "
+                f"v15_trades={len(traded):>2}  wr={win_rate:.0f}%  avg={avg_pnl:+.2f}%  "
                 f"prod_trades={len(prod_t)}"
             )
         else:
             print(
                 f"  {date_str}  signals={len(results):>3}  "
-                f"v12_trades=0   prod_trades={len(prod_t)}"
+                f"v15_trades=0   prod_trades={len(prod_t)}"
             )
         all_traded.extend(traded)
         all_prod_traded.extend(prod_t)
@@ -605,7 +624,7 @@ def print_weekly_summary(all_results: dict[str, list[BacktestResult]]) -> None:
         avg_pnl   = total_pnl / len(all_traded)
         win_rate  = len(wins) / len(all_traded) * 100
 
-        print(f"  V12 TOTAL  trades={len(all_traded)}  wins={len(wins)}  losses={len(losses)}")
+        print(f"  V15 TOTAL  trades={len(all_traded)}  wins={len(wins)}  losses={len(losses)}")
         print(f"             win_rate={win_rate:.0f}%  avg_pnl={avg_pnl:+.2f}%")
         print(f"             best={max(r.pnl_pct for r in all_traded if r.pnl_pct):+.2f}%  "
               f"worst={min(r.pnl_pct for r in all_traded if r.pnl_pct):+.2f}%")
@@ -617,14 +636,14 @@ def print_weekly_summary(all_results: dict[str, list[BacktestResult]]) -> None:
             avg = sum(pnl_for) / len(pnl_for) if pnl_for else 0
             print(f"    {reason:<20} {count:>3}  avg={avg:+.2f}%")
     else:
-        print("  V12 TOTAL  trades=0")
+        print("  V15 TOTAL  trades=0")
 
     # Production comparison
     prod_wins = [r for r in all_prod_traded if r.production_outcome == "traded"]
     v12_saved = [r for r in all_prod_traded if r.v12_outcome != "traded"]
-    print(f"\n  PRODUCTION vs V12:")
+    print(f"\n  PRODUCTION vs V15:")
     print(f"    Production executed          : {len(all_prod_traded)} trades")
-    print(f"    v12 would have blocked       : {len(v12_saved)} production trades")
+    print(f"    v15 would have blocked       : {len(v12_saved)} production trades")
     if v12_saved:
         for r in v12_saved:
             print(f"      {r.ticker:<14} {r.published_at.strftime('%Y-%m-%d %H:%MZ')}  blocked: {r.v12_outcome}")
@@ -646,7 +665,7 @@ def _trading_week(ref: datetime) -> tuple[str, str]:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Replay v12 strategy against production DB signals using yfinance prices"
+        description="Replay v15 strategy against production DB signals using yfinance prices"
     )
     parser.add_argument("--date", default=None, help="Single date (YYYY-MM-DD)")
     parser.add_argument("--since", default=None, help="Start date inclusive (YYYY-MM-DD)")
@@ -664,13 +683,15 @@ if __name__ == "__main__":
     else:
         start, end = _trading_week(now)
 
-    print(f"\nDB-Replay Backtest (v14): {start} → {end}")
+    print(f"\nDB-Replay Backtest (v15): {start} → {end}")
     print(f"  Strategy: TP={TAKE_PROFIT_PCT}% | SL={STOP_LOSS_PCT}% | time-stop={TIME_STOP_MINUTES}min")
     print(f"  Filters:  open-block={OPEN_BLOCK_MINUTES}min | "
-          f"momentum {MIN_PRICE_MOVE_PCT}%–{MAX_PRICE_MOVE_PCT}% | "
+          f"momentum(dead-tape) {MIN_PRICE_MOVE_PCT}%–{MAX_PRICE_MOVE_PCT}% | "
           f"RVOL {MIN_RVOL}–{MAX_RVOL:.0f} | "
           f"ADV$>={MIN_DAILY_DOLLAR_VOL/1e6:.0f}M | "
-          f"price>=${MIN_STOCK_PRICE:.2f} | day<=+{MAX_DAY_MOVE_PCT:.0f}% | 24h cooldown")
+          f"price>=${MIN_STOCK_PRICE:.2f} | spread<={MAX_SPREAD_PCT}% | "
+          f"day<=+{MAX_DAY_MOVE_PCT:.0f}% | "
+          f"VWAP={'on' if REQUIRE_VWAP_CONFIRM else 'off'} | 24h cooldown")
     print(f"  Costs:    FX {FX_COST_RT_PCT}% RT | tiered slippage | entry at next-bar open | SL-priority fills")
     print(f"  DB: {cfg.db_url.split('@')[-1]}")
 
@@ -723,7 +744,7 @@ if __name__ == "__main__":
                         v12_outcome=f"rejected:cooldown ({hours_since:.1f}h since last trade)",
                     ))
                     continue
-            result = run_v12_check(s)
+            result = run_v15_check(s)
             if result.v12_outcome == "traded":
                 ticker_last_traded[s.ticker] = s.published_at
             day_results.append(result)

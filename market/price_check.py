@@ -407,21 +407,24 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         )
         base["day_change_pct"] = day_change_pct
 
-        if today_volume is None:
-            # Volume data unavailable — fall back to the quote's own volume
-            # field (no RVOL possible; RVOL checks are skipped below).
-            current_volume = int(quote.get("v", 0))
-            avg_daily_volume = 0
-            rvol = 0.0
-            avg_dollar_volume = None
+        # FAIL-CLOSED on missing volume data. Without it we have neither the
+        # liquidity gate (avg_dollar_volume) nor the participation gate (RVOL) —
+        # the two checks that keep us out of untradeable / unconfirmed names.
+        # Trading on momentum + VWAP alone here would be the worst kind of
+        # silent fail-open: a Twelvedata volume outage would relax risk exactly
+        # when data is least reliable. Quant standard: no confirmation = no
+        # trade. Returning None (not a reject) means "couldn't evaluate" — the
+        # signal is parked in main.py's retry queue and re-tried next cycle.
+        if today_volume is None or avg_daily_volume is None or avg_dollar_volume is None:
             logger.warning(
-                "Price check [%s]: Twelvedata volume unavailable — using Finnhub "
-                "quote volume=%d (no RVOL)",
-                symbol, current_volume,
+                "Price check [%s]: volume/liquidity data unavailable — cannot run "
+                "liquidity or RVOL gates; deferring (will retry)",
+                symbol,
             )
-        else:
-            current_volume = today_volume
-            rvol = compute_rvol(current_volume, avg_daily_volume or 0, minutes_since_open)
+            return None
+
+        current_volume = today_volume
+        rvol = compute_rvol(current_volume, avg_daily_volume or 0, minutes_since_open)
 
         base.update(
             current_volume=current_volume,

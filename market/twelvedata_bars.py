@@ -293,8 +293,29 @@ def get_momentum_baseline(symbol: str) -> tuple[float | None, float | None, floa
             baseline_bar = bar
             break
     if baseline_bar is None:
-        # All bars are newer than the cutoff (e.g. right after the open) —
-        # fall back to the oldest bar we have rather than failing entirely.
+        # No bar is old enough to honor the look-back window (e.g. only a few
+        # bars exist right after the open). Fall back to the OLDEST bar we have
+        # rather than failing — but only if it is genuinely a different bar
+        # from the most recent one. If the oldest available bar IS the most
+        # recent (degenerate single-usable-bar case), there is no momentum
+        # window at all: return past_price=None so the caller's early-session
+        # open-price fallback (or a clean reject) kicks in instead of a
+        # spurious 0.00% reading.
+        if values[-1] is most_recent:
+            logger.debug(
+                "Twelvedata [%s]: no bar old enough for a momentum window "
+                "(have %d bar(s)) — momentum baseline unavailable",
+                symbol, len(values),
+            )
+            # Still return the current bar price + spread so the caller has them.
+            try:
+                cur = float(most_recent["close"])
+                hi = float(most_recent.get("high", cur))
+                lo = float(most_recent.get("low", cur))
+                sp = ((hi - lo) / cur) * 100 if cur > 0 else None
+            except (KeyError, ValueError, TypeError):
+                cur, sp = None, None
+            return None, cur, sp
         baseline_bar = values[-1]
 
     try:

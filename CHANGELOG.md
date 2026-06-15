@@ -7,6 +7,34 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v15.1 — 2026-06-15 (deep logic audit)
+
+Full code audit against quant-desk standards. Findings + fixes:
+
+- **Backtest ↔ production parity (the big one).** `backtest_db.py` was still
+  replaying v12-era logic: dead-cat measured vs today's OPEN (production uses
+  prev close), no spread filter, no VWAP gate, stale `low_momentum` semantics.
+  A backtest that tests different logic than production manufactures false
+  confidence. Rewrote as `run_v15_check()` — mirrors `confirm_price_signal()`
+  gate-for-gate (opening block → penny → spread → dead-cat/extended-move vs
+  prev close → ADV liquidity → dead-tape floor → ceiling → RVOL → VWAP), with
+  a `_session_vwap_at()` helper computing VWAP from the intraday bars. Added
+  `TestBacktestParity` asserting the backtest's constants equal `cfg`.
+- **Fail-CLOSED on missing volume data (live risk).** When Twelvedata volume
+  was unavailable, `confirm_price_signal` set `avg_dollar_volume=None`, which
+  *bypassed* both the liquidity gate AND the RVOL gate — a signal could trade
+  on momentum+VWAP alone, i.e. risk relaxed exactly when data was least
+  reliable. Now returns None (defer + retry) — no confirmation, no trade.
+- **Momentum-baseline degenerate guard.** When only one usable bar exists
+  (right after open), the baseline could equal the current bar → a spurious
+  0.00% momentum reading. Now returns `past_price=None` so the caller's
+  early-session open-price fallback (or a clean defer) applies instead.
+- **Verified OK (no change):** `_parse_fill` fee summation is correct (T212's
+  `taxes[].quantity` is a monetary amount, not a share count — confirmed
+  against the API schema); all percentage math is divide-by-zero guarded.
+
+---
+
 ## v15 — 2026-06-15
 
 First full live session on v14 took **0 trades from 957 scored articles**. Root

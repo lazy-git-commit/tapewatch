@@ -354,6 +354,14 @@ with **costs that match reality**:
 
 A strategy that only profits under frictionless fills doesn't profit.
 
+**Backtest ↔ production parity (cardinal rule).** `run_v15_check()` mirrors
+`confirm_price_signal()` gate-for-gate — same order, same thresholds (sourced
+from `cfg`, asserted equal by `TestBacktestParity`), same prev-close baselines,
+same VWAP confirmation (computed from intraday bars via `_session_vwap_at()`).
+If the two ever diverge, the backtest is testing a strategy you don't run, which
+is worse than no backtest. Any change to a price-check gate must be made in both
+places in the same commit.
+
 ---
 
 ## 11. Known limitations / future work

@@ -464,6 +464,46 @@ class TestVwap:
         assert vwap is None and last is None
 
 
+# ── Backtest ↔ production parity tests (v15 audit) ─────────────────────────────
+
+class TestBacktestParity:
+    """The backtest must test the SAME logic production runs."""
+
+    def test_backtest_uses_v15_thresholds(self):
+        # Constants are sourced from cfg, so they can't silently diverge from
+        # production. Guards against a future edit hardcoding a stale value.
+        import backtest.backtest_db as b
+        from config.settings import cfg
+        assert b.MIN_PRICE_MOVE_PCT == cfg.min_price_move_pct
+        assert b.MAX_PRICE_MOVE_PCT == cfg.max_price_move_pct
+        assert b.MIN_RVOL == cfg.min_rvol
+        assert b.MAX_RVOL == cfg.max_rvol
+        assert b.MAX_DAY_MOVE_PCT == cfg.max_day_move_pct
+        assert b.MAX_SPREAD_PCT == cfg.max_spread_pct
+        assert b.REQUIRE_VWAP_CONFIRM == cfg.require_vwap_confirmation
+
+    def test_backtest_has_vwap_gate(self):
+        import backtest.backtest_db as b
+        # The VWAP confirmation helper must exist (v15 parity) and old alias kept
+        assert hasattr(b, "_session_vwap_at")
+        assert b.run_v12_check is b.run_v15_check
+
+    def test_backtest_vwap_weighting(self):
+        import backtest.backtest_db as b
+        import pandas as pd
+        from datetime import datetime, timezone
+        # Two bars: heavy vol at price 10, light at 20 → VWAP weighted to 10
+        idx = pd.to_datetime(
+            ["2026-06-15 14:30", "2026-06-15 14:31"], utc=True
+        )
+        df = pd.DataFrame(
+            {"High": [10, 20], "Low": [10, 20], "Close": [10, 20], "Volume": [900, 100]},
+            index=idx,
+        )
+        vwap = b._session_vwap_at(df, datetime(2026, 6, 15, 14, 31, tzinfo=timezone.utc))
+        assert vwap == pytest.approx(11.0, rel=1e-6)  # (10*900 + 20*100)/1000
+
+
 # ── Backtest cost model tests ─────────────────────────────────────────────────
 
 class TestBacktestCosts:
