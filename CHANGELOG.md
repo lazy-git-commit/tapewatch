@@ -7,6 +7,51 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v15 — 2026-06-15
+
+First full live session on v14 took **0 trades from 957 scored articles**. Root
+causes found by querying the production DB + logs (no money lost — every safety
+system worked; the strategy simply could not fire). Three fixes.
+
+### Symbol hygiene — pre-market pipeline was unreachable
+- `clean_benzinga_symbol()` drops foreign-exchange tags (`TSX:MDA`, `LON:…`,
+  etc. → None — not US-tradeable) and strips Benzinga's disambiguation digit
+  (`INBX1` → `INBX`, `SAIL1` → `SAIL`). These uncleaned tags reached the price
+  check, got no quote, and burned 30-min pre-market eval windows.
+- `resolve_t212_ticker()` now returns None for non-US tags; `fetcher.py` skips
+  them (guard ordering fixed so None never hits `seen_checker`).
+
+### Quote fallback — Finnhub doesn't cover the small caps we target
+- `get_twelvedata_quote()` + `get_quote_with_fallback()`: Finnhub `/quote` →
+  Twelvedata `/quote` fallback. Finnhub's free tier silently omits small caps
+  and recent IPOs (2026-06-15: CUPR/ELAN/WBD/INBX/SAIL all had no Finnhub
+  quote, all priced on Twelvedata). Both sources normalise to the same
+  `c`/`o`/`pc` keys. Used by `confirm_price_signal` and `get_current_price`.
+
+### Momentum confirmation — VWAP replaces the fixed % floor (researched)
+- The v14 fixed +1.5%/5-min floor was the binding constraint: **1,077 of all
+  all-time rejections were `low_momentum`**, and every real large-cap catalyst
+  on 2026-06-15 was rejected at near-zero 5-min change (DXCM +0.14%, SNY
+  +0.07%, LLY +0.01%) — deep order books reprice slowly (PEAD). A single %
+  threshold cannot serve both a $2 micro-cap and a $1000 mega-cap.
+- **Fix (size-neutral, research-backed):** confirm with **VWAP-relative
+  position** — a stock held at/above session VWAP is being accumulated
+  regardless of raw % change; below VWAP is gap-and-crap regardless. New
+  `get_session_vwap()`. The fixed floor is reduced to a 0.2% dead-tape noise
+  filter; VWAP (step 10, runs last to save a credit) does the real judgement.
+  New reason code `below_vwap`. Toggle via `REQUIRE_VWAP_CONFIRMATION`.
+- Research: post-earnings-announcement drift literature + VWAP-reclaim
+  practitioner playbooks (citations in docs/algorithm.md §4).
+
+### Observability
+- Per-cycle **signal funnel** log line: `evaluated → seen, cooldown, no-data,
+  rejected, OPENED` — the 25-gate-passing-→-0-trades attrition that took a
+  manual DB dig on 2026-06-15 is now one line in journald.
+
+Tests: 44 passing (was 30).
+
+---
+
 ## v14 — 2026-06-12
 
 The "execution & risk" release. Root cause addressed: the realized win/loss

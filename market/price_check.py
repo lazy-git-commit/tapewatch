@@ -35,13 +35,24 @@ cheapest checks first so we fail fast and spend fewer API credits):
                        ADV-based on purpose: spike-day volume would let halt
                        patterns through (GOAI: $390k ADV → −18.99% stop fill).
   7. low_momentum    — up at least cfg.min_price_move_pct over the momentum
-                       look-back window (cfg.momentum_lookback_minutes).
+                       look-back window. v15: this is now only a DEAD-TAPE
+                       noise floor (default 0.2%); the real accumulation
+                       judgement is VWAP (step 10), which is size-neutral.
   8. high_momentum   — but NOT up more than cfg.max_price_move_pct in that
                        window — that is a post-halt spike, not an entry.
+                       Runs before VWAP so spikes don't waste a VWAP credit.
   9. low_volume /    — RVOL (time-of-day normalized relative volume) within
      high_volume       [cfg.min_rvol, cfg.max_rvol]. See _expected_volume_
                        fraction() for why raw volume ratios are meaningless
                        without time normalization.
+ 10. below_vwap      — price must hold at/above session VWAP (cfg.
+                       require_vwap_confirmation). SIZE-NEUTRAL accumulation
+                       test: a deep-book large-cap reprices <1% in 5 min but
+                       holds above VWAP when institutions buy; a fading
+                       gap-up sits below VWAP regardless of % change. This is
+                       the v15 fix for the fixed-% momentum floor rejecting
+                       every real large-cap catalyst. Runs LAST — it spends an
+                       extra Twelvedata credit, so all cheaper gates go first.
 """
 
 import logging
@@ -53,7 +64,9 @@ from dataclasses import dataclass
 import pytz
 from config.settings import cfg
 from market.finnhub_bars import get_finnhub_quote
-from market.twelvedata_bars import get_momentum_baseline, get_volume_stats
+from market.twelvedata_bars import (
+    get_momentum_baseline, get_volume_stats, get_twelvedata_quote, get_session_vwap,
+)
 
 _NYSE = mcal.get_calendar("NYSE")
 
@@ -149,6 +162,28 @@ def _to_yf_ticker(t212_ticker: str) -> str:
     return t212_ticker.split("_")[0]
 
 
+def get_quote_with_fallback(symbol: str) -> dict | None:
+    """
+    Real-time quote with a two-source fallback chain:
+      1. Finnhub /quote  — primary (fastest, generous rate limit)
+      2. Twelvedata /quote — fallback when Finnhub has no coverage
+
+    Finnhub's free tier silently omits many small caps and recent IPOs
+    (observed 2026-06-15: CUPR/ELAN/WBD/INBX/SAIL all returned no Finnhub
+    quote — exactly the small-cap catalysts this strategy targets — while
+    Twelvedata carried every one). Returning None from BOTH means the symbol
+    is genuinely unpriceable and the signal can't be evaluated.
+
+    Both sources return the same normalised keys (c/o/pc), so callers don't
+    need to know which one answered.
+    """
+    quote = get_finnhub_quote(symbol)
+    if quote is not None:
+        return quote
+    logger.info("Quote [%s]: no Finnhub coverage — trying Twelvedata fallback", symbol)
+    return get_twelvedata_quote(symbol)
+
+
 def minutes_until_close() -> float | None:
     """
     Minutes until today's actual market close (handles early-close days via
@@ -242,8 +277,9 @@ class PriceConfirmation:
     reason: str
     # approved | opening_block | penny_stock | wide_spread | dead_cat |
     # extended_move | illiquid | low_momentum | high_momentum |
-    # low_volume | high_volume | no_price_data
+    # low_volume | high_volume | below_vwap | no_price_data
     reason_code: str
+    vwap: float | None = None       # session VWAP at confirmation (v15)
 
 
 def _reject(base: dict, code: str, reason: str) -> "PriceConfirmation":
@@ -271,11 +307,11 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
     symbol = _to_yf_ticker(t212_ticker)
 
     try:
-        # ── Current price + previous close via Finnhub (real-time, retried) ──
-        quote = get_finnhub_quote(symbol)
+        # ── Current price + previous close (Finnhub → Twelvedata fallback) ──
+        quote = get_quote_with_fallback(symbol)
         if quote is None:
             logger.warning(
-                "Price check [%s]: no Finnhub quote available — cannot evaluate signal",
+                "Price check [%s]: no quote from Finnhub or Twelvedata — cannot evaluate signal",
                 symbol,
             )
             return None
@@ -284,10 +320,11 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         open_price = float(quote["o"]) if quote.get("o") else current_price
         if open_price == 0:
             open_price = current_price
-        # `pc` = previous close. The baseline for gap/day-change math: using
-        # today's open instead silently ignores overnight gaps in both
-        # directions (the old dead-cat hole).
-        finnhub_prev_close = float(quote.get("pc") or 0) or None
+        # `pc` = previous close (from whichever quote source answered —
+        # Finnhub or the Twelvedata fallback both populate this key). The
+        # baseline for gap/day-change math: using today's open instead
+        # silently ignores overnight gaps in both directions (the dead-cat hole).
+        quote_prev_close = float(quote.get("pc") or 0) or None
         day_move_pct = ((current_price - open_price) / open_price) * 100
 
         # ── Time since open ───────────────────────────────────────────────────
@@ -301,7 +338,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
         base = dict(
             ticker=t212_ticker, symbol=symbol,
             current_price=current_price, open_price=open_price,
-            prev_close=finnhub_prev_close,
+            prev_close=quote_prev_close,
             day_move_pct=day_move_pct, day_change_pct=None,
             recent_move_pct=0.0, current_volume=0, avg_volume=0,
             rvol=0.0, avg_dollar_volume=None, spread_proxy_pct=None,
@@ -363,7 +400,7 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
 
         # Prefer Finnhub's prev close (real-time source); Twelvedata's daily
         # bar is the backup when the quote lacks `pc`.
-        prev_close = finnhub_prev_close or td_prev_close
+        prev_close = quote_prev_close or td_prev_close
         base["prev_close"] = prev_close
         day_change_pct = (
             ((current_price - prev_close) / prev_close) * 100 if prev_close else None
@@ -425,15 +462,22 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                 f"clean exit",
             )
 
-        # ── 7. Momentum floor ────────────────────────────────────────────────
+        # ── 7. Momentum noise floor ──────────────────────────────────────────
+        # With VWAP confirmation on (step 9), this only rejects dead-flat tape —
+        # a catalyst that produced literally no move. The "is it being
+        # accumulated?" judgement is VWAP's job, not a fixed % threshold's.
         if recent_move_pct < cfg.min_price_move_pct:
             return _reject(
                 base, "low_momentum",
-                f"Insufficient momentum: {recent_move_pct:+.2f}% over last "
-                f"~{cfg.momentum_lookback_minutes} min (need +{cfg.min_price_move_pct}%)",
+                f"Dead tape: {recent_move_pct:+.2f}% over last "
+                f"~{cfg.momentum_lookback_minutes} min (need +{cfg.min_price_move_pct}% to "
+                f"confirm the catalyst moved the stock at all)",
             )
 
         # ── 8. Momentum ceiling ──────────────────────────────────────────────
+        # Runs BEFORE the VWAP call so a post-halt spike (which is also far
+        # ABOVE VWAP and would pass step 9) is rejected without spending the
+        # extra Twelvedata credit that get_session_vwap costs.
         if recent_move_pct > cfg.max_price_move_pct:
             return _reject(
                 base, "high_momentum",
@@ -457,6 +501,39 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
                     base, "high_volume",
                     f"RVOL {rvol:.1f} above {cfg.max_rvol} — parabolic volume is the "
                     f"halt-pattern signature, not a tradeable catalyst",
+                )
+
+        # ── 10. VWAP confirmation (size-neutral accumulation test) ───────────
+        # LAST gate, because get_session_vwap() spends an extra Twelvedata
+        # credit (a full-session bar pull) — every cheaper gate runs first so
+        # this is only reached by signals that have already passed everything
+        # else. Price held at/above session VWAP = institutions are net buyers,
+        # independent of the raw % change. This is what lets a deep-book
+        # large-cap catalyst through (it sits above VWAP even at +0.2%) while
+        # rejecting a fading gap-up (below VWAP regardless of % change).
+        # Research basis: PEAD literature + VWAP-reclaim practitioner playbooks
+        # (citations in docs/algorithm.md).
+        if cfg.require_vwap_confirmation:
+            vwap, vwap_last = get_session_vwap(symbol)
+            if vwap is not None and vwap > 0:
+                base["vwap"] = vwap
+                # Accept at/above VWAP minus a small tolerance (handles a fresh
+                # reclaim on the current bar).
+                vwap_floor = vwap * (1 - cfg.vwap_tolerance_pct / 100)
+                if current_price < vwap_floor:
+                    return _reject(
+                        base, "below_vwap",
+                        f"Below VWAP: price ${current_price:.4f} < VWAP ${vwap:.4f} "
+                        f"(tol {cfg.vwap_tolerance_pct}%) — being distributed, not "
+                        f"accumulated; gap-and-crap risk",
+                    )
+            else:
+                # VWAP unavailable (no volume yet / data gap). Don't hard-fail:
+                # the momentum floor + RVOL already passed. Logged so it's
+                # visible when we confirm without VWAP.
+                logger.info(
+                    "Price check [%s]: VWAP unavailable — confirming on momentum + RVOL only",
+                    symbol,
                 )
 
         # ── All conditions met — signal confirmed ─────────────────────────────
@@ -491,10 +568,10 @@ def get_current_price(t212_ticker: str) -> float | None:
     Returns None if both are unavailable — callers must handle this explicitly.
     """
     symbol = _to_yf_ticker(t212_ticker)
-    quote = get_finnhub_quote(symbol)
+    quote = get_quote_with_fallback(symbol)
     if quote is not None:
         price = float(quote["c"])
-        logger.debug("get_current_price [%s]: %.4f (Finnhub)", symbol, price)
+        logger.debug("get_current_price [%s]: %.4f", symbol, price)
         return price
     # Twelvedata fallback: use most recent 1-min bar close
     try:

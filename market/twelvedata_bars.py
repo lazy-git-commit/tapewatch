@@ -174,6 +174,73 @@ def _parse_bar_time(bar: dict) -> datetime | None:
         return None
 
 
+def get_twelvedata_quote(symbol: str) -> dict | None:
+    """
+    Fetch a real-time quote from Twelvedata /quote — the FALLBACK for when
+    Finnhub has no coverage of a symbol (small caps, recent IPOs, many names
+    Finnhub's free tier simply doesn't carry; observed 2026-06-15: Finnhub
+    returned no quote for CUPR/ELAN/WBD/INBX/SAIL while Twelvedata had them all).
+
+    Returns a dict normalised to the SAME keys as get_finnhub_quote() so the
+    price-check code can consume either interchangeably:
+        c  — current/last price        (Twelvedata "close")
+        o  — today's open               (Twelvedata "open")
+        pc — previous session close     (Twelvedata "previous_close")
+    Plus a passthrough "av" (average_volume) when present.
+
+    Costs 1 Twelvedata credit. Returns None on any error or missing price.
+    Retries are handled the same way as the time-series calls (429/5xx aware).
+    """
+    url = f"{_BASE_URL}/quote"
+    params = {"symbol": symbol, "apikey": cfg.twelvedata_api_key}
+    _record_credit_use()
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            resp = requests.get(url, params=params, timeout=_TIMEOUT)
+            if resp.status_code == 429:
+                wait = 1.5 * attempt * 2
+                logger.warning(
+                    "Twelvedata /quote rate limit for %s (attempt %d/3) — waiting %.1fs",
+                    symbol, attempt, wait,
+                )
+                time.sleep(wait)
+                continue
+            if resp.status_code >= 500:
+                time.sleep(1.5 * attempt)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") == "error":
+                logger.debug(
+                    "Twelvedata /quote error for %s: %s",
+                    symbol, data.get("message", "unknown")[:80],
+                )
+                return None
+            close = data.get("close")
+            if close is None or float(close) == 0:
+                return None
+            quote = {
+                "c": float(close),
+                "o": float(data["open"]) if data.get("open") else float(close),
+                "pc": float(data["previous_close"]) if data.get("previous_close") else None,
+                "av": int(float(data["average_volume"])) if data.get("average_volume") else None,
+            }
+            logger.debug(
+                "Twelvedata /quote [%s]: c=%.4f o=%.4f pc=%s (Finnhub fallback)",
+                symbol, quote["c"], quote["o"], quote["pc"],
+            )
+            return quote
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            time.sleep(1.5 * attempt)
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning("Twelvedata /quote malformed data for %s: %s", symbol, exc)
+            return None
+    logger.warning("Twelvedata /quote: all attempts failed for %s — last: %s", symbol, last_exc)
+    return None
+
+
 def get_momentum_baseline(symbol: str) -> tuple[float | None, float | None, float | None]:
     """
     Fetch 1-min intraday bars and return
@@ -249,6 +316,66 @@ def get_momentum_baseline(symbol: str) -> tuple[float | None, float | None, floa
         baseline_bar.get("datetime", "?"), spread_proxy_pct or 0,
     )
     return past_price, current_bar_price, spread_proxy_pct
+
+
+def get_session_vwap(symbol: str) -> tuple[float | None, float | None]:
+    """
+    Compute today's session VWAP and return (vwap, last_price).
+
+    VWAP (Volume-Weighted Average Price) is the institutional fair-value line:
+        VWAP = Σ(typical_price × volume) / Σ(volume),  typical = (H+L+C)/3
+    accumulated from the session open.
+
+    Why VWAP instead of a fixed % momentum floor (the v15 strategy fix):
+      A genuine catalyst on a deep-book large-cap reprices it by well under
+      1.5% in 5 minutes (DXCM +0.14%, SNY +0.07% on 2026-06-15 — all rejected
+      by the old fixed floor), yet the stock trades and HOLDS above VWAP
+      because institutions are net buyers. A fading "gap-and-crap" sits below
+      VWAP regardless of its raw % change. Price-vs-VWAP is therefore a
+      SIZE-NEUTRAL "is this being accumulated?" signal — the same test works
+      for a $2 micro-cap and a $1000 mega-cap. This is the standard
+      practitioner confirmation (see docs/algorithm.md research notes).
+
+    Returns (None, None) if data is unavailable. Costs 1 credit.
+
+    Implementation note: we pull up to 390 1-min bars (a full RTH session) and
+    accumulate only today's bars. Early in the session there are few bars, which
+    is fine — VWAP is simply the average so far.
+    """
+    values = _get_time_series(symbol, interval="1min", outputsize=390)
+    if values is None or len(values) < 1:
+        return None, None
+
+    now_et_date = datetime.now(_ET).date()
+    cum_pv = 0.0   # Σ typical_price × volume
+    cum_v = 0.0    # Σ volume
+    last_price: float | None = None
+
+    # values are newest-first; iterate oldest→newest so last_price ends on the
+    # most recent bar. Only include bars from today's session.
+    for bar in reversed(values):
+        bar_dt = _parse_bar_time(bar)
+        if bar_dt is None or bar_dt.astimezone(_ET).date() != now_et_date:
+            continue
+        try:
+            high = float(bar["high"])
+            low = float(bar["low"])
+            close = float(bar["close"])
+            vol = float(bar.get("volume", 0))
+        except (KeyError, ValueError, TypeError):
+            continue
+        typical = (high + low + close) / 3
+        cum_pv += typical * vol
+        cum_v += vol
+        last_price = close
+
+    if cum_v <= 0 or last_price is None:
+        # No volume yet (pre-open or dead tape) — VWAP undefined.
+        return None, last_price
+
+    vwap = cum_pv / cum_v
+    logger.debug("Twelvedata VWAP [%s]: vwap=%.4f last=%.4f", symbol, vwap, last_price)
+    return vwap, last_price
 
 
 def get_volume_stats(symbol: str) -> tuple[int | None, int | None, float | None, float | None]:

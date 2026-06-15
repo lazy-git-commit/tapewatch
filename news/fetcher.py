@@ -358,11 +358,15 @@ def fetch_all_news(
             pass
 
         # Build T212 tickers and filter blocklist + already-seen pairs.
+        # resolve_t212_ticker returns None for non-US/foreign listings — those
+        # are dropped here (the `t212 is not None` guard must come first, before
+        # any check that would receive None).
         eligible_tickers = [
             t212
             for t in raw_tickers
             for t212 in (resolve_t212_ticker(t),)
-            if t212 not in cfg.blocklist
+            if t212 is not None
+            and t212 not in cfg.blocklist
             and not seen_checker(article_id, t212)
         ]
         if not eligible_tickers:

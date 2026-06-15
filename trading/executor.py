@@ -103,12 +103,82 @@ def build_symbol_map(retries: int = 3) -> bool:
     return False
 
 
-def resolve_t212_ticker(exchange_symbol: str) -> str:
+# Exchange prefixes Benzinga attaches to NON-US listings. We only trade US
+# equities (T212 ISA, USD instruments), so a tagged ticker carrying any of
+# these is a foreign listing we cannot trade — reject it outright rather than
+# strip the prefix and accidentally trade a same-named US ticker.
+# Observed leak (2026-06-15): "TSX:MDA" reached the price check as "TSX:MDA",
+# Finnhub returned no quote, and the candidate burned a 30-min eval window.
+_NON_US_EXCHANGE_PREFIXES = (
+    "TSX:", "TSXV:", "CVE:", "CNSX:",      # Canada
+    "LON:", "LSE:",                         # London
+    "ASX:",                                 # Australia
+    "HKG:", "SHA:", "SHE:",                 # Hong Kong / China
+    "FRA:", "ETR:", "EPA:", "AMS:", "BIT:", "BME:", "STO:",  # Europe
+    "TSE:", "TYO:", "KRX:", "NSE:", "BSE:",  # Asia
+)
+
+
+def clean_benzinga_symbol(raw: str) -> str | None:
     """
-    Convert a Benzinga exchange symbol (e.g. "SUNE") to the correct T212 ticker code.
-    Uses the pre-built symbol map; falls back to "<symbol>_US_EQ" if not found.
+    Normalise a raw Benzinga ticker tag into a clean US exchange symbol, or
+    return None if it is not a tradeable US equity.
+
+    Benzinga tags carry routing/disambiguation cruft that breaks every
+    downstream consumer (Finnhub quote, Twelvedata, T212 mapping):
+
+      "TSX:MDA"  → None   — foreign (Toronto) listing, not US-tradeable
+      "INBX1"    → "INBX" — trailing digit is Benzinga's collision
+                            disambiguation suffix, not part of the symbol
+      "BRK.A"    → "BRK.A"— class shares are kept (dot is a real US ticker char)
+      "AAPL"     → "AAPL" — already clean
+
+    Returns the cleaned UPPERCASE symbol, or None to drop the tag.
     """
-    return _symbol_to_t212.get(exchange_symbol.upper(), f"{exchange_symbol}_US_EQ")
+    if not raw:
+        return None
+    sym = raw.strip().upper()
+
+    # Drop foreign-exchange-prefixed tags entirely — we can't trade them.
+    for prefix in _NON_US_EXCHANGE_PREFIXES:
+        if sym.startswith(prefix):
+            logger.debug("clean_benzinga_symbol: dropping non-US listing %s", raw)
+            return None
+
+    # A leftover "EXCH:" prefix we don't explicitly know is still non-US.
+    if ":" in sym:
+        logger.debug("clean_benzinga_symbol: dropping unknown-exchange tag %s", raw)
+        return None
+
+    # Strip a single trailing disambiguation digit that is NOT part of the
+    # real symbol (INBX1 → INBX, SAIL1 → SAIL). Guarded carefully:
+    #   - only a lone trailing digit (not multi-digit like a units ticker),
+    #   - only when the remaining stem is a plausible 2+ char alpha symbol,
+    #   so we never mangle legitimate alphanumerics.
+    if len(sym) >= 4 and sym[-1].isdigit() and sym[:-1].isalpha():
+        stem = sym[:-1]
+        logger.debug("clean_benzinga_symbol: %s → %s (stripped disambiguation digit)", raw, stem)
+        sym = stem
+
+    return sym or None
+
+
+def resolve_t212_ticker(exchange_symbol: str) -> str | None:
+    """
+    Convert a Benzinga exchange symbol (e.g. "SUNE") to the correct T212 ticker
+    code. Returns None when the tag is not a tradeable US equity (foreign
+    listing, unparseable) — callers must skip those.
+
+    Resolution order:
+      1. clean the raw tag (drop foreign listings, strip disambiguation cruft)
+      2. look up the cleaned symbol in the T212 shortName→ticker map
+         (handles post-SPAC/rename mismatches: SUNE → JCS_US_EQ)
+      3. fall back to "<symbol>_US_EQ"
+    """
+    cleaned = clean_benzinga_symbol(exchange_symbol)
+    if cleaned is None:
+        return None
+    return _symbol_to_t212.get(cleaned, f"{cleaned}_US_EQ")
 
 
 def _get(path: str) -> dict:

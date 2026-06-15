@@ -41,10 +41,42 @@ class Settings:
     min_sentiment_confidence: int = field(
         default_factory=lambda: int(os.getenv("MIN_SENTIMENT_CONFIDENCE", "7"))
     )
-    # Momentum floor: price must be up at least this % over the momentum
-    # look-back window. Below this, the "catalyst" isn't moving the stock.
+    # ── Momentum confirmation (v15: VWAP-relative, size-neutral) ──────────────
+    # The v14 fixed-% momentum floor was the strategy's binding constraint:
+    # 1,077 of all-time rejections were `low_momentum`, and on 2026-06-15 every
+    # real large-cap catalyst was rejected at near-zero 5-min change (DXCM
+    # +0.14%, SNY +0.07%, LLY +0.01%) — because deep order books reprice
+    # slowly. A single % threshold cannot serve both a $2 micro-cap and a
+    # $1000 mega-cap.
+    #
+    # Research (PEAD literature + practitioner playbooks — citations in
+    # docs/algorithm.md) converges on VWAP-relative position as the
+    # size-NEUTRAL confirmation of "is this being accumulated?": a stock held
+    # above its session VWAP on elevated relative volume is being bought by
+    # institutions regardless of its raw % change; one fading below VWAP is
+    # gap-and-crap regardless. So confirmation is now:
+    #   (a) price >= VWAP × (1 − vwap_tolerance_pct)   [primary, size-neutral]
+    #   (b) recent move >= min_price_move_pct           [noise floor only]
+    #   (c) recent move <= max_price_move_pct           [post-halt ceiling]
+    #   (d) RVOL in band                                [participation]
+    #
+    # require_vwap_confirmation toggles (a). When True, the momentum floor (b)
+    # is lowered to a pure noise-rejection level since VWAP does the real work.
+    require_vwap_confirmation: bool = field(
+        default_factory=lambda: os.getenv("REQUIRE_VWAP_CONFIRMATION", "true").lower() in ("1", "true", "yes")
+    )
+    # How far BELOW VWAP we still accept (small tolerance for a stock that just
+    # reclaimed VWAP on the current bar). 0.1% ≈ touching the line.
+    vwap_tolerance_pct: float = field(
+        default_factory=lambda: float(os.getenv("VWAP_TOLERANCE_PCT", "0.1"))
+    )
+    # Momentum noise floor. With VWAP confirmation on, this only rejects
+    # dead-flat tape (the catalyst produced literally no move); VWAP handles
+    # the "is it being accumulated" judgement. With VWAP confirmation OFF this
+    # reverts to being the sole momentum gate, so it is set higher in that case
+    # via .env. Default tuned for the VWAP-on regime.
     min_price_move_pct: float = field(
-        default_factory=lambda: float(os.getenv("MIN_PRICE_MOVE_PCT", "1.5"))
+        default_factory=lambda: float(os.getenv("MIN_PRICE_MOVE_PCT", "0.2"))
     )
     # Momentum ceiling: if the stock is up MORE than this % in the look-back
     # window, we are reading a post-halt spike — the move already happened

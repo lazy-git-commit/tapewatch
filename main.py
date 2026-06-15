@@ -370,7 +370,15 @@ def news_cycle() -> None:
         len(all_items), len(retry_items), len(news_items),
     )
 
+    # Funnel counters — make the tradeable-signal → trade attrition visible in
+    # one line per cycle. On 2026-06-15, 25 gate-passing positives produced 0
+    # trades and it took a manual DB dig to see WHY each one dropped. This
+    # surfaces the leak in the logs (and is cheap — just ints).
+    funnel = {"evaluated": 0, "already_seen": 0, "cooldown": 0,
+              "no_price_data": 0, "rejected": 0, "opened": 0}
+
     for item in all_items:
+        funnel["evaluated"] += 1
         logger.info(
             "Signal [%s] %.0f%% confidence catalyst=%s: %s",
             item.ticker, item.confidence * 100, item.catalyst_type, item.headline,
@@ -378,6 +386,7 @@ def news_cycle() -> None:
 
         # Dedup: (article, ticker) already processed in a previous cycle.
         if is_article_seen(item.article_id, item.ticker):
+            funnel["already_seen"] += 1
             logger.debug(
                 "Skipping %s — article %s already processed", item.ticker, item.article_id,
             )
@@ -385,6 +394,7 @@ def news_cycle() -> None:
 
         # 24h per-ticker cooldown (open position or traded recently).
         if was_recently_traded(item.ticker):
+            funnel["cooldown"] += 1
             logger.info("Skipping %s — 24h ticker cooldown active", item.ticker)
             continue
 
@@ -401,10 +411,12 @@ def news_cycle() -> None:
         if confirmation is None:
             # Data outage (not a rejection) — park for retry; the fetcher's
             # freshness filter can't see queue entries, so they survive.
+            funnel["no_price_data"] += 1
             _queue_retry(item)
             continue
 
         opened = _execute_entry(item, confirmation, fetched_at)
+        funnel["opened" if opened else "rejected"] += 1
 
         if opened:
             # Re-check portfolio gates after every fill.
@@ -412,6 +424,15 @@ def news_cycle() -> None:
             if not gates_ok:
                 logger.warning("Risk gate tripped mid-cycle: %s — stopping entries", gate_reason)
                 break
+
+    # One-line funnel summary whenever anything was evaluated.
+    if funnel["evaluated"]:
+        logger.info(
+            "Signal funnel: %d evaluated → %d seen, %d cooldown, %d no-data, "
+            "%d rejected, %d OPENED",
+            funnel["evaluated"], funnel["already_seen"], funnel["cooldown"],
+            funnel["no_price_data"], funnel["rejected"], funnel["opened"],
+        )
 
     elapsed_ms = (datetime.now(pytz.timezone("Europe/London")) - cycle_start).total_seconds() * 1000
     logger.info(

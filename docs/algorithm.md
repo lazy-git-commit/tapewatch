@@ -114,9 +114,24 @@ A positive classification only becomes a tradeable signal if **all** pass:
 
 ## 4. Stage 2 — Price confirmation (`market/price_check.py`)
 
-Data sources: Finnhub quote (current price, open, **previous close**),
-Twelvedata 1-min bars (momentum baseline by timestamp, spread proxy),
-Twelvedata daily bars (20-day ADV, prev-close backup).
+Data sources: **quote with fallback** — Finnhub `/quote` (current price, open,
+**previous close**), falling back to Twelvedata `/quote` when Finnhub has no
+coverage; Twelvedata 1-min bars (momentum baseline by timestamp, spread proxy);
+Twelvedata daily bars (20-day ADV, prev-close backup); Twelvedata session VWAP.
+
+**Symbol hygiene (v15):** Benzinga tags carry routing cruft that breaks every
+downstream consumer. `clean_benzinga_symbol()` (in `trading/executor.py`) drops
+foreign-exchange-prefixed tags entirely (`TSX:MDA` → None — not US-tradeable)
+and strips Benzinga's collision-disambiguation digit (`INBX1` → `INBX`,
+`SAIL1` → `SAIL`). On 2026-06-15 these uncleaned tags reached the price check,
+got no Finnhub quote, and burned 30-minute pre-market eval windows.
+
+**Quote fallback (v15):** Finnhub's free tier silently omits many small caps and
+recent IPOs — exactly the catalysts this strategy targets (2026-06-15:
+CUPR/ELAN/WBD/INBX/SAIL all had no Finnhub quote, all priced fine on
+Twelvedata). `get_quote_with_fallback()` tries Finnhub, then Twelvedata
+`/quote`; both return the same `c`/`o`/`pc` keys so callers are source-agnostic.
+Only when BOTH miss is a signal deemed unpriceable.
 
 Checks run cheapest-first; each rejection records a `reason_code`:
 
@@ -128,9 +143,50 @@ Checks run cheapest-first; each rejection records a `reason_code`:
 | 4 | `dead_cat` | < −3% vs **prev close** | Prev close (not open) so gap-downs count: a stock down 25% overnight but flat since open is still a falling knife |
 | 5 | `extended_move` | > +25% vs **prev close** | Closes the v13 hole: stock up 80% on the day but flat in the last 5 min passed the 5-min ceiling |
 | 6 | `illiquid` | 20-day ADV × price < **$5M** | **ADV-based on purpose**: spike-day volume explodes and would pass exactly the halt patterns this blocks. Exit slippage depends on the NORMAL book (GOAI: $390k ADV → −18.99% stop fill) |
-| 7 | `low_momentum` | < +1.5% over ~5 min (timestamp-selected bars) | Weak moves can't pay a 5% target against a 2% stop |
-| 8 | `high_momentum` | > +15% over ~5 min | Post-halt spike — halt articles publish AFTER the 30–120% pop |
-| 9 | `low_volume` / `high_volume` | RVOL outside [1.5, 20] | See below |
+| 7 | `low_momentum` | < +0.2% over ~5 min (v15: dead-tape noise floor only) | Just rejects "the catalyst moved nothing"; VWAP does the real work (step 10) |
+| 8 | `high_momentum` | > +15% over ~5 min | Post-halt spike — halt articles publish AFTER the 30–120% pop. Runs before VWAP to save a credit |
+| 9 | `low_volume` / `high_volume` | RVOL outside [1.5, 20] | See RVOL section |
+| 10 | `below_vwap` | price < session VWAP (− small tol) | v15: size-neutral accumulation test — see below |
+
+### Momentum confirmation: why VWAP, not a fixed % (v15)
+
+The v14 fixed momentum floor (+1.5% over 5 min) was the strategy's binding
+constraint — **1,077 of all-time rejections were `low_momentum`**, and on
+2026-06-15 *every* genuine large-cap catalyst was rejected at near-zero
+5-minute change: DXCM (FDA) +0.14%, SNY (FDA) +0.07%, LLY (product) +0.01%.
+
+The reason is structural, not a bug: **a deep order book reprices slowly.** A
+real catalyst on a $50B+ name is absorbed by liquidity and drifts over hours
+(post-earnings-announcement drift), where a micro-cap with the same news jumps
+several percent in seconds. **No single % threshold can serve both** a $2
+micro-cap and a $1000 mega-cap.
+
+The research-backed fix is to confirm with **VWAP-relative position**, which is
+*size-neutral*:
+
+- **VWAP** (volume-weighted average price, accumulated from the open) is the
+  intraday "fair value" line institutions benchmark against.
+- A stock **held at or above VWAP** is being *accumulated* — net institutional
+  buying — regardless of whether its 5-min % change is +0.2% or +5%.
+- A stock **below VWAP** is being *distributed* (the classic "gap-and-crap":
+  gap up at the open, fade all day) — regardless of % change.
+
+So v15 replaces the fixed floor with: a tiny **dead-tape noise floor** (0.2%,
+just "did it move at all"), the unchanged **post-halt ceiling** (15%), the
+**RVOL band** (participation), and finally the **VWAP gate** (accumulation).
+VWAP runs last because it costs an extra Twelvedata credit (a full-session bar
+pull); every cheaper gate filters first.
+
+**Research basis:**
+- Post-earnings-announcement drift: large-caps price the immediate surprise
+  fast then drift; the tradeable signal is direction/accumulation, not the
+  magnitude of the first 5-minute candle.
+- Practitioner VWAP-reclaim / catalyst playbooks: "RVOL ≥ 1.5–2× is the proxy
+  for whether a stock is in play"; "enter on the first candle that closes back
+  above VWAP" — confirmation by *structure* (VWAP) rather than a fixed % move.
+- Sources: [PEAD (Wikipedia)](https://en.wikipedia.org/wiki/Post%E2%80%93earnings-announcement_drift),
+  [VWAP momentum strategy playbook](https://www.snappchart.app/blog/strategy-playbooks/vwap-momentum-trading-strategy),
+  [volume confirmation for entries](https://www.quantvps.com/blog/using-volume-analysis-to-confirm-trade-entries-and-exits).
 
 ### RVOL — time-of-day normalized relative volume
 

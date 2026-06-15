@@ -336,6 +336,134 @@ class TestRvol:
         assert rvol == pytest.approx(1.0, rel=1e-3)
 
 
+# ── Symbol hygiene tests (v15) ────────────────────────────────────────────────
+
+class TestSymbolCleaning:
+    """Tests for trading/executor.py::clean_benzinga_symbol / resolve_t212_ticker"""
+
+    def test_plain_us_symbol_unchanged(self):
+        from trading.executor import clean_benzinga_symbol
+        assert clean_benzinga_symbol("AAPL") == "AAPL"
+        assert clean_benzinga_symbol("aapl") == "AAPL"  # uppercased
+
+    def test_foreign_exchange_prefix_dropped(self):
+        from trading.executor import clean_benzinga_symbol
+        # The 2026-06-15 leak: TSX:MDA reached the price check and burned an
+        # eval window. Foreign listings are not US-tradeable → drop entirely.
+        assert clean_benzinga_symbol("TSX:MDA") is None
+        assert clean_benzinga_symbol("LON:VOD") is None
+        assert clean_benzinga_symbol("ASX:BHP") is None
+
+    def test_unknown_exchange_prefix_dropped(self):
+        from trading.executor import clean_benzinga_symbol
+        # Any colon = exchange routing we don't recognise → not a clean US symbol
+        assert clean_benzinga_symbol("XYZ:ABC") is None
+
+    def test_disambiguation_digit_stripped(self):
+        from trading.executor import clean_benzinga_symbol
+        # Benzinga collision suffix: INBX1 → INBX, SAIL1 → SAIL
+        assert clean_benzinga_symbol("INBX1") == "INBX"
+        assert clean_benzinga_symbol("SAIL1") == "SAIL"
+
+    def test_short_symbols_not_mangled(self):
+        from trading.executor import clean_benzinga_symbol
+        # Guard: only strip the digit when stem stays a plausible 2+ char symbol
+        # and length >= 4. Short tickers with digits are left alone.
+        assert clean_benzinga_symbol("BV1") == "BV1"   # too short to strip
+        assert clean_benzinga_symbol("F") == "F"       # single-letter US ticker
+
+    def test_class_share_dot_preserved(self):
+        from trading.executor import clean_benzinga_symbol
+        assert clean_benzinga_symbol("BRK.A") == "BRK.A"
+
+    def test_empty_returns_none(self):
+        from trading.executor import clean_benzinga_symbol
+        assert clean_benzinga_symbol("") is None
+
+    def test_resolve_returns_none_for_foreign(self):
+        from trading.executor import resolve_t212_ticker
+        assert resolve_t212_ticker("TSX:MDA") is None
+
+    def test_resolve_appends_us_eq_fallback(self):
+        from trading.executor import resolve_t212_ticker
+        # Not in the (empty in tests) symbol map → fallback format
+        assert resolve_t212_ticker("AAPL") == "AAPL_US_EQ"
+        # With cleaning applied first
+        assert resolve_t212_ticker("INBX1") == "INBX_US_EQ"
+
+
+# ── Quote fallback tests (v15) ────────────────────────────────────────────────
+
+class TestQuoteFallback:
+    """Tests for market/price_check.py::get_quote_with_fallback"""
+
+    @patch("market.price_check.get_twelvedata_quote")
+    @patch("market.price_check.get_finnhub_quote")
+    def test_finnhub_used_when_available(self, mock_finnhub, mock_td):
+        from market.price_check import get_quote_with_fallback
+        mock_finnhub.return_value = {"c": 100.0, "o": 99.0, "pc": 98.0}
+        q = get_quote_with_fallback("AAPL")
+        assert q["c"] == 100.0
+        mock_td.assert_not_called()  # no fallback when primary answers
+
+    @patch("market.price_check.get_twelvedata_quote")
+    @patch("market.price_check.get_finnhub_quote")
+    def test_falls_back_to_twelvedata(self, mock_finnhub, mock_td):
+        from market.price_check import get_quote_with_fallback
+        mock_finnhub.return_value = None  # Finnhub has no coverage
+        mock_td.return_value = {"c": 8.15, "o": 8.0, "pc": 3.97}
+        q = get_quote_with_fallback("CUPR")
+        assert q["c"] == 8.15
+        assert q["pc"] == 3.97
+        mock_td.assert_called_once()
+
+    @patch("market.price_check.get_twelvedata_quote")
+    @patch("market.price_check.get_finnhub_quote")
+    def test_returns_none_when_both_fail(self, mock_finnhub, mock_td):
+        from market.price_check import get_quote_with_fallback
+        mock_finnhub.return_value = None
+        mock_td.return_value = None
+        assert get_quote_with_fallback("NOPE") is None
+
+
+# ── VWAP computation tests (v15) ──────────────────────────────────────────────
+
+class TestVwap:
+    """Tests for market/twelvedata_bars.py::get_session_vwap"""
+
+    def _bar(self, dt, h, l, c, v):
+        return {"datetime": dt, "high": str(h), "low": str(l), "close": str(c), "volume": str(v)}
+
+    def _today_bars(self):
+        """Two same-day ET bars (newest first), so the session filter keeps both."""
+        from datetime import datetime
+        import pytz
+        now_et = datetime.now(pytz.timezone("America/New_York"))
+        d = now_et.strftime("%Y-%m-%d")
+        # Heavy volume (900) at price 10, light (100) at 20.
+        # Use times safely in the past relative to "now" so they're today.
+        return [
+            self._bar(f"{d} 09:31:00", 20, 20, 20, 100),  # newest first
+            self._bar(f"{d} 09:30:00", 10, 10, 10, 900),
+        ]
+
+    @patch("market.twelvedata_bars._get_time_series")
+    def test_vwap_weighted_by_volume(self, mock_ts):
+        import market.twelvedata_bars as td
+        mock_ts.return_value = self._today_bars()
+        vwap, last = td.get_session_vwap("AAPL")
+        # typical prices 20 and 10; volume-weighted (20*100 + 10*900)/1000 = 11.0
+        assert vwap == pytest.approx(11.0, rel=1e-6)
+        assert last == 20.0  # last_price = most recent bar's close
+
+    @patch("market.twelvedata_bars._get_time_series")
+    def test_vwap_none_when_no_data(self, mock_ts):
+        import market.twelvedata_bars as td
+        mock_ts.return_value = None
+        vwap, last = td.get_session_vwap("AAPL")
+        assert vwap is None and last is None
+
+
 # ── Backtest cost model tests ─────────────────────────────────────────────────
 
 class TestBacktestCosts:
