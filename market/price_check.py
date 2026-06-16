@@ -176,9 +176,27 @@ def get_quote_with_fallback(symbol: str) -> dict | None:
 
     Both sources return the same normalised keys (c/o/pc), so callers don't
     need to know which one answered.
+
+    `pc` (previous close) gets special treatment: Finnhub's free tier routinely
+    returns pc=0 (or a stale pc) in the first minutes after the open, before its
+    daily rollover settles (observed 2026-06-16: OTLK/SLP/SPCB all had a valid
+    Finnhub price but pc=0 at 09:30 ET, which terminally rejected every premarket
+    candidate as "no prev close"). Finnhub being non-None is therefore NOT enough
+    to trust its pc — when pc is missing we backfill it from Twelvedata rather
+    than abandoning Finnhub's (otherwise good) real-time price. This is a cheap
+    one-credit call only on the names that need it.
     """
     quote = get_finnhub_quote(symbol)
     if quote is not None:
+        if not (float(quote.get("pc") or 0) > 0):
+            td = get_twelvedata_quote(symbol)
+            td_pc = float(td.get("pc") or 0) if td else 0
+            if td_pc > 0:
+                logger.info(
+                    "Quote [%s]: Finnhub pc missing (%.4f) — backfilled prev close "
+                    "%.4f from Twelvedata", symbol, float(quote.get("pc") or 0), td_pc,
+                )
+                quote["pc"] = td_pc
         return quote
     logger.info("Quote [%s]: no Finnhub coverage — trying Twelvedata fallback", symbol)
     return get_twelvedata_quote(symbol)

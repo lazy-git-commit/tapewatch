@@ -201,7 +201,15 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
         # ── Gap gate: vs previous close, gap included ────────────────────────
         gap_pct = conf.day_change_pct
         if gap_pct is None:
-            update_premarket_candidate(cand_id, "rejected", "no prev close — gap unknown")
+            # A missing previous close at the open is a TRANSIENT data condition,
+            # not a verdict on the candidate (Finnhub returns pc=0 in the first
+            # minutes; the Twelvedata daily bar can lag too). Treat it like
+            # opening_block / data-unavailable: stay pending and retry next cycle
+            # within the 30-min window. Before 2026-06-16 this was a terminal
+            # rejection that killed every real catalyst (OTLK +27%, SPCB +18%).
+            logger.info(
+                "Pre-market eval [%s]: prev close unavailable — retrying next cycle", ticker
+            )
             continue
         if gap_pct < cfg.min_gap_pct:
             update_premarket_candidate(

@@ -133,6 +133,19 @@ Twelvedata). `get_quote_with_fallback()` tries Finnhub, then Twelvedata
 `/quote`; both return the same `c`/`o`/`pc` keys so callers are source-agnostic.
 Only when BOTH miss is a signal deemed unpriceable.
 
+**Previous-close backfill (v15.2):** Finnhub being reachable is not enough to
+trust its `pc` (previous close). In the first minutes after the open Finnhub's
+free tier routinely returns `pc=0` before its daily rollover settles (2026-06-16:
+OTLK/SLP/SPCB all had a valid Finnhub price but `pc=0` at 09:30 ET). Because the
+gap gate and the dead-cat/extended-move filters all measure vs prev close, a
+missing `pc` made `day_change_pct` `None`, which **terminally rejected every
+pre-market candidate as "no prev close"** — the real reason zero gap-and-go
+trades fired despite multiple genuine catalysts. `get_quote_with_fallback()` now
+backfills `pc` from Twelvedata whenever Finnhub's `pc` is ≤ 0, keeping Finnhub's
+(good) real-time price. The pre-market evaluator also treats a still-missing prev
+close as a **transient, retryable** condition (stay pending, retry within the
+30-min window) rather than a verdict — same handling as `opening_block`.
+
 Checks run cheapest-first; each rejection records a `reason_code`:
 
 | # | Code | Rule (defaults) | Motivating incident |

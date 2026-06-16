@@ -425,6 +425,31 @@ class TestQuoteFallback:
         mock_td.return_value = None
         assert get_quote_with_fallback("NOPE") is None
 
+    @patch("market.price_check.get_twelvedata_quote")
+    @patch("market.price_check.get_finnhub_quote")
+    def test_pc_backfilled_when_finnhub_pc_zero(self, mock_finnhub, mock_td):
+        # Regression (2026-06-16): Finnhub returns a valid price but pc=0 in the
+        # first minutes after open. Must backfill prev close from Twelvedata
+        # rather than returning the unusable pc — otherwise every premarket
+        # candidate (OTLK +27%, SPCB +18%) is terminally rejected "no prev close".
+        from market.price_check import get_quote_with_fallback
+        mock_finnhub.return_value = {"c": 1.53, "o": 1.19, "pc": 0}
+        mock_td.return_value = {"c": 1.52, "o": 1.19, "pc": 1.16}
+        q = get_quote_with_fallback("OTLK")
+        assert q["c"] == 1.53           # keeps Finnhub's real-time price
+        assert q["pc"] == 1.16          # backfilled from Twelvedata
+        mock_td.assert_called_once()
+
+    @patch("market.price_check.get_twelvedata_quote")
+    @patch("market.price_check.get_finnhub_quote")
+    def test_no_backfill_when_finnhub_pc_valid(self, mock_finnhub, mock_td):
+        # When Finnhub's pc is good, don't burn a Twelvedata credit.
+        from market.price_check import get_quote_with_fallback
+        mock_finnhub.return_value = {"c": 100.0, "o": 99.0, "pc": 98.0}
+        q = get_quote_with_fallback("AAPL")
+        assert q["pc"] == 98.0
+        mock_td.assert_not_called()
+
 
 # ── VWAP computation tests (v15) ──────────────────────────────────────────────
 

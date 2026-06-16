@@ -7,6 +7,43 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v15.2 — 2026-06-16 (prev-close backfill — fixes zero pre-market trades)
+
+Investigation of "why no trades today" (212 positives scored, 31 gate-passing,
+**0 trades**). Root cause was a single data bug masking every pre-market catalyst.
+
+- **The bug.** Finnhub's free `/quote` returns `pc=0` (previous close) in the
+  first minutes after the open, before its daily rollover settles. Every gap /
+  dead-cat / extended-move filter measures vs prev close, so a zero `pc` made
+  `day_change_pct = None`, and the pre-market evaluator rejected the candidate
+  **terminally** as "no prev close — gap unknown". Confirmed in the DB: all 19
+  rejected pre-market candidates today (incl. OTLK +27%, SPCB +18%, SLP M&A)
+  carried that exact note. `get_quote_with_fallback()` never consulted
+  Twelvedata because Finnhub *was* reachable — it just had a bad `pc`.
+
+- **Fix 1 — `pc` backfill (`market/price_check.py`).** When Finnhub's quote has
+  `pc ≤ 0`, backfill prev close from Twelvedata (which carried the correct value
+  for every affected name) while keeping Finnhub's real-time price. One extra
+  credit only on the names that need it.
+
+- **Fix 2 — retryable missing-pc (`premarket/scanner.py`).** A still-missing prev
+  close at the open is now a transient, retryable condition (stay pending, retry
+  within the 30-min window) — same handling as `opening_block` — not a terminal
+  rejection.
+
+- **Honest scope note.** With the fix, most of today's hindsight "winners" are
+  *still* correctly rejected — OTLK/TRNR are sub-$5 (`penny_stock`), SPCB/SLP
+  are below the $5M ADV floor (`illiquid`) with RVOL ~1.3 (< 1.5). The fix does
+  not loosen risk; it replaces a **false** rejection reason ("no prev close",
+  which would also kill a legitimate liquid large-cap gapping on morning news)
+  with the **correct** fundamental one. Genuinely unpriceable tags
+  (OLIT/STI1/VHNA/IIVI — delisted/SPAC/merged) still 404 on both sources and
+  expire correctly.
+
+- Tests 47 → 49 (`TestQuoteFallback`: pc-backfill + no-backfill-when-valid).
+
+---
+
 ## v15.1 — 2026-06-15 (deep logic audit)
 
 Full code audit against quant-desk standards. Findings + fixes:
