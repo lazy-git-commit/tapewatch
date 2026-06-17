@@ -130,6 +130,7 @@ def premarket_scan() -> None:
                 catalyst_type=item.catalyst_type,
                 confidence=item.confidence,
                 published_at=item.published_at.isoformat(),
+                catalyst_magnitude=item.catalyst_magnitude,
             )
             logger.info(
                 "Pre-market candidate #%d added: [%s] %s (catalyst=%s conf=%.2f)",

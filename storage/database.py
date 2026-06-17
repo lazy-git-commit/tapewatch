@@ -156,6 +156,10 @@ def init_db() -> None:
                 ALTER TABLE sentiment_scores
                 ADD COLUMN IF NOT EXISTS catalyst_magnitude INTEGER
             """)
+            cur.execute("""
+                ALTER TABLE premarket_candidates
+                ADD COLUMN IF NOT EXISTS catalyst_magnitude INTEGER
+            """)
             # Eval-loop table: EVERY Claude classification (positive, neutral,
             # negative) is stored here; a nightly job fills in forward returns
             # so prompt changes can be measured, not guessed.
@@ -524,6 +528,7 @@ def is_premarket_candidate_seen(article_id: str, ticker: str) -> bool:
 def save_premarket_candidate(
     article_id: str, ticker: str, headline: str,
     catalyst_type: str, confidence: float, published_at: str,
+    catalyst_magnitude: int | None = None,
 ) -> int:
     """Add a scored pre-market article to the at-open watchlist."""
     with get_conn() as conn:
@@ -531,11 +536,11 @@ def save_premarket_candidate(
             cur.execute(
                 """INSERT INTO premarket_candidates
                    (article_id, ticker, headline, catalyst_type, confidence,
-                    published_at, created_at, status)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
+                    published_at, created_at, status, catalyst_magnitude)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)
                    RETURNING id""",
                 (article_id, ticker, headline, catalyst_type, confidence,
-                 published_at, _now_london()),
+                 published_at, _now_london(), catalyst_magnitude),
             )
             return cur.fetchone()["id"]
 

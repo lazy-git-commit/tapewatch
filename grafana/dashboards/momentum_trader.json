@@ -266,7 +266,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT fetched_at, ticker, confidence, acted_on, rejection_code, rejection_reason, headline, published_at FROM news_signals ORDER BY fetched_at DESC LIMIT 200",
+          "rawSql": "SELECT fetched_at, ticker, confidence, catalyst_type, catalyst_magnitude AS mag, acted_on, rejection_code, rejection_reason, headline, published_at FROM news_signals ORDER BY fetched_at DESC LIMIT 200",
           "format": "table",
           "refId": "A"
         }
@@ -541,7 +541,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ticker, catalyst_type, ROUND(confidence::numeric, 2) AS conf, status, eval_note, headline FROM premarket_candidates WHERE created_at LIKE TO_CHAR(NOW(), 'YYYY-MM-DD') || '%' ORDER BY confidence DESC",
+          "rawSql": "SELECT ticker, catalyst_type, catalyst_magnitude AS mag, ROUND(confidence::numeric, 2) AS conf, status, eval_note, headline FROM premarket_candidates WHERE created_at LIKE TO_CHAR(NOW(), 'YYYY-MM-DD') || '%' ORDER BY confidence DESC",
           "format": "table",
           "refId": "A"
         }
@@ -597,7 +597,84 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT catalyst_type, COUNT(*) AS n, ROUND(AVG(fwd_return_15m)::numeric, 2) AS avg_15m_pct, ROUND(AVG(fwd_return_60m)::numeric, 2) AS avg_60m_pct FROM sentiment_scores WHERE sentiment = 'positive' AND returns_computed_at IS NOT NULL GROUP BY catalyst_type ORDER BY avg_15m_pct DESC",
+          "rawSql": "SELECT catalyst_type, ROUND(AVG(catalyst_magnitude)::numeric, 1) AS avg_mag, COUNT(*) AS n, ROUND(AVG(fwd_return_15m)::numeric, 2) AS avg_15m_pct, ROUND(AVG(fwd_return_60m)::numeric, 2) AS avg_60m_pct FROM sentiment_scores WHERE sentiment = 'positive' AND returns_computed_at IS NOT NULL GROUP BY catalyst_type ORDER BY avg_15m_pct DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Catalyst Magnitude vs 15-min Return (positives)",
+      "type": "table",
+      "description": "Does scoring a higher magnitude actually produce better returns? This is the key eval-loop question for the v15.8 catalyst_magnitude feature. Expect magnitude 4-5 to show higher avg_15m_pct once enough data accumulates.",
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "avg_15m_pct" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "yellow", "value": 0 },
+                    { "color": "green", "value": 1 }
+                  ]
+                }
+              },
+              { "id": "custom.displayMode", "value": "color-background" }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT catalyst_magnitude AS magnitude, COUNT(*) AS n, ROUND(AVG(fwd_return_15m)::numeric, 2) AS avg_15m_pct, ROUND(AVG(fwd_return_60m)::numeric, 2) AS avg_60m_pct, ROUND((AVG((fwd_return_15m > 2)::int) * 100)::numeric, 0) AS pct_moved_2pct FROM sentiment_scores WHERE sentiment = 'positive' AND returns_computed_at IS NOT NULL AND catalyst_magnitude IS NOT NULL GROUP BY catalyst_magnitude ORDER BY catalyst_magnitude DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Magnitude Gate Funnel (sentiment_scores, last 7 days)",
+      "type": "table",
+      "description": "Shows how many signals the magnitude gate is filtering. All fetcher-gate drops (confidence, catalyst type, already_moved, magnitude) are visible here via sentiment_scores — which stores every Claude classification before any gate is applied.",
+      "gridPos": {
+        "x": 12,
+        "y": 45,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT catalyst_magnitude AS mag, sentiment, COUNT(*) AS n FROM sentiment_scores WHERE scored_at >= TO_CHAR(NOW() - INTERVAL '7 days', 'YYYY-MM-DD') AND catalyst_magnitude IS NOT NULL GROUP BY catalyst_magnitude, sentiment ORDER BY catalyst_magnitude DESC, sentiment",
           "format": "table",
           "refId": "A"
         }
