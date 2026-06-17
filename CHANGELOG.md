@@ -7,6 +7,41 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v15.6 — 2026-06-17 (three correctness fixes from second code review)
+
+Three bugs identified in a second independent code review of v15.3–v15.5:
+
+- **`open_at_time()` ValueError in pre/post-market.** `open_at_time()` raises
+  `ValueError("The provided timestamp is not covered by the schedule")` when
+  called outside the session window (before open, after close). The broad
+  `except Exception` handler was catching this and falling through to a Finnhub
+  network call — so every news cycle tick before 13:30 UTC burned a Finnhub
+  API credit unnecessarily. Fixed: catch `ValueError` separately and return
+  `False` immediately. Generic exceptions still fall back to Finnhub.
+
+- **`sell()` `force_market` parameter.** The emergency DB-failure flatten in
+  `main.py` was using `reason="eod_flatten"` to force a market order — correct
+  behaviour, wrong semantic. Logs would record `reason=eod_flatten` for a DB
+  failure event, making forensics harder. Added `force_market: bool = False`
+  keyword argument to `sell()`. The routing is now `force_market or reason ==
+  "eod_flatten"`. Emergency flatten calls pass `reason="db_record_failed",
+  force_market=True`. EOD flatten still passes `reason="eod_flatten"`.
+
+- **GBP/USD currency mismatch in `calculate_quantity()`.** T212 cash API
+  returns portfolio value and available cash in GBP. Stock prices and ADV are
+  in USD. `quantity = max_spend / price` was dividing GBP by USD — dimensionally
+  wrong — systematically undersizing by ~21% (at GBP/USD 1.27). Fixed: fetch
+  live GBP/USD rate from Twelvedata (`get_gbp_usd_rate()`, 60-second in-process
+  cache, falls back to 1.27 if the API is unavailable). All four sizing
+  constraints computed in GBP; budget converted to USD before `/ price`.
+  The ADV participation cap is also correctly converted (USD ADV → GBP before
+  comparison, GBP budget → USD before division).
+
+Tests: 61 (no new tests; existing TestPositionSizing tests updated to mock
+`get_gbp_usd_rate=1.0` so they test sizing logic independently of FX).
+
+---
+
 ## v15.5 — 2026-06-17 (market-open DST detection fix — zero pre-market trades)
 
 Second zero-trade-day investigation (same session as v15.4). Root cause: a

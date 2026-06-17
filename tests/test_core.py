@@ -194,37 +194,43 @@ class TestPositionSizing:
     def _mock_cash(self, total, free):
         return {"total": total, "free": free, "invested": total - free}
 
+    @patch("trading.executor.get_gbp_usd_rate", return_value=1.0)
     @patch("trading.executor._get")
-    def test_quantity_respects_max_position_pct(self, mock_get):
+    def test_quantity_respects_max_position_pct(self, mock_get, _mock_fx):
         from trading.executor import calculate_quantity
         mock_get.return_value = self._mock_cash(total=10000.0, free=10000.0)
         # Hard cap binds: 5% of £10,000 = £500 (risk cap is 0.25%/2% = £1,250).
-        # At £100/share = 5 shares
+        # FX mocked to 1.0 so GBP budget == USD spend; at $100/share = 5 shares.
         quantity, err = calculate_quantity("AAPL_US_EQ", price=100.0)
         assert err is None
         assert quantity == pytest.approx(5.0, rel=1e-4)
 
+    @patch("trading.executor.get_gbp_usd_rate", return_value=1.0)
     @patch("trading.executor._get")
-    def test_quantity_capped_by_available_cash(self, mock_get):
+    def test_quantity_capped_by_available_cash(self, mock_get, _mock_fx):
         from trading.executor import calculate_quantity
         mock_get.return_value = self._mock_cash(total=10000.0, free=200.0)
-        # 5% of £10,000 = £500, but only £200 cash available → use £200
+        # 5% of £10,000 = £500, but only £200 cash available → use £200.
+        # FX mocked to 1.0 so £200 budget == $200; at $100/share = 2 shares.
         quantity, err = calculate_quantity("AAPL_US_EQ", price=100.0)
         assert err is None
         assert quantity == pytest.approx(2.0, rel=1e-4)
 
+    @patch("trading.executor.get_gbp_usd_rate", return_value=1.0)
     @patch("trading.executor._get")
-    def test_quantity_capped_by_adv_participation(self, mock_get):
+    def test_quantity_capped_by_adv_participation(self, mock_get, _mock_fx):
         from trading.executor import calculate_quantity
         mock_get.return_value = self._mock_cash(total=10000.0, free=10000.0)
-        # ADV participation cap: 0.5% of $20,000 ADV = £100 — binds below the
-        # £500 hard cap. This is what keeps exits from moving thin books.
+        # ADV participation cap: 0.5% of $20,000 ADV = $100 USD cap.
+        # Divided by fx=1.0 → £100 GBP cap, which binds below the £500 hard cap.
+        # At $100/share = 1 share. This is what keeps exits from moving thin books.
         quantity, err = calculate_quantity("THIN_US_EQ", price=100.0, avg_dollar_volume=20_000)
         assert err is None
         assert quantity == pytest.approx(1.0, rel=1e-4)
 
+    @patch("trading.executor.get_gbp_usd_rate", return_value=1.0)
     @patch("trading.executor._get")
-    def test_zero_cash_returns_none(self, mock_get):
+    def test_zero_cash_returns_none(self, mock_get, _mock_fx):
         from trading.executor import calculate_quantity
         mock_get.return_value = self._mock_cash(total=1000.0, free=0.0)
         quantity, err = calculate_quantity("AAPL_US_EQ", price=100.0)

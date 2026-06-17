@@ -83,6 +83,40 @@ def get_credits_used_today() -> int:
     return _credit_meter["used"] if _credit_meter["date"] == today else 0
 
 
+# ── GBP/USD live rate ─────────────────────────────────────────────────────────
+# Cached with a 60-second TTL: position sizing is called at most once per signal,
+# but in burst news days we don't want to burn a credit per signal. The 60s stale
+# window is safe — FX intraday moves ~0.1%/min, which is inside the ADV cap's
+# safety margin. Falls back to 1.27 (5-year average) if the API is unavailable.
+
+_FX_CACHE: dict = {"rate": None, "ts": 0.0}
+_FX_CACHE_TTL = 60.0
+_FX_FALLBACK = 1.27
+
+
+def get_gbp_usd_rate() -> float:
+    """Return the live GBP/USD rate, cached for 60 s. Falls back to 1.27."""
+    import time as _time
+    now = _time.monotonic()
+    if _FX_CACHE["rate"] is not None and now - _FX_CACHE["ts"] < _FX_CACHE_TTL:
+        return _FX_CACHE["rate"]
+    try:
+        resp = requests.get(
+            f"{_BASE_URL}/price",
+            params={"symbol": "GBP/USD", "apikey": cfg.twelvedata_api_key},
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        rate = float(data["price"])
+        _FX_CACHE["rate"] = rate
+        _FX_CACHE["ts"] = now
+        return rate
+    except Exception as exc:
+        logger.warning("GBP/USD rate fetch failed: %s — using fallback %.4f", exc, _FX_FALLBACK)
+        return _FX_CACHE["rate"] if _FX_CACHE["rate"] else _FX_FALLBACK
+
+
 def _get_time_series(
     symbol: str,
     interval: str,

@@ -18,6 +18,7 @@ import time
 import requests
 from dataclasses import dataclass, field
 from config.settings import cfg
+from market.twelvedata_bars import get_gbp_usd_rate
 
 logger = logging.getLogger(__name__)
 
@@ -325,19 +326,18 @@ def calculate_quantity(
     Risk-based position sizing. Returns (quantity, error_reason).
 
     The position size is the MINIMUM of four constraints:
-      1. Hard cap        — max_position_size_pct of portfolio value.
-      2. Risk budget     — equity × risk_per_trade_pct / stop_loss_pct.
-                           Sizes the position so a stop-loss hit costs at most
-                           risk_per_trade_pct of the account. With the fixed
-                           2% stop the hard cap usually binds first; this term
-                           becomes active if stops are widened/dynamic.
+      1. Hard cap        — max_position_size_pct of portfolio value (GBP).
+      2. Risk budget     — equity × risk_per_trade_pct / stop_loss_pct (GBP).
       3. Liquidity cap   — max_adv_participation_pct of the stock's average
-                           daily dollar volume, so our own exit order can't
-                           move the price (GOAI: our market sell alone pushed
-                           the fill 11.7% below trigger). Approximation: ADV
-                           is USD, equity is GBP — the small FX difference is
-                           within the cap's safety margin.
-      4. Available cash.
+                           daily dollar volume converted to GBP, so our own
+                           exit order can't move the price (GOAI: our market
+                           sell alone pushed the fill 11.7% below trigger).
+      4. Available cash  (GBP).
+
+    All four constraints are in GBP. The GBP budget is then converted to USD
+    using the live GBP/USD rate before dividing by the USD stock price to get
+    quantity. This makes the ADV cap and the quantity division mathematically
+    consistent regardless of FX moves.
     """
     try:
         data = _get("/equity/account/cash")
@@ -354,6 +354,8 @@ def calculate_quantity(
         logger.warning("calculate_quantity for %s: %s", ticker, reason)
         return None, reason
 
+    fx = get_gbp_usd_rate()  # GBP → USD conversion factor
+
     hard_cap = portfolio_value * (cfg.max_position_size_pct / 100)
     risk_cap = (
         portfolio_value * (cfg.risk_per_trade_pct / 100) / (cfg.stop_loss_pct / 100)
@@ -361,26 +363,31 @@ def calculate_quantity(
     )
     constraints = [hard_cap, risk_cap, available_cash]
     if avg_dollar_volume is not None and avg_dollar_volume > 0:
-        constraints.append(avg_dollar_volume * (cfg.max_adv_participation_pct / 100))
+        # Convert USD ADV cap to GBP so all constraints are in the same currency.
+        adv_cap_gbp = (avg_dollar_volume * (cfg.max_adv_participation_pct / 100)) / fx
+        constraints.append(adv_cap_gbp)
 
-    max_spend = min(constraints)
-    if max_spend <= 0:
+    max_spend_gbp = min(constraints)
+    if max_spend_gbp <= 0:
         return None, "position size computed as zero"
+
+    # Convert GBP budget to USD to match the USD stock price, then size.
+    max_spend_usd = max_spend_gbp * fx
 
     # Trading 212 allows at most 4 decimal places for fractional quantities.
     # If the account is too small for even 0.0001 share, do not send a zero
     # quantity order and burn the signal on a broker-side validation error.
-    quantity = round(max_spend / price, 4)
+    quantity = round(max_spend_usd / price, 4)
     if quantity <= 0:
         return None, (
             f"position size below minimum fractional quantity "
-            f"(max_spend=£{max_spend:.2f}, price=${price:.4f})"
+            f"(max_spend=£{max_spend_gbp:.2f} / ${max_spend_usd:.2f}, price=${price:.4f})"
         )
     logger.info(
-        "Position size for %s: £%.2f (caps: hard=£%.0f risk=£%.0f adv=%s cash=£%.0f) "
-        "→ %.4f shares @ $%.4f",
-        ticker, max_spend, hard_cap, risk_cap,
-        f"£{avg_dollar_volume * cfg.max_adv_participation_pct / 100:.0f}" if avg_dollar_volume else "n/a",
+        "Position size for %s: £%.2f ($%.2f @ fx=%.4f) "
+        "(caps: hard=£%.0f risk=£%.0f adv=%s cash=£%.0f) → %.4f shares @ $%.4f",
+        ticker, max_spend_gbp, max_spend_usd, fx, hard_cap, risk_cap,
+        f"£{adv_cap_gbp:.0f}" if avg_dollar_volume else "n/a",
         available_cash, quantity, price,
     )
     return quantity, None
@@ -547,7 +554,7 @@ def buy(ticker: str, price: float, avg_dollar_volume: float | None = None) -> Or
         )
 
 
-def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult:
+def sell(ticker: str, quantity: float, price: float, reason: str, *, force_market: bool = False) -> OrderResult:
     """
     Close a position with BOUNDED slippage.
 
@@ -557,11 +564,13 @@ def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult
     collapsing book it caps the damage at the slack instead of chasing the
     bid down (GOAI: market sell filled −18.99% on a −2% stop trigger).
 
-    EOD flatten:
-      - Uses a MARKET order. At the close, execution certainty beats bounded
-        slippage; carrying a momentum name overnight is the larger risk.
+    force_market=True bypasses the limit order entirely (used for EOD flatten
+    and emergency exits where execution certainty beats slippage control).
+    EOD flatten passes reason="eod_flatten"; emergency DB-failure exits pass
+    reason="db_record_failed" with force_market=True — keeping the reason
+    accurate for logs and reporting while still routing through market order.
 
-    Fill handling for non-EOD exits:
+    Fill handling for non-market exits:
       - FILLED within the poll window → success with real fill data.
       - Unfilled after the window → cancel and report failure; the monitor
         keeps the position open and retries next cycle (20s later) at the
@@ -573,7 +582,7 @@ def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult
     """
     limit_price = _round_price(price * (1 - cfg.sell_limit_slack_pct / 100))
     order_id: str | None = None
-    used_market_fallback = reason == "eod_flatten"
+    used_market_fallback = force_market or reason == "eod_flatten"
     try:
         if used_market_fallback:
             order = _post("/equity/orders/market", {"quantity": -quantity, "ticker": ticker})
