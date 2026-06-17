@@ -56,6 +56,7 @@ from storage.database import (
 logger = logging.getLogger(__name__)
 
 _ET = pytz.timezone("America/New_York")
+_LONDON = pytz.timezone("Europe/London")
 
 # Candidates are only evaluated during the first N minutes after the open.
 # Past that, the gap-and-go edge is gone — late entries on morning news are
@@ -165,7 +166,7 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
         return []
 
     minutes_open = _minutes_since_open()
-    today_str = _now_et().strftime("%Y-%m-%d")
+    today_london = datetime.now(_LONDON).date()
     approved: list[tuple[dict, PriceConfirmation]] = []
 
     for cand in pending:
@@ -175,8 +176,16 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
         # ── Expire stale candidates ──────────────────────────────────────────
         # (a) created on a previous day — the catalyst is old news now;
         # (b) evaluation window closed — gap-and-go is a first-30-min trade.
-        created_day = str(cand.get("created_at", ""))[:10]
-        if created_day != today_str:
+        # created_at is stored as a London-offset ISO string; parse it back
+        # to a London date so midnight-straddling comparisons are correct.
+        try:
+            created_ts = datetime.fromisoformat(str(cand.get("created_at", "")))
+            if created_ts.tzinfo is None:
+                created_ts = _LONDON.localize(created_ts)
+            created_day = created_ts.astimezone(_LONDON).date()
+        except (ValueError, TypeError):
+            created_day = None
+        if created_day != today_london:
             update_premarket_candidate(cand_id, "expired", f"stale: created {created_day}")
             continue
         if minutes_open > _EVAL_WINDOW_MINUTES:

@@ -41,7 +41,10 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import pytz
 import yfinance as yf
+
+_ET = pytz.timezone("America/New_York")
 
 from storage.database import get_scores_missing_returns, update_forward_returns
 
@@ -120,7 +123,10 @@ def compute_forward_returns(batch_limit: int = 500) -> int:
         if (datetime.now(timezone.utc) - published).total_seconds() < 65 * 60:
             continue
 
-        bars = _get_intraday_bars(symbol, published.replace(hour=0, minute=0, second=0, microsecond=0))
+        # Use the ET calendar date — NYSE bars are indexed on the ET session,
+        # so an article at 20:15 UTC (15:15 ET) must fetch the ET date's bars.
+        et_date = published.astimezone(_ET).replace(hour=0, minute=0, second=0, microsecond=0)
+        bars = _get_intraday_bars(symbol, et_date)
         if bars is None:
             update_forward_returns(row["id"], None, None, None)
             updated += 1

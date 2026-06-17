@@ -308,6 +308,8 @@ def _candidate_to_news_item(cand: dict) -> NewsItem:
     london = pytz.timezone("Europe/London")
     try:
         published_at = datetime.fromisoformat(str(cand["published_at"]))
+        if published_at.tzinfo is None:
+            published_at = london.localize(published_at)
     except (ValueError, TypeError):
         published_at = datetime.now(london)
     return NewsItem(

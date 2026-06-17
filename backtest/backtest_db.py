@@ -146,8 +146,8 @@ def fetch_signals_for_dates(start_date: str, end_date: str) -> list[SignalRecord
                 SELECT id, ticker, headline, published_at, confidence, acted_on, rejection_code
                 FROM news_signals
                 WHERE sentiment = 'positive'
-                  AND created_at::timestamptz >= %s::date
-                  AND created_at::timestamptz < %s::date
+                  AND (created_at::timestamptz AT TIME ZONE 'Europe/London')::date >= %s::date
+                  AND (created_at::timestamptz AT TIME ZONE 'Europe/London')::date < %s::date
                 ORDER BY published_at ASC
                 """,
                 (start_date, end_date),
@@ -158,9 +158,10 @@ def fetch_signals_for_dates(start_date: str, end_date: str) -> list[SignalRecord
         try:
             pub = datetime.fromisoformat(str(r["published_at"]).replace("Z", "+00:00"))
             if pub.tzinfo is None:
-                pub = pub.replace(tzinfo=timezone.utc)
+                pub = pytz.timezone("Europe/London").localize(pub)  # write path is _now_london()
+            pub = pub.astimezone(timezone.utc)
         except (ValueError, TypeError):
-            pub = datetime.now(timezone.utc)
+            continue  # unparseable published_at — skip rather than corrupt backtest
         signals.append(SignalRecord(
             signal_id=r["id"],
             ticker=r["ticker"],
@@ -181,8 +182,8 @@ def fetch_actual_trades(start_date: str, end_date: str) -> dict[int, dict]:
                 """
                 SELECT t.*, t.signal_id
                 FROM trades t
-                WHERE t.buy_time::timestamptz >= %s::date
-                  AND t.buy_time::timestamptz < %s::date
+                WHERE (t.buy_time::timestamptz AT TIME ZONE 'Europe/London')::date >= %s::date
+                  AND (t.buy_time::timestamptz AT TIME ZONE 'Europe/London')::date < %s::date
                 """,
                 (start_date, end_date),
             )

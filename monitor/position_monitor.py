@@ -32,6 +32,7 @@ Price fetch failure policy:
 
 import logging
 from datetime import datetime, timezone
+import pytz
 from market.price_check import get_current_price, is_market_open, minutes_until_close
 from trading.executor import (
     sell, get_order_status, cancel_order, _fetch_fill, _parse_fill,
@@ -45,11 +46,17 @@ from config.settings import cfg
 logger = logging.getLogger(__name__)
 
 
+_LONDON = pytz.timezone("Europe/London")
+
+
 def _parse_utc(iso_str: str) -> datetime:
     dt = datetime.fromisoformat(iso_str)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+        # Timestamps are written by _now_london() — treat naive strings as London
+        # rather than UTC so a missing offset doesn't introduce a 1-hour error
+        # during BST when computing elapsed time against datetime.now(utc).
+        dt = _LONDON.localize(dt)
+    return dt.astimezone(timezone.utc)
 
 
 def check_exit_conditions(trade: dict, has_resting_tp: bool = False) -> tuple[bool, str, float | None]:
