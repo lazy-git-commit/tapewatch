@@ -7,6 +7,42 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v15.7 — 2026-06-17 (three correctness fixes from third code review)
+
+Three bugs identified by automated multi-angle code review of v15.6:
+
+- **`get_gbp_usd_rate()` cache and zero-rate bugs (3-in-1).** (a) The fallback
+  expression `if _FX_CACHE["rate"] else _FX_FALLBACK` used truthiness, so a
+  cached `0.0` from a malformed Twelvedata response (`{"price": "0"}`) would
+  either be served directly (ZeroDivisionError in `adv_cap_gbp = ... / fx`) or
+  incorrectly replaced by the hardcoded fallback. Fixed: added an explicit
+  `rate <= 0` guard that raises before caching, and changed the fallback
+  expression to `is not None`. (b) On API failure, `_FX_CACHE["ts"]` was not
+  updated, so every subsequent call during an outage fired a new HTTP request
+  (retry storm) instead of throttling to one attempt per TTL window. Fixed:
+  always update `ts` in the except branch.
+
+- **`ValueError` discrimination in `is_market_open()`.** `open_at_time()` raises
+  `ValueError` for two distinct reasons: (a) timestamp outside the session window
+  — correct, means closed; (b) schedule column validation failure — a
+  programming error (pmc schema/version mismatch). The broad `except ValueError:
+  return False` silently swallowed case (b), bypassing the Finnhub fallback
+  entirely. Fixed: check the exception message; only return `False` for the
+  session-window case, let unexpected ValueErrors fall through to Finnhub.
+
+- **EOD flatten `force_market` not explicit in `position_monitor`.** The
+  `sell()` call for EOD exits passed `reason="eod_flatten"` without
+  `force_market=True`. Market-order routing depended solely on a string literal
+  match inside `sell()`. A reason-string refactor would silently revert to a
+  bounded limit order near the close, risking overnight carry. Fixed:
+  `sell(..., force_market=(reason == "eod_flatten"))` so the flag is always
+  set explicitly at the call site.
+
+Tests: 61 → 63 (two new: `test_outside_session_window_returns_false`,
+`test_schema_valueerror_falls_back_to_finnhub`).
+
+---
+
 ## v15.6 — 2026-06-17 (three correctness fixes from second code review)
 
 Three bugs identified in a second independent code review of v15.3–v15.5:

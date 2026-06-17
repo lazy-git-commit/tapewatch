@@ -96,8 +96,7 @@ _FX_FALLBACK = 1.27
 
 def get_gbp_usd_rate() -> float:
     """Return the live GBP/USD rate, cached for 60 s. Falls back to 1.27."""
-    import time as _time
-    now = _time.monotonic()
+    now = time.monotonic()
     if _FX_CACHE["rate"] is not None and now - _FX_CACHE["ts"] < _FX_CACHE_TTL:
         return _FX_CACHE["rate"]
     try:
@@ -109,12 +108,17 @@ def get_gbp_usd_rate() -> float:
         resp.raise_for_status()
         data = resp.json()
         rate = float(data["price"])
+        if rate <= 0:
+            raise ValueError(f"Twelvedata returned non-positive GBP/USD rate: {rate}")
         _FX_CACHE["rate"] = rate
         _FX_CACHE["ts"] = now
         return rate
     except Exception as exc:
         logger.warning("GBP/USD rate fetch failed: %s — using fallback %.4f", exc, _FX_FALLBACK)
-        return _FX_CACHE["rate"] if _FX_CACHE["rate"] else _FX_FALLBACK
+        # Update ts even on failure so we throttle to one retry per TTL window
+        # instead of hammering the dead endpoint on every call during an outage.
+        _FX_CACHE["ts"] = now
+        return _FX_CACHE["rate"] if _FX_CACHE["rate"] is not None else _FX_FALLBACK
 
 
 def _get_time_series(

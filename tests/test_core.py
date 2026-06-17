@@ -441,6 +441,31 @@ class TestIsMarketOpen:
         mock_nyse.schedule.return_value = sched
         assert is_market_open() is False
 
+    @patch("market.price_check._NYSE")
+    def test_outside_session_window_returns_false(self, mock_nyse):
+        """open_at_time() raises ValueError('not covered by the schedule') before/after hours → False, no Finnhub call."""
+        from market.price_check import is_market_open
+        sched = MagicMock()
+        sched.empty = False
+        mock_nyse.schedule.return_value = sched
+        mock_nyse.open_at_time.side_effect = ValueError("The provided timestamp is not covered by the schedule")
+        assert is_market_open() is False
+
+    @patch("market.price_check.requests")
+    @patch("market.price_check._NYSE")
+    def test_schema_valueerror_falls_back_to_finnhub(self, mock_nyse, mock_requests):
+        """open_at_time() raises a schema/column ValueError → falls through to Finnhub fallback, not silent False."""
+        from market.price_check import is_market_open
+        sched = MagicMock()
+        sched.empty = False
+        mock_nyse.schedule.return_value = sched
+        mock_nyse.open_at_time.side_effect = ValueError("You seem to be using a schedule that isn't based on market_times")
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"isOpen": True}
+        mock_requests.get.return_value = mock_resp
+        assert is_market_open() is True
+        mock_requests.get.assert_called_once()
+
 
 # ── RVOL normalization tests ──────────────────────────────────────────────────
 

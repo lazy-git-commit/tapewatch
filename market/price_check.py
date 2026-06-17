@@ -266,10 +266,15 @@ def is_market_open() -> bool:
         if sched.empty:
             return False
         return bool(_NYSE.open_at_time(sched, now_utc))
-    except ValueError:
-        # open_at_time() raises ValueError when the timestamp is outside the
-        # session window (before open or after close). That means: not open.
-        return False
+    except ValueError as exc:
+        # open_at_time() raises ValueError for two distinct reasons:
+        #   (a) timestamp outside session window — means not open, return False.
+        #   (b) schedule column validation failure (schema/version mismatch) —
+        #       a programming error that should fall through to the Finnhub
+        #       fallback rather than silently reporting "market closed".
+        if "not covered by the schedule" in str(exc):
+            return False
+        logger.warning("Calendar open check failed (unexpected ValueError): %s — falling back to Finnhub", exc)
     except Exception as exc:
         logger.warning("Calendar open check failed: %s — falling back to Finnhub", exc)
 

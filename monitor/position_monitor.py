@@ -359,8 +359,11 @@ def monitor_positions() -> None:
         )
 
         # ── 4. Sell (bounded-slippage limit, market fallback inside sell()) ──
+        # EOD flatten must use a market order — execution certainty beats
+        # slippage control at the close. Pass force_market=True explicitly so
+        # the routing doesn't rely on the "eod_flatten" string literal alone.
         try:
-            result = sell(ticker, quantity, sell_price, reason)
+            result = sell(ticker, quantity, sell_price, reason, force_market=(reason == "eod_flatten"))
         except Exception as exc:
             logger.error(
                 "monitor_positions: sell() raised exception for trade %d (%s): %s",
