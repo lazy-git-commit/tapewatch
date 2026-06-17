@@ -236,7 +236,7 @@ def _execute_entry(item: NewsItem, confirmation: PriceConfirmation, fetched_at: 
             item.ticker, result.order_id, exc,
         )
         try:
-            flatten = sell(item.ticker, result.quantity, result.price, "db_record_failed")
+            flatten = sell(item.ticker, result.quantity, result.price, "eod_flatten")
             if flatten.success:
                 logger.critical(
                     "Emergency flatten succeeded for unrecorded %s position "

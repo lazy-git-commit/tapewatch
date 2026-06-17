@@ -311,6 +311,76 @@ class TestSellExecution:
         assert result.success is True
         assert mock_post.call_args[0][0] == "/equity/orders/market"
 
+    @patch("trading.executor.time.sleep")
+    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor.get_order_status", return_value="FILLED")
+    @patch("trading.executor._post", return_value={"id": "sl-1"})
+    def test_stop_loss_uses_limit_order(self, mock_post, _mock_status, _mock_fill, _mock_sleep):
+        from trading.executor import sell
+        result = sell("AAPL_US_EQ", quantity=1.0, price=100.0, reason="stop_loss")
+        assert result.success is True
+        assert mock_post.call_args[0][0] == "/equity/orders/limit"
+
+    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._post", return_value={"id": "em-1"})
+    def test_emergency_flatten_uses_market_order(self, mock_post, _mock_fill):
+        # An unrecorded buy must exit at market — a limit that fails to fill
+        # leaves an invisible unmanaged position with no stop or EOD logic.
+        from trading.executor import sell
+        result = sell("AAPL_US_EQ", quantity=1.0, price=100.0, reason="eod_flatten")
+        assert result.success is True
+        assert mock_post.call_args[0][0] == "/equity/orders/market"
+
+
+class TestGoneTpOrderResolution:
+    """Tests for monitor/position_monitor.py::_handle_gone_tp_order
+
+    A TP order that 404s on the pending endpoint is NOT automatically a fill.
+    DAY orders expire at close; treating expiry as profit corrupts P&L and
+    leaves the real position unmanaged with no stop or EOD flatten.
+    """
+
+    def _trade(self, buy_price=100.0):
+        buy_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        return {
+            "id": 42,
+            "ticker": "TEST_US_EQ",
+            "buy_price": buy_price,
+            "quantity": 10.0,
+            "buy_time": buy_time,
+            "tp_order_id": "tp-order-99",
+            "mode": "demo",
+        }
+
+    @patch("monitor.position_monitor.set_tp_order_id")
+    @patch("monitor.position_monitor.close_trade")
+    @patch("monitor.position_monitor._fetch_fill")
+    def test_gone_with_fill_closes_trade_as_tp(self, mock_fetch, mock_close, mock_set_tp):
+        """GONE + fill detail → trade closed as take_profit, returns True."""
+        mock_fetch.return_value = {
+            "price": "105.00",
+            "walletImpact": {"netValue": "52.30", "fxRate": "1.25", "taxes": []},
+        }
+        from monitor.position_monitor import _handle_gone_tp_order
+        trade = self._trade()
+        result = _handle_gone_tp_order(trade, "tp-order-99")
+        assert result is True
+        mock_close.assert_called_once()
+        mock_set_tp.assert_not_called()
+
+    @patch("monitor.position_monitor.set_tp_order_id")
+    @patch("monitor.position_monitor.close_trade")
+    @patch("monitor.position_monitor._fetch_fill", return_value=None)
+    def test_gone_without_fill_reverts_to_polled_exits(self, _mock_fetch, mock_close, mock_set_tp):
+        """GONE + no fill detail → stale TP id cleared, trade stays open, returns False."""
+        from monitor.position_monitor import _handle_gone_tp_order
+        trade = self._trade()
+        result = _handle_gone_tp_order(trade, "tp-order-99")
+        assert result is False
+        mock_close.assert_not_called()
+        mock_set_tp.assert_called_once_with(42, None)
+        assert trade["tp_order_id"] is None
+
 
 class TestCashflowPnl:
     """Tests for storage/database.py cashflow sign normalization"""

@@ -309,6 +309,7 @@ class Settings:
             ("MAX_DAILY_LOSS_PCT", self.max_daily_loss_pct > 0),
             ("TAKE_PROFIT_PCT", self.take_profit_pct > 0),
             ("STOP_LOSS_PCT", self.stop_loss_pct > 0),
+            ("TAKE_PROFIT_PCT >= STOP_LOSS_PCT (min 1:1 R:R required)", self.take_profit_pct >= self.stop_loss_pct),
             ("TIME_STOP_MINUTES", self.time_stop_minutes > 0),
             ("MONITOR_INTERVAL_SECONDS", self.monitor_interval_seconds > 0),
             ("EOD_FLATTEN_MINUTES", self.eod_flatten_minutes >= 0),
