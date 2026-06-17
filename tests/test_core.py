@@ -398,6 +398,44 @@ class TestCashflowPnl:
         assert pct == pytest.approx(10.0)
 
 
+class TestIsMarketOpen:
+    """Tests for market/price_check.py::is_market_open
+
+    The 2026-06-17 incident: a long-running pmc calendar object had stale DST
+    state (treated EDT open as EST open), delaying market detection by 60 min
+    and expiring all 19 pre-market candidates before evaluation. Fixed by using
+    open_at_time() instead of a manual row comparison.
+    """
+
+    @patch("market.price_check._NYSE")
+    def test_open_during_regular_hours(self, mock_nyse):
+        import pandas as pd
+        from market.price_check import is_market_open
+        sched = MagicMock()
+        sched.empty = False
+        mock_nyse.schedule.return_value = sched
+        mock_nyse.open_at_time.return_value = True
+        assert is_market_open() is True
+
+    @patch("market.price_check._NYSE")
+    def test_closed_before_open(self, mock_nyse):
+        import pandas as pd
+        from market.price_check import is_market_open
+        sched = MagicMock()
+        sched.empty = False
+        mock_nyse.schedule.return_value = sched
+        mock_nyse.open_at_time.return_value = False
+        assert is_market_open() is False
+
+    @patch("market.price_check._NYSE")
+    def test_holiday_returns_false(self, mock_nyse):
+        from market.price_check import is_market_open
+        sched = MagicMock()
+        sched.empty = True
+        mock_nyse.schedule.return_value = sched
+        assert is_market_open() is False
+
+
 # ── RVOL normalization tests ──────────────────────────────────────────────────
 
 class TestRvol:

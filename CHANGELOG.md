@@ -7,6 +7,61 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v15.5 — 2026-06-17 (market-open DST detection fix — zero pre-market trades)
+
+Second zero-trade-day investigation (same session as v15.4). Root cause: a
+long-running process whose `pandas_market_calendars` NYSE calendar object
+accumulated stale DST state. In summer (EDT = UTC-4) the manual comparison
+`market_open <= now_utc` was evaluating the open as 14:30 UTC instead of
+13:30 UTC — a 60-minute delay. Every pre-market candidate was still pending
+when the system finally called `evaluate_premarket_candidates()`, but by then
+`_minutes_since_open()` had already exceeded 30 min and all 19 candidates
+were immediately expired. Zero trades resulted.
+
+**Evidence:** opening_block message at 14:30:31 UTC read "0.5 min since open"
+(correct for a 14:30 UTC open) instead of ~60 min, proving the system believed
+the market opened one hour late. Service had been running continuously since
+before midnight (process 3939342 — no restart between sessions).
+
+**Fix:** replaced the manual `market_open <= now_utc` comparison in
+`is_market_open()` with `_NYSE.open_at_time(sched, now_utc)`, which
+re-derives open/close from first principles on each call and is immune to
+stale cached DST state in the long-running calendar object.
+
+**Today's signals (correctly rejected by filters, not the DST bug):**
+- ALOT M&A (+71% gap > 20% max) — correct: exhausted
+- ICCM FDA (+162% gap) — correct: exhausted
+- QURE extended_move (+72%) — correct: exhausted
+- SPRO, FTHM, OBAI — correct: penny stocks
+- GSK, JBL — correct: low_momentum (dead tape, catalyst not moving stock)
+- ANGO FDA IDE approval — gap only +0.25%, market not believing the catalyst
+- Most contract_win signals — gaps below 1% min, market unimpressed
+
+Tests 61 → 62.
+
+---
+
+## v15.4 — 2026-06-17 (emergency flatten market order, TP/SL ratio guard, gone-TP tests)
+
+Three correctness gaps identified in the v15.3 audit (by code review):
+
+- **Emergency flatten uses market order.** If `open_trade()` fails after a
+  broker buy fills, the position is unrecorded. The emergency sell was using
+  `reason="db_record_failed"` which routes through a bounded limit order — a
+  limit that fails to fill leaves the position invisible with no stop or EOD
+  logic. Changed to `reason="eod_flatten"` so sell() uses a market order for
+  execution certainty.
+- **TP/SL ratio guard.** Config validation now rejects `TAKE_PROFIT_PCT <
+  STOP_LOSS_PCT` at startup. A sub-1:1 R:R requires a >50% win rate just to
+  break even; misconfiguring TP=1.0/SL=2.0 was silently accepted.
+- **Tests for `_handle_gone_tp_order`.** The most dangerous code path from
+  v15.3 — GONE TP order → fill-detail-check before closing as take_profit —
+  had zero test coverage. Added 2 targeted tests.
+
+Tests 58 → 61.
+
+---
+
 ## v15.3 — 2026-06-17 (risk-control and execution audit)
 
 Deep live-logic audit focused on failures that can corrupt P&L, leave positions

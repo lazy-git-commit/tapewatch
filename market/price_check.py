@@ -249,6 +249,14 @@ def is_market_open() -> bool:
     Check whether the NYSE is currently open using pandas_market_calendars
     as the authoritative local source (handles holidays, early closes, weekends).
 
+    Uses open_at_time() rather than a manual schedule-row comparison. The manual
+    approach (market_open <= now_utc < market_close) is fragile: if the
+    long-running pmc _NYSE object has stale internal DST state (observed
+    2026-06-17: service running since midnight treated EDT open as EST open,
+    delaying market detection by 60 min and expiring all pre-market candidates),
+    the comparison silently returns False for the entire first hour of trading.
+    open_at_time() re-derives the open/close from first principles each call.
+
     Falls back to a Finnhub API check if the calendar check fails for any reason.
     """
     try:
@@ -257,9 +265,7 @@ def is_market_open() -> bool:
         sched = _NYSE.schedule(today, today)
         if sched.empty:
             return False
-        market_open = sched.iloc[0]["market_open"]
-        market_close = sched.iloc[0]["market_close"]
-        return bool(market_open <= now_utc < market_close)
+        return bool(_NYSE.open_at_time(sched, now_utc))
     except Exception as exc:
         logger.warning("Calendar open check failed: %s — falling back to Finnhub", exc)
 

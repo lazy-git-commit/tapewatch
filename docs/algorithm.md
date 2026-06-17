@@ -162,6 +162,16 @@ Twelvedata). `get_quote_with_fallback()` tries Finnhub, then Twelvedata
 `/quote`; both return the same `c`/`o`/`pc` keys so callers are source-agnostic.
 Only when BOTH miss is a signal deemed unpriceable.
 
+**Market-open detection (v15.5):** `is_market_open()` uses
+`_NYSE.open_at_time(sched, now_utc)` rather than a manual `market_open <=
+now_utc < market_close` comparison. The manual approach is fragile: on
+2026-06-17 a long-running pmc calendar object (process started at midnight)
+had stale DST state — in summer (EDT = UTC-4) it evaluated the NYSE open as
+14:30 UTC instead of 13:30 UTC. The system spent the entire 13:30–14:29 UTC
+window scanning for pre-market news instead of evaluating the watchlist.
+`open_at_time()` re-derives open/close from first principles on each call and
+is immune to this stale-state problem.
+
 **Previous-close backfill (v15.2):** Finnhub being reachable is not enough to
 trust its `pc` (previous close). In the first minutes after the open Finnhub's
 free tier routinely returns `pc=0` before its daily rollover settles (2026-06-16:
