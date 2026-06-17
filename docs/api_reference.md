@@ -460,7 +460,7 @@ Other notable error types:
 
 ### Endpoint: POST `/equity/orders/limit` (v14)
 
-**Purpose:** Two uses. (1) **Resting take-profit** — placed immediately after every buy at `buy_price × (1 + TAKE_PROFIT_PCT%)`, `timeValidity: "DAY"`; the exchange fills it with zero polling latency. (2) **Bounded-slippage exits** — stop-loss/time-stop/EOD sells go out as limits at `trigger × (1 − SELL_LIMIT_SLACK_PCT%)` so a collapsing book can cost at most ~1%, not GOAI's −18.99%.
+**Purpose:** Two uses. (1) **Resting take-profit** — placed immediately after every buy at `buy_price × (1 + TAKE_PROFIT_PCT%)`, `timeValidity: "DAY"`; the exchange fills it with zero polling latency. (2) **Bounded-slippage exits** — stop-loss/time-stop sells go out as limits at `trigger × (1 − SELL_LIMIT_SLACK_PCT%)` so a collapsing book can cost at most ~1%, not GOAI's −18.99%. EOD flatten is the exception: it uses a market order because execution certainty before the close beats slippage control.
 
 **Request body:**
 ```json
@@ -470,7 +470,7 @@ Negative quantity = sell. Prices rounded to 2dp (≥$1) / 4dp (<$1).
 
 ### Endpoint: GET `/equity/orders/{id}` (v14)
 
-**Purpose:** Order status polling. Statuses: `NEW`, `CONFIRMED`, `FILLED`, `CANCELLED`, `REJECTED`. A **404 means the order left the book** (filled → history) — `get_order_status()` maps it to `"GONE"`. Network errors return `None` = status UNKNOWN; callers must never treat `None` as filled.
+**Purpose:** Order status polling. Statuses: `NEW`, `CONFIRMED`, `FILLED`, `CANCELLED`, `REJECTED`. A **404 means the order left the pending book**, not necessarily that it filled; it may be filled, cancelled, expired, or missing from the recent-history page. `get_order_status()` checks history and returns `"FILLED"`/terminal status when possible, otherwise `"GONE"`. Callers must verify fill detail before closing a DB trade as take-profit. Network errors return `None` = status UNKNOWN; callers must never treat `None` as filled.
 
 ### Endpoint: DELETE `/equity/orders/{id}` (v14)
 

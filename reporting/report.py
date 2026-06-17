@@ -8,6 +8,7 @@ Or call generate_report() programmatically.
 
 import logging
 from datetime import datetime
+from config.settings import cfg
 from storage.database import get_conn
 
 logger = logging.getLogger(__name__)
@@ -17,9 +18,15 @@ def generate_report() -> str:
     """Return a plain-text performance report from all closed trades."""
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM trades WHERE status = 'closed' ORDER BY sell_time DESC")
+            cur.execute(
+                "SELECT * FROM trades WHERE status = 'closed' AND mode = %s ORDER BY sell_time DESC",
+                (cfg.trading_mode,),
+            )
             trades = cur.fetchall()
-            cur.execute("SELECT * FROM trades WHERE status = 'open'")
+            cur.execute(
+                "SELECT * FROM trades WHERE status = 'open' AND mode = %s",
+                (cfg.trading_mode,),
+            )
             open_trades = cur.fetchall()
 
     if not trades and not open_trades:
@@ -28,6 +35,7 @@ def generate_report() -> str:
     lines = []
     lines.append("=" * 60)
     lines.append("  MOMENTUM TRADER — PERFORMANCE REPORT")
+    lines.append(f"  Mode:      {cfg.trading_mode.upper()}")
     lines.append(f"  Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     lines.append("=" * 60)
 
@@ -37,7 +45,7 @@ def generate_report() -> str:
         lines.append("-" * 40)
         for t in open_trades:
             lines.append(
-                f"  {t['ticker']:<20} bought @ £{t['buy_price']:.4f}  "
+                f"  {t['ticker']:<20} bought @ ${t['buy_price']:.4f}  "
                 f"qty={t['quantity']:.4f}  opened {t['buy_time'][:16]}"
             )
 

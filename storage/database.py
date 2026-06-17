@@ -286,6 +286,26 @@ def open_trade(
             return row_id
 
 
+def _pnl_from_cashflows(
+    buy_net_gbp: float,
+    sell_net_gbp: float,
+) -> tuple[float, float]:
+    """
+    Return (pnl_gbp, pnl_pct) from broker cash-flow values.
+
+    Trading APIs differ on sign convention: some report a buy as a positive
+    cost, others as a negative wallet impact. For a long-only close, the only
+    invariant we can rely on is economic direction: buy = cost, sell =
+    proceeds. Using absolute values keeps the daily kill switch correct under
+    either convention while preserving the raw broker values in the DB.
+    """
+    cost = abs(float(buy_net_gbp))
+    proceeds = abs(float(sell_net_gbp))
+    pnl = proceeds - cost
+    pnl_pct = (pnl / cost) * 100 if cost > 0 else 0.0
+    return pnl, pnl_pct
+
+
 def close_trade(
     trade_id: int,
     sell_price: float,
@@ -310,10 +330,12 @@ def close_trade(
             quantity = row["quantity"]
             buy_net_gbp_stored = row["buy_net_gbp"]
 
-            # Use real GBP cash flows when available; fall back to USD price diff
+            # Use real GBP cash flows when available; fall back to USD price diff.
+            # Cash-flow signs are normalized in _pnl_from_cashflows(); this is
+            # critical for the daily kill switch because broker APIs often
+            # report buys as negative wallet impacts and sells as positive ones.
             if sell_net_gbp is not None and buy_net_gbp_stored is not None:
-                pnl = sell_net_gbp - buy_net_gbp_stored
-                pnl_pct = (pnl / abs(buy_net_gbp_stored)) * 100
+                pnl, pnl_pct = _pnl_from_cashflows(buy_net_gbp_stored, sell_net_gbp)
             else:
                 pnl = (sell_price - buy_price) * quantity
                 pnl_pct = ((sell_price - buy_price) / buy_price) * 100
@@ -334,10 +356,13 @@ def close_trade(
 
 
 def get_open_trades() -> list[dict]:
-    """Return all currently open trades as dicts."""
+    """Return currently open trades for the active trading mode only."""
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM trades WHERE status = 'open'")
+            cur.execute(
+                "SELECT * FROM trades WHERE status = 'open' AND mode = %s",
+                (cfg.trading_mode,),
+            )
             return [dict(r) for r in cur.fetchall()]
 
 
@@ -350,7 +375,7 @@ def was_recently_traded(ticker: str, hours: int = 24) -> bool:
                    WHERE ticker = %s
                    AND mode = %s
                    AND (status = 'open'
-                        OR buy_time >= (NOW() AT TIME ZONE 'UTC' - make_interval(hours => %s))::TEXT)
+                        OR buy_time::timestamptz >= (NOW() - make_interval(hours => %s)))
                    LIMIT 1""",
                 (ticker, cfg.trading_mode, hours),
             )
@@ -374,12 +399,14 @@ def count_open_trades() -> int:
 
 def count_trades_today() -> int:
     """Number of positions opened today (London calendar day, matching buy_time storage)."""
-    today_prefix = datetime.now(_LONDON).strftime("%Y-%m-%d")
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT COUNT(*) AS n FROM trades WHERE mode = %s AND buy_time LIKE %s",
-                (cfg.trading_mode, f"{today_prefix}%"),
+                """SELECT COUNT(*) AS n FROM trades
+                   WHERE mode = %s
+                     AND (buy_time::timestamptz AT TIME ZONE 'Europe/London')::date =
+                         (NOW() AT TIME ZONE 'Europe/London')::date""",
+                (cfg.trading_mode,),
             )
             return int(cur.fetchone()["n"])
 
@@ -391,13 +418,16 @@ def get_today_realized_pnl() -> float:
     positions are opened until tomorrow. Realized-only by design — unrealized
     swings on open positions shouldn't toggle the switch on and off.
     """
-    today_prefix = datetime.now(_LONDON).strftime("%Y-%m-%d")
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT COALESCE(SUM(profit_loss), 0) AS pnl FROM trades
-                   WHERE mode = %s AND status = 'closed' AND sell_time LIKE %s""",
-                (cfg.trading_mode, f"{today_prefix}%"),
+                   WHERE mode = %s
+                     AND status = 'closed'
+                     AND sell_time IS NOT NULL
+                     AND (sell_time::timestamptz AT TIME ZONE 'Europe/London')::date =
+                         (NOW() AT TIME ZONE 'Europe/London')::date""",
+                (cfg.trading_mode,),
             )
             return float(cur.fetchone()["pnl"])
 
@@ -542,5 +572,4 @@ def save_snapshot(total_value: float, cash: Optional[float] = None) -> None:
                    VALUES (%s, %s, %s)""",
                 (total_value, cash, _now_london()),
             )
-
 

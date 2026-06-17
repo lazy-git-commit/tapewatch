@@ -166,9 +166,16 @@ def _get_time_series(
 
 
 def _parse_bar_time(bar: dict) -> datetime | None:
-    """Parse a Twelvedata bar timestamp (ET, 'YYYY-MM-DD HH:MM:SS') to UTC."""
+    """Parse a Twelvedata bar timestamp (ET) to UTC.
+
+    Intraday bars use ``YYYY-MM-DD HH:MM:SS``; daily bars often use
+    ``YYYY-MM-DD``. Treat both as ET because Twelvedata timestamps US equity
+    bars in the exchange timezone.
+    """
     try:
-        bar_dt = datetime.strptime(bar.get("datetime", ""), "%Y-%m-%d %H:%M:%S")
+        raw = bar.get("datetime", "")
+        fmt = "%Y-%m-%d" if len(raw) == 10 else "%Y-%m-%d %H:%M:%S"
+        bar_dt = datetime.strptime(raw, fmt)
         return _ET.localize(bar_dt).astimezone(timezone.utc)
     except (ValueError, TypeError):
         return None
@@ -420,6 +427,16 @@ def get_volume_stats(symbol: str) -> tuple[int | None, int | None, float | None,
 
     try:
         today_bar = values[0]
+        today_bar_time = _parse_bar_time(today_bar)
+        today_et = datetime.now(_ET).date()
+        if today_bar_time is None or today_bar_time.astimezone(_ET).date() != today_et:
+            logger.warning(
+                "Twelvedata daily bar for %s has not rolled to today yet "
+                "(latest=%s, expected=%s) — volume/RVOL unavailable",
+                symbol, today_bar.get("datetime", "?"), today_et,
+            )
+            return None, None, None, None
+
         today_volume = int(float(today_bar.get("volume", 0)))
 
         prior_bars = values[1:]  # up to 20 prior trading days

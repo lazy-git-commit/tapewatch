@@ -267,11 +267,25 @@ def _parse_fill(fill: dict) -> tuple[float | None, float | None, float | None, f
     """Extract (filled_price, net_gbp, fx_rate, fees_gbp) from a Trading 212 fill dict."""
     if not fill:
         return None, None, None, None
-    filled_price = fill.get("price")
+    try:
+        filled_price = float(fill["price"]) if fill.get("price") is not None else None
+    except (TypeError, ValueError):
+        filled_price = None
     impact = fill.get("walletImpact", {})
-    net_gbp = impact.get("netValue")
-    fx_rate = impact.get("fxRate")
-    fees_gbp = sum(abs(t.get("quantity", 0)) for t in impact.get("taxes", []))
+    try:
+        net_gbp = float(impact["netValue"]) if impact.get("netValue") is not None else None
+    except (TypeError, ValueError):
+        net_gbp = None
+    try:
+        fx_rate = float(impact["fxRate"]) if impact.get("fxRate") is not None else None
+    except (TypeError, ValueError):
+        fx_rate = None
+    fees_gbp = 0.0
+    for tax in impact.get("taxes", []) or []:
+        try:
+            fees_gbp += abs(float(tax.get("quantity", 0)))
+        except (TypeError, ValueError):
+            continue
     return filled_price, net_gbp, fx_rate, fees_gbp
 
 
@@ -353,8 +367,15 @@ def calculate_quantity(
     if max_spend <= 0:
         return None, "position size computed as zero"
 
-    # Trading 212 allows at most 4 decimal places for fractional quantities
+    # Trading 212 allows at most 4 decimal places for fractional quantities.
+    # If the account is too small for even 0.0001 share, do not send a zero
+    # quantity order and burn the signal on a broker-side validation error.
     quantity = round(max_spend / price, 4)
+    if quantity <= 0:
+        return None, (
+            f"position size below minimum fractional quantity "
+            f"(max_spend=£{max_spend:.2f}, price=${price:.4f})"
+        )
     logger.info(
         "Position size for %s: £%.2f (caps: hard=£%.0f risk=£%.0f adv=%s cash=£%.0f) "
         "→ %.4f shares @ $%.4f",
@@ -372,17 +393,36 @@ def get_order_status(order_id: str) -> str | None:
     Return the T212 order status (NEW, FILLED, CANCELLED, REJECTED, ...).
 
     Special values:
-      "GONE" — the order 404s on the pending-orders endpoint, which means it
-               left the book (filled and moved to history, normally).
+      "GONE" — the order 404s on the pending-orders endpoint and the history
+               lookup is inconclusive. This is NOT proof of a fill; callers
+               that care about fill-vs-expiry must fetch fill detail before
+               closing any DB trade.
       None   — network/API error: status UNKNOWN. Callers must NOT treat
                None as filled — closing a DB trade on a transient timeout
                while the real position is still open would desync the book.
     """
     try:
         item = _get(f"/equity/orders/{order_id}")
-        return str(item.get("status", "")) or None
+        return str(item.get("status", "")).upper() or None
     except Exception as exc:
         if "HTTP 404" in str(exc):
+            # Pending endpoint 404 means "not live on the book", but that can
+            # be a fill, cancellation, expiry, or history pagination miss. Check
+            # recent order history before making the caller infer too much.
+            try:
+                data = _get("/equity/history/orders?limit=50")
+                for item in data.get("items", []):
+                    order = item.get("order", {})
+                    if str(order.get("id") or item.get("id")) != str(order_id):
+                        continue
+                    status = str(order.get("status") or item.get("status") or "").upper()
+                    if "fill" in item or status == "FILLED":
+                        return "FILLED"
+                    if status:
+                        return status
+            except Exception as hist_exc:
+                logger.warning("get_order_status(%s): history lookup failed after 404: %s", order_id, hist_exc)
+                return None
             return "GONE"
         logger.warning("get_order_status(%s): %s", order_id, exc)
         return None
@@ -390,10 +430,12 @@ def get_order_status(order_id: str) -> str | None:
 
 def cancel_order(order_id: str) -> bool:
     """
-    Cancel a pending order. Returns True if cancelled (or already gone),
-    False if the cancel failed — the caller MUST then re-check the order
-    status, because the most common failure is "already filled" (the
-    cancel/fill race the monitor has to handle before placing a stop sell).
+    Cancel a pending order. Returns True if the broker accepted the cancel.
+
+    False means the order state is unresolved — the caller MUST re-check order
+    status/fill detail before placing any competing order. The common benign
+    case is "already filled", but network errors and expiry look similar at
+    this level.
     """
     try:
         _delete(f"/equity/orders/{order_id}")
@@ -458,6 +500,12 @@ def buy(ticker: str, price: float, avg_dollar_volume: float | None = None) -> Or
                 body = exc_str.split(" - ", 1)[1]
                 allowed = int(_json.loads(body)["detail"].split()[-1])
                 quantity = round(quantity, allowed)
+                if quantity <= 0:
+                    return OrderResult(
+                        success=False, ticker=ticker, quantity=quantity,
+                        price=price, order_id=None,
+                        error=f"quantity rounds to zero at broker precision {allowed}",
+                    )
                 logger.info(
                     "Retrying BUY %s with precision=%d → quantity=%s",
                     ticker, allowed, quantity,
@@ -509,7 +557,11 @@ def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult
     collapsing book it caps the damage at the slack instead of chasing the
     bid down (GOAI: market sell filled −18.99% on a −2% stop trigger).
 
-    Fill handling:
+    EOD flatten:
+      - Uses a MARKET order. At the close, execution certainty beats bounded
+        slippage; carrying a momentum name overnight is the larger risk.
+
+    Fill handling for non-EOD exits:
       - FILLED within the poll window → success with real fill data.
       - Unfilled after the window → cancel and report failure; the monitor
         keeps the position open and retries next cycle (20s later) at the
@@ -521,26 +573,36 @@ def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult
     """
     limit_price = _round_price(price * (1 - cfg.sell_limit_slack_pct / 100))
     order_id: str | None = None
-    used_market_fallback = False
+    used_market_fallback = reason == "eod_flatten"
     try:
-        try:
-            order = _post("/equity/orders/limit", {
-                "quantity": -quantity,
-                "ticker": ticker,
-                "limitPrice": limit_price,
-                "timeValidity": "DAY",
-            })
-            order_id = str(order.get("id", ""))
-        except Exception as limit_exc:
-            # Limit rejected (precision, instrument restrictions, ...) —
-            # fall back to market so the position is never stuck unmanaged.
-            logger.warning(
-                "SELL limit placement failed for %s (%s) — falling back to market order",
-                ticker, limit_exc,
-            )
+        if used_market_fallback:
             order = _post("/equity/orders/market", {"quantity": -quantity, "ticker": ticker})
             order_id = str(order.get("id", ""))
-            used_market_fallback = True
+        else:
+            try:
+                order = _post("/equity/orders/limit", {
+                    "quantity": -quantity,
+                    "ticker": ticker,
+                    "limitPrice": limit_price,
+                    "timeValidity": "DAY",
+                })
+                order_id = str(order.get("id", ""))
+            except Exception as limit_exc:
+                # Limit rejected (precision, instrument restrictions, ...) —
+                # fall back to market so the position is never stuck unmanaged.
+                logger.warning(
+                    "SELL limit placement failed for %s (%s) — falling back to market order",
+                    ticker, limit_exc,
+                )
+                order = _post("/equity/orders/market", {"quantity": -quantity, "ticker": ticker})
+                order_id = str(order.get("id", ""))
+                used_market_fallback = True
+
+        if not order_id:
+            return OrderResult(
+                success=False, ticker=ticker, quantity=quantity,
+                price=price, order_id=None, error="broker response missing order id",
+            )
 
         # ── Wait for the fill ────────────────────────────────────────────────
         # Poll status first (fast, definitive), then fetch fill details.
@@ -549,10 +611,9 @@ def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult
             for _ in range(10):  # up to ~20s
                 time.sleep(2)
                 status = get_order_status(order_id)
-                # "GONE" = order left the pending book (filled → history).
-                # None = NETWORK ERROR, status unknown — keep polling. Treating
-                # None as filled would record the trade closed in the DB while
-                # the real order may still be live on the book (position desync).
+                # "GONE" usually means the order left the pending book; we
+                # still fetch fill detail below before trusting the price.
+                # None = NETWORK ERROR, status unknown — keep polling.
                 if status in ("FILLED", "GONE"):
                     filled = True
                     break
@@ -576,9 +637,18 @@ def sell(ticker: str, quantity: float, price: float, reason: str) -> OrderResult
                     price=price, order_id=order_id,
                     error="limit sell unfilled — cancelled for retry",
                 )
-            # Cancel failed → most likely filled while cancelling. Fall through
-            # and treat as filled; fill fetch below confirms the price.
-            logger.info("SELL [%s] cancel/fill race — treating order %s as filled", ticker, order_id)
+
+            # Cancel failed. Re-check: if the order filled during the cancel,
+            # record it; otherwise do not pretend it filled.
+            status = get_order_status(order_id)
+            if status in ("FILLED", "GONE"):
+                logger.info("SELL [%s] cancel/fill race — treating order %s as filled", ticker, order_id)
+            else:
+                return OrderResult(
+                    success=False, ticker=ticker, quantity=quantity,
+                    price=price, order_id=order_id,
+                    error=f"limit sell cancel failed; state={status or 'unknown'}",
+                )
 
         fill = _fetch_fill(order_id)
         filled_price, net_gbp, fx_rate, fees_gbp = _parse_fill(fill)

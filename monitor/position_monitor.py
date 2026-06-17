@@ -128,13 +128,14 @@ def check_exit_conditions(trade: dict, has_resting_tp: bool = False) -> tuple[bo
     return False, "", current_price
 
 
-def _close_as_tp_fill(trade: dict, tp_order_id: str) -> None:
+def _close_as_tp_fill(trade: dict, tp_order_id: str, fill: dict | None = None) -> None:
     """
     The resting TP order filled — record the close with real fill data.
     If fill detail is unavailable, fall back to the TP threshold price: a
     limit sell can only fill AT or ABOVE its limit, so this is conservative.
     """
-    fill = _fetch_fill(tp_order_id)
+    if fill is None:
+        fill = _fetch_fill(tp_order_id)
     filled_price, net_gbp, fx_rate, fees_gbp = _parse_fill(fill)
     tp_threshold = trade["buy_price"] * (1 + cfg.take_profit_pct / 100)
     sell_price = filled_price if filled_price is not None else tp_threshold
@@ -153,6 +154,35 @@ def _close_as_tp_fill(trade: dict, tp_order_id: str) -> None:
         sell_order_id=tp_order_id,
         sell_net_gbp=net_gbp, sell_fx_rate=fx_rate, sell_fees_gbp=fees_gbp,
     )
+
+
+def _handle_gone_tp_order(trade: dict, tp_order_id: str) -> bool:
+    """
+    Resolve a TP order that disappeared from the pending-order endpoint.
+
+    T212 returns 404 for orders that are no longer live. That is usually a
+    fill, but DAY orders can also expire/cancel. We only close the DB trade as
+    take_profit when fill detail exists; otherwise we clear the stale TP id and
+    let the normal polled exits manage the still-open position.
+
+    Returns True when the trade was closed, False when monitoring should
+    continue without a resting TP.
+    """
+    fill = _fetch_fill(tp_order_id)
+    if fill:
+        _close_as_tp_fill(trade, tp_order_id, fill=fill)
+        return True
+    logger.warning(
+        "Monitor [%s] trade=%d: TP order %s is gone but no fill was found — "
+        "treating it as expired/cancelled and reverting to polled exits",
+        trade["ticker"], trade["id"], tp_order_id,
+    )
+    try:
+        set_tp_order_id(trade["id"], None)
+    except Exception:
+        pass
+    trade["tp_order_id"] = None
+    return False
 
 
 def _cancel_tp_before_sell(trade: dict) -> bool:
@@ -176,7 +206,12 @@ def _cancel_tp_before_sell(trade: dict) -> bool:
     # were cancelling. Re-check before doing anything irreversible.
     status = get_order_status(tp_order_id)
     if status in ("FILLED", "GONE"):
-        _close_as_tp_fill(trade, tp_order_id)
+        if status == "FILLED":
+            _close_as_tp_fill(trade, tp_order_id)
+        elif _handle_gone_tp_order(trade, tp_order_id):
+            return False
+        else:
+            return True
         return False
     # Unknown state (network error): do NOT sell — the resting order may
     # still be live and a second sell would double-exit. Retry next cycle.
@@ -244,7 +279,7 @@ def monitor_positions() -> None:
         has_resting_tp = False
         if tp_order_id:
             status = get_order_status(tp_order_id)
-            if status in ("FILLED", "GONE"):
+            if status == "FILLED":
                 # Profit side executed at the exchange — just record it.
                 try:
                     _close_as_tp_fill(trade, tp_order_id)
@@ -254,6 +289,19 @@ def monitor_positions() -> None:
                         trade_id, ticker, exc, exc_info=True,
                     )
                 continue
+            elif status == "GONE":
+                # Disappeared is not automatically filled; verify fill detail
+                # before closing the DB trade as a take-profit.
+                try:
+                    if _handle_gone_tp_order(trade, tp_order_id):
+                        continue
+                    tp_order_id = None
+                except Exception as exc:
+                    logger.error(
+                        "monitor_positions: failed to resolve gone TP order for trade %d (%s): %s",
+                        trade_id, ticker, exc, exc_info=True,
+                    )
+                    continue
             elif status in ("CANCELLED", "REJECTED"):
                 # Resting order died (e.g. DAY validity expired) — fall back
                 # to polled TP for this position from now on.

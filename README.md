@@ -16,19 +16,21 @@ Claude Haiku — expert momentum day trader classifier
                      analyst PT raises / "Maintains" ratings    → neutral  (ignored)
                      earnings misses / guidance cuts            → negative (ignored)
        ↓
-Price confirmation — Finnhub real-time quote + yfinance momentum baseline
-                     blocks first minute after open (auction noise)
-                     price up ≥ 0.5% over last 15 min?
-                     volume ≥ 1.5× 20-day average? (or >0 in first 15 min)
-                     stock not down >3% on the day? (dead-cat bounce guard)
+Price confirmation — Finnhub quote + Twelvedata fallback/bars
+                     blocks first 5 minutes after open (auction noise)
+                     price ≥ $5 and not already extended vs prev close
+                     timestamp-based momentum + time-normalized RVOL
+                     ADV liquidity floor + spread proxy
+                     VWAP confirmation (is the stock being accumulated?)
        ↓
 Buy order (Trading 212 API — demo or live)
   auto-retries once if T212 rejects for quantity precision mismatch
        ↓
-Position monitor (every 60s) — Finnhub real-time price
-  → Take profit (+5%)  ✅
-  → Stop loss  (-2%)   ❌
-  → Time stop  (60min) ⏱️
+Position monitor (every 20s) — Finnhub quote + Twelvedata fallback
+  → Resting take-profit limit (+5%)  ✅
+  → Stop loss bounded-limit (-2%)    ❌
+  → Time stop (60min)                ⏱️
+  → EOD flatten before close
        ↓
 Trade logged to PostgreSQL (tagged demo or live)
        ↓
@@ -73,13 +75,19 @@ Key settings in `.env`:
 |---|---|---|
 | `TRADING_MODE` | `demo` | **Keep as `demo` until confident** |
 | `BLOCKLIST` | `` | Comma-separated Trading 212 codes to never trade (e.g. `TSLA_US_EQ`) |
-| `MIN_PRICE_MOVE_PCT` | `0.5` | Price must be up this % over the momentum window to confirm a signal |
-| `MOMENTUM_WINDOW_MINUTES` | `15` | How far back to measure recent price momentum |
-| `MAX_DAY_DROP_PCT` | `3.0` | Reject signal if stock is down more than this % from today's open (dead-cat bounce guard) |
+| `MIN_PRICE_MOVE_PCT` | `0.2` | Dead-tape floor; VWAP/RVOL do the real confirmation |
+| `MOMENTUM_LOOKBACK_MINUTES` | `5` | Timestamp-based momentum lookback |
+| `MAX_DAY_DROP_PCT` | `3.0` | Reject if stock is down more than this % vs previous close |
+| `MAX_DAY_MOVE_PCT` | `25.0` | Reject if the day move is already exhausted |
+| `MIN_RVOL` / `MAX_RVOL` | `1.5` / `20.0` | Time-of-day-normalized participation band |
+| `REQUIRE_VWAP_CONFIRMATION` | `true` | Require price to hold at/above session VWAP |
 | `MAX_POSITION_SIZE_PCT` | `5.0` | Max % of portfolio per trade |
+| `RISK_PER_TRADE_PCT` | `0.25` | Position risk budget if stop is hit |
+| `MAX_DAILY_LOSS_PCT` | `2.0` | Daily kill switch on realized losses |
 | `TAKE_PROFIT_PCT` | `5.0` | Sell when up this % |
 | `STOP_LOSS_PCT` | `2.0` | Sell when down this % |
 | `TIME_STOP_MINUTES` | `60` | Sell after this many minutes regardless |
+| `EOD_FLATTEN_MINUTES` | `10` | Force-close before the bell |
 
 ### 4. Run the tests
 

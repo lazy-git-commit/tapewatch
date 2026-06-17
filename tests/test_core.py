@@ -300,6 +300,34 @@ class TestBuyPrecisionRetry:
         assert mock_post.call_count == 2
 
 
+class TestSellExecution:
+    """Tests for trading/executor.py::sell execution policy"""
+
+    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._post", return_value={"id": "eod-1"})
+    def test_eod_flatten_uses_market_order(self, mock_post, _mock_fill):
+        from trading.executor import sell
+        result = sell("AAPL_US_EQ", quantity=1.0, price=100.0, reason="eod_flatten")
+        assert result.success is True
+        assert mock_post.call_args[0][0] == "/equity/orders/market"
+
+
+class TestCashflowPnl:
+    """Tests for storage/database.py cashflow sign normalization"""
+
+    def test_positive_buy_cost_positive_sell_proceeds(self):
+        from storage.database import _pnl_from_cashflows
+        pnl, pct = _pnl_from_cashflows(100.0, 110.0)
+        assert pnl == pytest.approx(10.0)
+        assert pct == pytest.approx(10.0)
+
+    def test_negative_buy_wallet_impact_is_handled(self):
+        from storage.database import _pnl_from_cashflows
+        pnl, pct = _pnl_from_cashflows(-100.0, 110.0)
+        assert pnl == pytest.approx(10.0)
+        assert pct == pytest.approx(10.0)
+
+
 # ── RVOL normalization tests ──────────────────────────────────────────────────
 
 class TestRvol:
@@ -487,6 +515,43 @@ class TestVwap:
         mock_ts.return_value = None
         vwap, last = td.get_session_vwap("AAPL")
         assert vwap is None and last is None
+
+
+class TestTwelvedataVolumeStats:
+    """Tests for market/twelvedata_bars.py::get_volume_stats"""
+
+    def _daily_bar(self, dt, close=10, volume=1000):
+        return {"datetime": dt, "close": str(close), "volume": str(volume)}
+
+    @patch("market.twelvedata_bars._get_time_series")
+    def test_daily_bar_must_be_today_for_rvol(self, mock_ts):
+        import pytz
+        import market.twelvedata_bars as td
+        now_et = datetime.now(pytz.timezone("America/New_York"))
+        yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
+        before = (now_et - timedelta(days=2)).strftime("%Y-%m-%d")
+        mock_ts.return_value = [
+            self._daily_bar(yesterday, close=10, volume=5000),
+            self._daily_bar(before, close=9, volume=1000),
+        ]
+        assert td.get_volume_stats("AAPL") == (None, None, None, None)
+
+    @patch("market.twelvedata_bars._get_time_series")
+    def test_date_only_daily_bar_parses(self, mock_ts):
+        import pytz
+        import market.twelvedata_bars as td
+        now_et = datetime.now(pytz.timezone("America/New_York"))
+        today = now_et.strftime("%Y-%m-%d")
+        yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
+        mock_ts.return_value = [
+            self._daily_bar(today, close=11, volume=500),
+            self._daily_bar(yesterday, close=10, volume=1000),
+        ]
+        today_vol, avg_vol, adv_dollars, prev_close = td.get_volume_stats("AAPL")
+        assert today_vol == 500
+        assert avg_vol == 1000
+        assert adv_dollars == pytest.approx(10_000)
+        assert prev_close == pytest.approx(10)
 
 
 # ── Backtest ↔ production parity tests (v15 audit) ─────────────────────────────

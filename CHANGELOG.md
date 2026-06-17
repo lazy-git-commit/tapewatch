@@ -7,6 +7,46 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v15.3 — 2026-06-17 (risk-control and execution audit)
+
+Deep live-logic audit focused on failures that can corrupt P&L, leave positions
+unmanaged, or make reports disagree with trading reality.
+
+- **Mode-scoped position management.** `get_open_trades()` now filters by
+  active `TRADING_MODE`. Without this, switching a shared DB from demo to live
+  could make the live monitor act on demo rows.
+- **Timestamp-safe risk gates.** 24h ticker cooldown, trades-today, and today's
+  realized P&L now cast stored ISO text to `timestamptz` instead of relying on
+  lexicographic text comparisons / `LIKE` date prefixes.
+- **Cashflow-sign-safe P&L.** Broker fill cashflows are normalized as
+  `abs(sell_net_gbp) - abs(buy_net_gbp)`, so a buy reported as a negative wallet
+  impact cannot invert realized P&L or disable the daily kill switch.
+- **No orphaned buys.** If the broker buy fills but the DB trade insert fails,
+  the system immediately attempts an emergency flatten. If the trade row exists
+  but `acted_on` marking fails, the position still gets its TP/monitoring.
+- **No untracked resting TP.** If a TP order is placed but its order id cannot
+  be stored, the system cancels that TP; otherwise a later stop/time-stop sell
+  would not know about the reserved shares.
+- **TP 404 is no longer assumed profitable.** A disappeared pending order is
+  resolved through fill detail before the DB trade is closed as `take_profit`;
+  missing fill detail is treated as expired/cancelled and falls back to polled
+  exits.
+- **EOD flatten uses market orders.** Stop/time-stop exits remain
+  bounded-slippage limits, but the end-of-day flatten prioritizes execution
+  certainty over slippage control to avoid overnight gap risk.
+- **Daily volume freshness guard.** Twelvedata daily bars must be for today's ET
+  date before they can feed RVOL. Yesterday's full-day volume can no longer
+  masquerade as today's cumulative volume.
+- **Config sanity checks.** Startup validation now rejects impossible trading
+  settings (bad mode, inverted thresholds, zero/negative stops, invalid risk
+  caps) before the service can trade.
+- **Docs/research basis.** `docs/algorithm.md` now maps each major rule to
+  respected momentum, PEAD, execution-cost, intraday-volume, and backtest-
+  overfitting research instead of relying only on incident anecdotes.
+- Tests 49 → 54.
+
+---
+
 ## v15.2 — 2026-06-16 (prev-close backfill — fixes zero pre-market trades)
 
 Investigation of "why no trades today" (212 positives scored, 31 gate-passing,

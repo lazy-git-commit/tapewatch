@@ -3,10 +3,11 @@ backtest/backtest.py
 ────────────────────
 Replays the full trading strategy against historical news + price data.
 
-NOTE (v14): this Benzinga-replay tool still mirrors v12 entry logic and
-frictionless fills. For current-strategy analysis use backtest/backtest_db.py,
-which applies the v14 filter set, realistic next-bar entries, stop-priority
-fills, and the FX + slippage cost model.
+LEGACY NOTE: this Benzinga-replay tool intentionally still mirrors v12 entry
+logic and mostly frictionless fills. It is useful only for old prompt/news
+experiments. For current-strategy analysis use backtest/backtest_db.py, which
+applies the v15 filter set, realistic next-bar entries, stop-priority fills,
+VWAP/RVOL confirmation, and the FX + slippage cost model.
 
 Mirrors the live v12 logic:
   1. Classify sentiment with Claude Haiku (batched, same as production)
@@ -643,11 +644,17 @@ def print_week_summary(all_results: dict[str, list[TradeResult]]) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Backtest the momentum trading strategy (v12 logic)")
+    parser = argparse.ArgumentParser(description="LEGACY Benzinga replay backtest (v12 logic)")
     parser.add_argument("--date", default=None, help="Date to backtest (YYYY-MM-DD), default: last market day")
     parser.add_argument("--week", action="store_true", help="Backtest the entire last trading week (Mon–Fri)")
     parser.add_argument("--no-sentiment", action="store_true", help="Skip Claude sentiment and use all articles")
     args = parser.parse_args()
+
+    print(
+        "\nWARNING: backtest.backtest is a LEGACY v12 replay and does not mirror "
+        "the live v15 strategy. Use `python -m backtest.backtest_db` for current "
+        "strategy analysis.\n"
+    )
 
     if args.week:
         # Last full trading week: find last Friday and go back to its Monday

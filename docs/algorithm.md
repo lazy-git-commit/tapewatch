@@ -1,6 +1,6 @@
 # How the Algorithm Works
 
-This is the authoritative description of the trading algorithm as of **v14**.
+This is the authoritative description of the trading algorithm as of **v15**.
 Every filter exists because a specific, named loss demonstrated the need for it —
 those incidents are cited inline. When changing any rule, update this document
 and `CHANGELOG.md` in the same commit.
@@ -28,6 +28,35 @@ moves that already happened.
 construction. Everything in the design biases toward catalysts that survive
 being a minute late (earnings, FDA, M&A targets) and away from those that
 don't (micro-cap halt spikes).
+
+### Research map: why these rules are defensible
+
+This is not a generic "buy green candles" bot. The live rules are mapped to
+well-documented effects and professional execution discipline:
+
+| System rule | Research / practitioner basis | Implementation |
+|---|---|---|
+| Trade only fresh, material catalysts | Post-earnings-announcement drift (Ball & Brown; Bernard & Thomas) and cross-sectional momentum (Jegadeesh & Titman) show that markets can underreact to new information. AQR's Asness/Frazzini work also stresses that momentum is real but implementation-sensitive. | Claude catalyst taxonomy + confidence gate + `already_moved` filter |
+| Demand price/volume confirmation | Momentum is fragile around reversals; volume and intraday liquidity patterns matter. Admati & Pfleiderer's intraday-volume work supports time-of-day-aware volume interpretation. | timestamp momentum, RVOL normalized to the intraday U-curve, VWAP confirmation |
+| Avoid crowded/halt/illiquid moves | Momentum profits are eroded by transaction costs and can crash; Korajczyk & Sadka, Barroso & Santa-Clara, and Daniel & Moskowitz motivate liquidity filters and hard risk brakes. | ADV floor, ADV participation cap, RVOL ceiling, max day-move and max 5-min move ceilings |
+| Model execution as a first-class risk | Almgren-Chriss / implementation-shortfall practice says market impact and timing risk are part of the trade, not an afterthought. | resting TP, bounded stop exits, EOD market flatten, slippage-aware backtest |
+| Do not optimize by vibes | López de Prado and related backtest-overfitting work warns that repeated historical tuning can manufacture false edge. | `sentiment_scores` eval loop, DB replay, explicit costs, documented rule rationale |
+
+Useful references:
+- Narasimhan Jegadeesh & Sheridan Titman, "Returns to Buying Winners and Selling Losers" (Journal of Finance, 1993): https://doi.org/10.1111/j.1540-6261.1993.tb04702.x
+- Victor Bernard & Jacob Thomas, "Post-Earnings-Announcement Drift" (Journal of Accounting Research, 1989): https://doi.org/10.2307/2491062
+- Clifford Asness, Andrea Frazzini, Ronen Israel & Tobias Moskowitz, "Fact, Fiction, and Momentum Investing" (Journal of Portfolio Management, 2014): https://doi.org/10.3905/jpm.2014.40.5.075
+- Robert Korajczyk & Ronnie Sadka, "Are Momentum Profits Robust to Trading Costs?" (Journal of Finance, 2004): https://doi.org/10.1111/j.1540-6261.2004.00656.x
+- Pedro Barroso & Pedro Santa-Clara, "Momentum Has Its Moments" (Journal of Financial Economics, 2015): https://doi.org/10.1016/j.jfineco.2014.11.010
+- Kent Daniel & Tobias Moskowitz, "Momentum Crashes" (Journal of Financial Economics, 2016): https://doi.org/10.1016/j.jfineco.2016.07.002
+- Robert Almgren & Neil Chriss, "Optimal Execution of Portfolio Transactions" (Journal of Risk, 2000/2001): https://www.smallake.kr/wp-content/uploads/2016/03/optliq.pdf
+- Anat Admati & Paul Pfleiderer, "A Theory of Intraday Patterns" (Review of Financial Studies, 1988): https://doi.org/10.1093/rfs/1.1.3
+- Peter Carr & Marcos López de Prado, "Determining Optimal Trading Rules without Backtesting" (2014): https://arxiv.org/abs/1408.1159
+
+Important boundary: these papers support the *class* of effects and controls,
+not a guaranteed profitable parameter set. The only honest answer for this
+specific implementation is continual out-of-sample measurement: live/demo
+trades, forward returns on all classified articles, and costed replay.
 
 ---
 
@@ -258,13 +287,18 @@ filled +3.13%; GOAI "stop_loss" filled −18.99%). v14 restructures execution:
 | **Take profit** | **Resting LIMIT sell placed at buy time** (`tp_order_id` on the trade). The exchange fills it the moment price touches target | zero |
 | **Stop loss** | Polled every 20s (was 60s); sells via **bounded limit** at trigger × (1 − 1%) — caps slippage at ~1% instead of chasing a collapsing bid. Unfilled → cancel → retry next cycle at current price | ≤ 20s |
 | **Time stop** | 60 min after entry, polled; needs no price feed (fires even in a data outage) | ≤ 20s |
-| **EOD flatten** | ALL positions force-closed 10 min before the close, regardless of P&L. Stops don't work overnight; one gap erases a month | — |
+| **EOD flatten** | ALL positions force-closed 10 min before the close with a market sell, regardless of P&L. Stops don't work overnight; one gap erases a month | — |
 
 **The cancel/fill race** (no OCO on T212): before any stop/time-stop sell, the
 resting TP must be cancelled (it reserves the shares). If the cancel fails
 because the TP filled while cancelling, the trade is recorded as a
 take_profit — never sold twice. Unknown order state (network error) → defer to
 next cycle rather than risk a double exit.
+
+If a resting TP disappears from the pending-order endpoint, the monitor now
+checks fill detail before closing the DB trade. A missing pending order can be
+a fill, but it can also be a DAY-order expiry/cancel; treating every 404 as a
+profit would corrupt P&L and leave real positions unmanaged.
 
 The monitor never sells into a closed market (guard + loud error if positions
 somehow survive past the close).

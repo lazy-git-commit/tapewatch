@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import pytz
 import yfinance as yf
 
 from config.settings import cfg
@@ -64,6 +65,7 @@ MAX_DAY_MOVE_PCT     = cfg.max_day_move_pct          # 25.0 (extended-move ceili
 REQUIRE_VWAP_CONFIRM = cfg.require_vwap_confirmation # True (v15 size-neutral gate)
 VWAP_TOLERANCE_PCT   = cfg.vwap_tolerance_pct        # 0.1
 MOMENTUM_BARS_BACK   = 6   # ~5 min ago
+_ET = pytz.timezone("America/New_York")
 
 # ── Cost model (v14) ──────────────────────────────────────────────────────────
 # The old backtest assumed frictionless fills, making every projection an
@@ -144,8 +146,8 @@ def fetch_signals_for_dates(start_date: str, end_date: str) -> list[SignalRecord
                 SELECT id, ticker, headline, published_at, confidence, acted_on, rejection_code
                 FROM news_signals
                 WHERE sentiment = 'positive'
-                  AND created_at >= %s
-                  AND created_at < %s
+                  AND created_at::timestamptz >= %s::date
+                  AND created_at::timestamptz < %s::date
                 ORDER BY published_at ASC
                 """,
                 (start_date, end_date),
@@ -179,8 +181,8 @@ def fetch_actual_trades(start_date: str, end_date: str) -> dict[int, dict]:
                 """
                 SELECT t.*, t.signal_id
                 FROM trades t
-                WHERE t.buy_time >= %s
-                  AND t.buy_time < %s
+                WHERE t.buy_time::timestamptz >= %s::date
+                  AND t.buy_time::timestamptz < %s::date
                 """,
                 (start_date, end_date),
             )
@@ -312,6 +314,13 @@ def _entry_fill(bars: pd.DataFrame, signal_time: datetime) -> tuple:
     return future.index[idx], float(future.iloc[idx]["Open"])
 
 
+def _market_open_for_signal(ts: datetime) -> datetime:
+    """NYSE regular-session open for the signal's local ET date, in UTC."""
+    ts_et = ts.astimezone(_ET)
+    open_et = ts_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    return open_et.astimezone(timezone.utc)
+
+
 def _simulate_trade(bars: pd.DataFrame, entry_time: datetime, entry_price: float) -> tuple:
     """
     Walk forward bar-by-bar from entry. Conservative fill assumptions:
@@ -355,7 +364,7 @@ def run_v15_check(signal: SignalRecord) -> BacktestResult:
     yf_ticker = signal.ticker.split("_")[0]
     pub = signal.published_at
     date = pub.replace(hour=0, minute=0, second=0, microsecond=0)
-    market_open_utc = date.replace(hour=13, minute=30, second=0)
+    market_open_utc = _market_open_for_signal(pub)
 
     if signal.acted_on:
         prod_outcome = "traded"

@@ -77,7 +77,7 @@ One row per open or closed trade. A row is inserted when a buy order is placed (
 
 | Column | Type | Description |
 |---|---|---|
-| `profit_loss` | REAL | Realised profit or loss in GBP. Computed as `sell_net_gbp - buy_net_gbp` when both GBP values are available (accurate). Falls back to `(sell_price - buy_price) × quantity` in USD terms for historical rows that pre-date GBP fill capture. |
+| `profit_loss` | REAL | Realised profit or loss in GBP. Computed as `abs(sell_net_gbp) - abs(buy_net_gbp)` when both GBP values are available, so broker wallet-impact sign conventions cannot corrupt P&L or the daily kill switch. Falls back to `(sell_price - buy_price) × quantity` in USD terms for historical rows that pre-date GBP fill capture. |
 | `profit_loss_pct` | REAL | P&L as a percentage of the cost basis. Computed as `profit_loss / abs(buy_net_gbp) × 100` when GBP data is available, otherwise `(sell_price - buy_price) / buy_price × 100`. |
 
 ---

@@ -51,7 +51,10 @@ from news.fetcher import fetch_all_news, NewsItem
 from market.price_check import (
     confirm_price_signal, is_market_open, is_too_late_to_buy, PriceConfirmation,
 )
-from trading.executor import buy, build_symbol_map, place_take_profit, get_portfolio_value, get_account_summary
+from trading.executor import (
+    buy, sell, build_symbol_map, place_take_profit, cancel_order,
+    get_portfolio_value, get_account_summary,
+)
 from monitor.position_monitor import monitor_positions
 from premarket.scanner import in_premarket_window, premarket_scan, evaluate_premarket_candidates
 from analysis.forward_returns import compute_forward_returns
@@ -212,6 +215,9 @@ def _execute_entry(item: NewsItem, confirmation: PriceConfirmation, fetched_at: 
         return False
 
     # ── Record trade ──────────────────────────────────────────────────────────
+    # A buy that is not represented in the DB is an unmanaged live position.
+    # If the insert fails after the broker filled us, flatten immediately; the
+    # spread loss is preferable to an invisible position with no stop/EOD logic.
     try:
         trade_id = open_trade(
             ticker=item.ticker,
@@ -223,14 +229,41 @@ def _execute_entry(item: NewsItem, confirmation: PriceConfirmation, fetched_at: 
             buy_fx_rate=result.fx_rate,
             buy_fees_gbp=result.fees_gbp,
         )
-        mark_signal_acted_on(signal_id)
     except Exception as exc:
         logger.error(
             "open_trade() failed for %s after successful buy order %s: %s "
-            "— trade executed but NOT recorded in DB",
+            "— trade executed but NOT recorded in DB; attempting emergency flatten",
             item.ticker, result.order_id, exc,
         )
+        try:
+            flatten = sell(item.ticker, result.quantity, result.price, "db_record_failed")
+            if flatten.success:
+                logger.critical(
+                    "Emergency flatten succeeded for unrecorded %s position "
+                    "(sell_order=%s)",
+                    item.ticker, flatten.order_id,
+                )
+            else:
+                logger.critical(
+                    "Emergency flatten FAILED for unrecorded %s position: %s — "
+                    "manual broker reconciliation required",
+                    item.ticker, flatten.error,
+                )
+        except Exception as flatten_exc:
+            logger.critical(
+                "Emergency flatten raised for unrecorded %s position: %s — "
+                "manual broker reconciliation required",
+                item.ticker, flatten_exc, exc_info=True,
+            )
         return False
+
+    try:
+        mark_signal_acted_on(signal_id)
+    except Exception as exc:
+        # The trade row is the source of truth for position management. A failed
+        # acted_on flag should not abort TP placement or leave the position less
+        # protected.
+        logger.warning("mark_signal_acted_on failed for signal %d: %s", signal_id, exc)
 
     # ── Resting take-profit ───────────────────────────────────────────────────
     # Placed at the exchange so the profit side has zero polling latency.
@@ -243,9 +276,21 @@ def _execute_entry(item: NewsItem, confirmation: PriceConfirmation, fetched_at: 
         except Exception as exc:
             logger.error(
                 "Could not store tp_order_id %s for trade %d: %s — monitor will "
-                "treat this as polled-TP",
+                "not know about the resting order; cancelling it now",
                 tp_order_id, trade_id, exc,
             )
+            if cancel_order(tp_order_id):
+                logger.warning(
+                    "Untracked resting TP %s for trade %d cancelled; monitor will use polled TP",
+                    tp_order_id, trade_id,
+                )
+                tp_order_id = None
+            else:
+                logger.critical(
+                    "Could not cancel untracked TP order %s for trade %d — "
+                    "manual broker reconciliation required before any stop sell",
+                    tp_order_id, trade_id,
+                )
 
     logger.info(
         "Trade #%d opened: %s × %.6f @ $%.4f | net=£%.2f fx=%.4f fees=£%.2f | "

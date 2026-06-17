@@ -56,7 +56,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ticker, quantity, buy_price, buy_time, ROUND(EXTRACT(EPOCH FROM (NOW() - buy_time::timestamp)) / 60) AS age_minutes FROM trades WHERE status = 'open' AND mode = '$mode' ORDER BY buy_time DESC",
+          "rawSql": "SELECT ticker, quantity, buy_price, buy_time, ROUND(EXTRACT(EPOCH FROM (NOW() - buy_time::timestamptz)) / 60) AS age_minutes FROM trades WHERE status = 'open' AND mode = '$mode' ORDER BY buy_time DESC",
           "format": "table",
           "refId": "A"
         }
@@ -162,7 +162,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(SUM(CASE WHEN sell_net_gbp IS NOT NULL AND buy_net_gbp IS NOT NULL THEN sell_net_gbp - buy_net_gbp ELSE profit_loss END)::numeric, 2) AS total_pnl FROM trades WHERE status = 'closed' AND mode = '$mode'",
+          "rawSql": "SELECT ROUND(SUM(CASE WHEN sell_net_gbp IS NOT NULL AND buy_net_gbp IS NOT NULL THEN ABS(sell_net_gbp) - ABS(buy_net_gbp) ELSE profit_loss END)::numeric, 2) AS total_pnl FROM trades WHERE status = 'closed' AND mode = '$mode'",
           "format": "table",
           "refId": "A"
         }
@@ -431,7 +431,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(COALESCE(SUM(profit_loss), 0)::numeric, 2) AS today_pnl FROM trades WHERE mode = '$mode' AND status = 'closed' AND sell_time LIKE TO_CHAR(NOW(), 'YYYY-MM-DD') || '%'",
+          "rawSql": "SELECT ROUND(COALESCE(SUM(profit_loss), 0)::numeric, 2) AS today_pnl FROM trades WHERE mode = '$mode' AND status = 'closed' AND sell_time IS NOT NULL AND (sell_time::timestamptz AT TIME ZONE 'Europe/London')::date = (NOW() AT TIME ZONE 'Europe/London')::date",
           "format": "table",
           "refId": "A"
         }
@@ -485,7 +485,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT COUNT(*) AS trades_today FROM trades WHERE mode = '$mode' AND buy_time LIKE TO_CHAR(NOW(), 'YYYY-MM-DD') || '%'",
+          "rawSql": "SELECT COUNT(*) AS trades_today FROM trades WHERE mode = '$mode' AND (buy_time::timestamptz AT TIME ZONE 'Europe/London')::date = (NOW() AT TIME ZONE 'Europe/London')::date",
           "format": "table",
           "refId": "A"
         }

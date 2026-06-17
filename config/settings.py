@@ -150,7 +150,7 @@ class Settings:
     # eval loop but never traded.
     tradeable_catalysts: list[str] = field(
         default_factory=lambda: [
-            c.strip() for c in os.getenv(
+            c.strip().lower() for c in os.getenv(
                 "TRADEABLE_CATALYSTS",
                 "earnings_beat,guidance_raise,fda_approval,ma_target,contract_win,product_launch,short_squeeze",
             ).split(",") if c.strip()
@@ -252,7 +252,7 @@ class Settings:
     # ── News Settings ─────────────────────────────────────────────────────────
     blocklist: list[str] = field(
         default_factory=lambda: [
-            t.strip() for t in os.getenv("BLOCKLIST", "").split(",") if t.strip()
+            t.strip().upper() for t in os.getenv("BLOCKLIST", "").split(",") if t.strip()
         ]
     )
 
@@ -262,6 +262,9 @@ class Settings:
     def validate(self) -> None:
         """Raise if any required key is missing."""
         missing = []
+        errors = []
+        if self.trading_mode.lower() not in ("demo", "live"):
+            errors.append("TRADING_MODE must be either 'demo' or 'live'")
         if self.is_live:
             if not self.trading212_api_key:
                 missing.append("TRADING212_API_KEY")
@@ -285,6 +288,36 @@ class Settings:
                 f"Missing required environment variables: {', '.join(missing)}\n"
                 "Copy .env.example to .env and fill in your keys."
             )
+        numeric_checks = [
+            ("MIN_SENTIMENT_CONFIDENCE", 1 <= self.min_sentiment_confidence <= 10),
+            ("MIN_PRICE_MOVE_PCT", self.min_price_move_pct >= 0),
+            ("MAX_PRICE_MOVE_PCT", self.max_price_move_pct > self.min_price_move_pct),
+            ("MAX_DAY_MOVE_PCT", self.max_day_move_pct > 0),
+            ("MOMENTUM_LOOKBACK_MINUTES", self.momentum_lookback_minutes > 0),
+            ("MAX_DAY_DROP_PCT", self.max_day_drop_pct > 0),
+            ("MIN_DAILY_DOLLAR_VOLUME", self.min_daily_dollar_volume >= 0),
+            ("MIN_RVOL", self.min_rvol >= 0),
+            ("MAX_RVOL", self.max_rvol > self.min_rvol),
+            ("MIN_STOCK_PRICE", self.min_stock_price >= 0),
+            ("MAX_SPREAD_PCT", self.max_spread_pct > 0),
+            ("OPEN_BLOCK_MINUTES", self.open_block_minutes >= 0),
+            ("MAX_POSITION_SIZE_PCT", self.max_position_size_pct > 0),
+            ("RISK_PER_TRADE_PCT", self.risk_per_trade_pct > 0),
+            ("MAX_ADV_PARTICIPATION_PCT", self.max_adv_participation_pct > 0),
+            ("MAX_OPEN_POSITIONS", self.max_open_positions > 0),
+            ("MAX_TRADES_PER_DAY", self.max_trades_per_day > 0),
+            ("MAX_DAILY_LOSS_PCT", self.max_daily_loss_pct > 0),
+            ("TAKE_PROFIT_PCT", self.take_profit_pct > 0),
+            ("STOP_LOSS_PCT", self.stop_loss_pct > 0),
+            ("TIME_STOP_MINUTES", self.time_stop_minutes > 0),
+            ("MONITOR_INTERVAL_SECONDS", self.monitor_interval_seconds > 0),
+            ("EOD_FLATTEN_MINUTES", self.eod_flatten_minutes >= 0),
+            ("SELL_LIMIT_SLACK_PCT", self.sell_limit_slack_pct >= 0),
+            ("MIN_GAP_PCT/MAX_GAP_PCT", self.max_gap_pct > self.min_gap_pct),
+        ]
+        errors.extend(name for name, ok in numeric_checks if not ok)
+        if errors:
+            raise ValueError("Invalid trading configuration: " + "; ".join(errors))
 
     @property
     def is_live(self) -> bool:
