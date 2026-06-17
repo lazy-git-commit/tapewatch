@@ -7,6 +7,56 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v15.8 — 2026-06-17 (catalyst materiality scoring + broker reconciliation)
+
+Two strategy and safety upgrades recommended by quant review:
+
+### Catalyst materiality extraction (signal quality)
+
+The system previously classified catalyst *type* (14 classes) but not
+catalyst *magnitude* — an FDA approval for a $50M micro-cap and one for a
+$5B mid-cap were treated identically. Bernard & Thomas (1992) PEAD evidence
+shows post-event drift is proportional to surprise size, not just direction.
+
+**Changes:**
+- New `catalyst_magnitude` field (integer 1–5) added to the Claude tool schema
+  and system prompt. Rubric anchored to expected intraday move relative to
+  market cap: 5 = transformative (micro-cap FDA/M&A, >20% earnings surprise),
+  4 = major, 3 = material, 2 = modest, 1 = noise (PT raise, reiteration, MOU).
+- New Gate 4 in `fetch_all_news()`: signals below `MIN_CATALYST_MAGNITUDE`
+  (default 2) are filtered before entering the trade path. Magnitude=1 signals
+  (analyst reiterations, vague partnerships, conference attendance) that
+  somehow score "positive" are now blocked at the gate.
+- `catalyst_magnitude` persisted to `sentiment_scores` and `news_signals`
+  tables (DB migration: `ADD COLUMN IF NOT EXISTS`). The nightly
+  `forward_returns` job will accumulate magnitude-stratified return data —
+  the eval loop can now measure whether high-magnitude signals actually
+  outperform.
+- `MIN_CATALYST_MAGNITUDE=2` in `.env`/deploy — set to 3 to restrict to
+  material+ catalysts only.
+
+### Broker reconciliation (safety)
+
+The monitor previously trusted only the DB as source of truth. Two dangerous
+divergences were invisible:
+- **Phantom** (DB-open, broker-flat): `close_trade()` failed after a sell.
+  Monitor kept trying to exit a flat position forever.
+- **Orphan** (broker-open, DB-flat): `open_trade()` failed after a buy fill,
+  and emergency flatten also failed. Live unmanaged position with no stop.
+
+**Changes:**
+- New `get_broker_positions()` in `trading/executor.py`: calls T212
+  `/equity/portfolio`, returns `{ticker: quantity}` or `None` on API failure.
+- New `_reconcile_positions()` in `monitor/position_monitor.py`: diffed every
+  monitor cycle against `get_open_trades()`. Phantoms and orphans are logged
+  at `CRITICAL` level for manual review. Never auto-reconciles — a transient
+  API timeout looks identical to "broker has no positions" and auto-closing
+  would flatten real positions.
+
+Tests: 63 → 69.
+
+---
+
 ## v15.7 — 2026-06-17 (three correctness fixes from third code review)
 
 Three bugs identified by automated multi-angle code review of v15.6:

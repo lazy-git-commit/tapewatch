@@ -186,6 +186,98 @@ class TestSentimentScoring:
         assert kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
 
 
+# ── Catalyst magnitude tests ─────────────────────────────────────────────────
+
+class TestCatalystMagnitude:
+    """Tests for catalyst_magnitude field in news/fetcher.py"""
+
+    def _mock_tool_response(self, classifications):
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": classifications}
+        msg = MagicMock()
+        msg.content = [block]
+        return msg
+
+    @patch("news.fetcher._claude")
+    def test_magnitude_parsed_from_response(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
+        mock_claude.messages.create.return_value = self._mock_tool_response([
+            {"id": "1", "sentiment": "positive", "confidence": 0.95,
+             "catalyst_type": "fda_approval", "already_moved": False,
+             "catalyst_magnitude": 5},
+        ])
+        scores = _batch_score_sentiment([{"id": "1", "headline": "FDA approval", "teaser": ""}])
+        assert scores["1"]["catalyst_magnitude"] == 5
+
+    @patch("news.fetcher._claude")
+    def test_missing_magnitude_defaults_to_one(self, mock_claude):
+        """Old Claude responses without catalyst_magnitude default to 1 (noise)."""
+        from news.fetcher import _batch_score_sentiment
+        mock_claude.messages.create.return_value = self._mock_tool_response([
+            {"id": "1", "sentiment": "positive", "confidence": 0.9,
+             "catalyst_type": "earnings_beat", "already_moved": False},
+            # no catalyst_magnitude key
+        ])
+        scores = _batch_score_sentiment([{"id": "1", "headline": "Beat", "teaser": ""}])
+        assert scores["1"]["catalyst_magnitude"] == 1
+
+
+# ── Broker reconciliation tests ───────────────────────────────────────────────
+
+class TestBrokerReconciliation:
+    """Tests for monitor/position_monitor.py::_reconcile_positions"""
+
+    def _trade(self, trade_id, ticker, qty=10.0):
+        return {"id": trade_id, "ticker": ticker, "quantity": qty,
+                "buy_price": 100.0, "buy_time": "2026-06-17T13:00:00+00:00",
+                "tp_order_id": None, "mode": "demo"}
+
+    @patch("monitor.position_monitor.get_broker_positions")
+    def test_phantom_position_logged(self, mock_broker, caplog):
+        """DB-open trade not present in broker portfolio → CRITICAL log."""
+        import logging
+        mock_broker.return_value = {}  # broker has nothing
+        from monitor.position_monitor import _reconcile_positions
+        with caplog.at_level(logging.CRITICAL, logger="monitor.position_monitor"):
+            _reconcile_positions([self._trade(42, "AAPL_US_EQ")])
+        assert any("RECONCILIATION" in r.message and "AAPL_US_EQ" in r.message
+                   and "OPEN in DB but NOT in broker" in r.message
+                   for r in caplog.records)
+
+    @patch("monitor.position_monitor.get_broker_positions")
+    def test_orphan_position_logged(self, mock_broker, caplog):
+        """Broker holds position not in DB → CRITICAL log."""
+        import logging
+        mock_broker.return_value = {"TSLA_US_EQ": 5.0}  # broker has it, DB doesn't
+        from monitor.position_monitor import _reconcile_positions
+        with caplog.at_level(logging.CRITICAL, logger="monitor.position_monitor"):
+            _reconcile_positions([])  # no DB trades
+        assert any("RECONCILIATION" in r.message and "TSLA_US_EQ" in r.message
+                   and "broker holds" in r.message
+                   for r in caplog.records)
+
+    @patch("monitor.position_monitor.get_broker_positions")
+    def test_api_failure_skips_silently(self, mock_broker, caplog):
+        """get_broker_positions() returns None (API failure) → no alerts."""
+        import logging
+        mock_broker.return_value = None
+        from monitor.position_monitor import _reconcile_positions
+        with caplog.at_level(logging.CRITICAL, logger="monitor.position_monitor"):
+            _reconcile_positions([self._trade(1, "AAPL_US_EQ")])
+        assert not any("RECONCILIATION" in r.message for r in caplog.records)
+
+    @patch("monitor.position_monitor.get_broker_positions")
+    def test_matching_positions_no_alert(self, mock_broker, caplog):
+        """DB and broker agree → no CRITICAL logs."""
+        import logging
+        mock_broker.return_value = {"AAPL_US_EQ": 10.0}
+        from monitor.position_monitor import _reconcile_positions
+        with caplog.at_level(logging.CRITICAL, logger="monitor.position_monitor"):
+            _reconcile_positions([self._trade(1, "AAPL_US_EQ")])
+        assert not any("RECONCILIATION" in r.message for r in caplog.records)
+
+
 # ── Position sizing tests ─────────────────────────────────────────────────────
 
 class TestPositionSizing:

@@ -317,6 +317,29 @@ def get_account_summary() -> tuple[float, float] | None:
     return float(data.get("total", 0)), float(data.get("free", 0))
 
 
+def get_broker_positions() -> dict[str, float] | None:
+    """
+    Return the broker's current open positions as {t212_ticker: quantity}.
+
+    Uses the T212 /equity/portfolio endpoint. Returns None on API failure
+    so callers can distinguish "broker has no positions" (empty dict) from
+    "broker is unreachable" (None) and avoid false-positive reconciliation
+    alerts during transient network errors.
+    """
+    try:
+        data = _get("/equity/portfolio")
+        # T212 returns a list of position objects; each has 'ticker' and 'quantity'.
+        positions = data if isinstance(data, list) else data.get("positions", [])
+        return {
+            str(p["ticker"]): float(p["quantity"])
+            for p in positions
+            if p.get("ticker") and p.get("quantity") is not None
+        }
+    except Exception as exc:
+        logger.warning("get_broker_positions failed: %s — skipping reconciliation", exc)
+        return None
+
+
 def calculate_quantity(
     ticker: str,
     price: float,

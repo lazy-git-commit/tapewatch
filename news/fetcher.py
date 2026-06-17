@@ -122,25 +122,58 @@ Confidence calibration (0.0–1.0):
 - below 0.5: routine flow — PT raises, reiterations, sector commentary,
   conference attendance, dividends, awards, ESG, stale rewrites
 
+STEP 6 — Score catalyst_magnitude (1–5): how large is this catalyst relative
+to the company's current market position?
+
+This measures expected move SIZE, not just direction. Use all available
+context: company market cap, dollar figures in the headline, catalyst class.
+
+- 5 (transformative): FDA approval or M&A for a micro/small-cap (< $500M
+  market cap), earnings beat with >20% revenue surprise, deal value > 50%
+  of market cap. Expected intraday move: 20–100%+.
+
+- 4 (major): FDA approval for a mid-cap ($500M–$2B), definitive M&A with
+  20–50% premium, contract win > 10% of annual revenue, earnings beat with
+  10–20% surprise. Expected move: 8–25%.
+
+- 3 (material): Named contract with dollar value 3–10% of revenue, earnings
+  beat with 5–10% surprise, guidance raise with concrete numbers, Phase 3
+  trial result for a small-cap. Expected move: 3–10%.
+
+- 2 (modest): Partnership with revenue figures below 3% of annual revenue,
+  analyst upgrade with new product catalyst, earnings in-line with slight
+  beat, guidance raised modestly. Expected move: 1–5%.
+
+- 1 (noise): PT raise with no new catalyst, reiteration, conference
+  attendance, vague partnership MOU, routine contract renewal, awards/ESG.
+  Expected move: < 1%.
+
+When market cap is unknown, use the company name and context clues (share
+price, sector) to estimate. Biotech names below $1B move violently on FDA
+decisions; use 5. S&P 500 names use 1–2 unless the catalyst is extraordinary.
+
 Examples:
 
 Headline: "Acme Therapeutics Receives FDA Approval For Lead Drug ACM-101"
-→ {"sentiment": "positive", "confidence": 0.95, "catalyst_type": "fda_approval", "already_moved": false}
+→ {"sentiment": "positive", "confidence": 0.95, "catalyst_type": "fda_approval", "already_moved": false, "catalyst_magnitude": 5}
 
 Headline: "Acme Therapeutics Shares Halted On Circuit Breaker To The Upside"
-→ {"sentiment": "neutral", "confidence": 0.2, "catalyst_type": "halt_or_resume", "already_moved": true}
+→ {"sentiment": "neutral", "confidence": 0.2, "catalyst_type": "halt_or_resume", "already_moved": true, "catalyst_magnitude": 1}
 
 Headline: "What's Going On With Acme Therapeutics Stock On Tuesday?"
-→ {"sentiment": "neutral", "confidence": 0.2, "catalyst_type": "recap_explainer", "already_moved": true}
+→ {"sentiment": "neutral", "confidence": 0.2, "catalyst_type": "recap_explainer", "already_moved": true, "catalyst_magnitude": 1}
 
 Headline: "Acme Announces $40M Registered Direct Offering Priced At-The-Market"
-→ {"sentiment": "negative", "confidence": 0.85, "catalyst_type": "offering_dilution", "already_moved": false}
+→ {"sentiment": "negative", "confidence": 0.85, "catalyst_type": "offering_dilution", "already_moved": false, "catalyst_magnitude": 3}
 
 Headline: "MegaBank Maintains Overweight On Apple, Raises Price Target To $310"
-→ {"sentiment": "neutral", "confidence": 0.3, "catalyst_type": "analyst_action", "already_moved": false}
+→ {"sentiment": "neutral", "confidence": 0.3, "catalyst_type": "analyst_action", "already_moved": false, "catalyst_magnitude": 1}
 
 Headline: "Acme Signs Non-Binding LOI To Merge With Beta Corp"
-→ {"sentiment": "neutral", "confidence": 0.4, "catalyst_type": "other", "already_moved": false}
+→ {"sentiment": "neutral", "confidence": 0.4, "catalyst_type": "other", "already_moved": false, "catalyst_magnitude": 2}
+
+Headline: "SmallCorp Wins $45M DoD Contract (Annual Revenue ~$120M)"
+→ {"sentiment": "positive", "confidence": 0.85, "catalyst_type": "contract_win", "already_moved": false, "catalyst_magnitude": 4}
 
 Classify every article you are given. Use the classify_articles tool."""
 
@@ -165,8 +198,14 @@ _CLASSIFY_TOOL = {
                             "type": "boolean",
                             "description": "true if the price move described already happened before publication",
                         },
+                        "catalyst_magnitude": {
+                            "type": "integer",
+                            "description": "1–5: expected move size relative to market cap. 5=transformative (micro-cap FDA/M&A, >20% surprise), 4=major, 3=material, 2=modest, 1=noise/routine.",
+                            "minimum": 1,
+                            "maximum": 5,
+                        },
                     },
-                    "required": ["id", "sentiment", "confidence", "catalyst_type", "already_moved"],
+                    "required": ["id", "sentiment", "confidence", "catalyst_type", "already_moved", "catalyst_magnitude"],
                 },
             }
         },
@@ -187,6 +226,7 @@ class NewsItem:
     confidence: float    # 0.0–1.0
     catalyst_type: str   # one of CATALYST_TYPES
     already_moved: bool  # model's judgement: move happened pre-publication
+    catalyst_magnitude: int  # 1–5: expected move size relative to market cap
 
 
 def _fetch(lookback_minutes: int) -> list[dict]:
@@ -284,6 +324,7 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
                 "confidence": float(r.get("confidence", 0.5)),
                 "catalyst_type": str(r.get("catalyst_type", "other")),
                 "already_moved": bool(r.get("already_moved", False)),
+                "catalyst_magnitude": int(r.get("catalyst_magnitude", 1)),
             }
         if len(results) < len(articles):
             logger.warning(
@@ -415,6 +456,7 @@ def fetch_all_news(
                 "confidence": s["confidence"],
                 "catalyst_type": s["catalyst_type"],
                 "already_moved": s["already_moved"],
+                "catalyst_magnitude": s["catalyst_magnitude"],
                 "published_at": article.get("published", ""),
             })
     if score_rows:
@@ -461,6 +503,18 @@ def fetch_all_news(
             )
             continue
 
+        # Gate 4: catalyst magnitude floor. Filters out noise signals (PT raises,
+        # routine reiterations, vague MOUs) that the model scores positive with
+        # low magnitude. Bernard & Thomas (1992) PEAD evidence shows drift is
+        # proportional to earnings surprise size — the same principle applies here.
+        if s["catalyst_magnitude"] < cfg.min_catalyst_magnitude:
+            logger.info(
+                "Gate [magnitude]: %s positive but magnitude=%d < min=%d — skipping: %s",
+                ",".join(tickers), s["catalyst_magnitude"], cfg.min_catalyst_magnitude,
+                headline[:70],
+            )
+            continue
+
         teaser = html.unescape(article.get("teaser") or article.get("body", "")[:200])
         try:
             published_at = datetime.fromisoformat(
@@ -481,6 +535,7 @@ def fetch_all_news(
                 confidence=s["confidence"],
                 catalyst_type=s["catalyst_type"],
                 already_moved=s["already_moved"],
+                catalyst_magnitude=s["catalyst_magnitude"],
             ))
 
     logger.info(

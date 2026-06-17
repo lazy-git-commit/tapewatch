@@ -174,6 +174,7 @@ def _execute_entry(item: NewsItem, confirmation: PriceConfirmation, fetched_at: 
             published_at=item.published_at.isoformat(),
             fetched_at=fetched_at,
             catalyst_type=item.catalyst_type,
+            catalyst_magnitude=item.catalyst_magnitude,
         )
     except Exception as exc:
         logger.error("save_signal failed for %s: %s — skipping trade", item.ticker, exc)

@@ -41,6 +41,14 @@ class Settings:
     min_sentiment_confidence: int = field(
         default_factory=lambda: int(os.getenv("MIN_SENTIMENT_CONFIDENCE", "7"))
     )
+    # Minimum catalyst magnitude (1–5) to trade. Filters noise signals that the
+    # model scores positive but judges as small relative-to-market-cap impact.
+    # Default 2: trades material catalysts (3+) and modest ones (2) but blocks
+    # pure noise (1 = PT raise, reiteration, vague MOU, conference attendance).
+    # Set to 3 to restrict to material+ only; set to 1 to disable the gate.
+    min_catalyst_magnitude: int = field(
+        default_factory=lambda: int(os.getenv("MIN_CATALYST_MAGNITUDE", "2"))
+    )
     # ── Momentum confirmation (v15: VWAP-relative, size-neutral) ──────────────
     # The v14 fixed-% momentum floor was the strategy's binding constraint:
     # 1,077 of all-time rejections were `low_momentum`, and on 2026-06-15 every
@@ -290,6 +298,7 @@ class Settings:
             )
         numeric_checks = [
             ("MIN_SENTIMENT_CONFIDENCE", 1 <= self.min_sentiment_confidence <= 10),
+            ("MIN_CATALYST_MAGNITUDE", 1 <= self.min_catalyst_magnitude <= 5),
             ("MIN_PRICE_MOVE_PCT", self.min_price_move_pct >= 0),
             ("MAX_PRICE_MOVE_PCT", self.max_price_move_pct > self.min_price_move_pct),
             ("MAX_DAY_MOVE_PCT", self.max_day_move_pct > 0),

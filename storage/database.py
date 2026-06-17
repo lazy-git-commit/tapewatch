@@ -147,6 +147,15 @@ def init_db() -> None:
                 ALTER TABLE news_signals
                 ADD COLUMN IF NOT EXISTS catalyst_type TEXT
             """)
+            # catalyst_magnitude: 1–5 relative-to-market-cap impact score.
+            cur.execute("""
+                ALTER TABLE news_signals
+                ADD COLUMN IF NOT EXISTS catalyst_magnitude INTEGER
+            """)
+            cur.execute("""
+                ALTER TABLE sentiment_scores
+                ADD COLUMN IF NOT EXISTS catalyst_magnitude INTEGER
+            """)
             # Eval-loop table: EVERY Claude classification (positive, neutral,
             # negative) is stored here; a nightly job fills in forward returns
             # so prompt changes can be measured, not guessed.
@@ -219,6 +228,7 @@ def save_signal(
     published_at: str | None = None,
     fetched_at: str | None = None,
     catalyst_type: str | None = None,
+    catalyst_magnitude: int | None = None,
 ) -> int:
     """Insert a news signal. Returns the new row id."""
     now = _now_london()
@@ -227,11 +237,13 @@ def save_signal(
             cur.execute(
                 """INSERT INTO news_signals
                    (article_id, ticker, headline, source, sentiment, confidence,
-                    published_at, fetched_at, created_at, catalyst_type)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    published_at, fetched_at, created_at, catalyst_type,
+                    catalyst_magnitude)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (article_id, ticker, headline, source, sentiment, confidence,
-                 published_at, fetched_at or now, now, catalyst_type),
+                 published_at, fetched_at or now, now, catalyst_type,
+                 catalyst_magnitude),
             )
             return cur.fetchone()["id"]
 
@@ -458,11 +470,14 @@ def save_sentiment_scores(rows: list[dict]) -> None:
             cur.executemany(
                 """INSERT INTO sentiment_scores
                    (article_id, ticker, headline, sentiment, confidence,
-                    catalyst_type, already_moved, published_at, scored_at)
+                    catalyst_type, already_moved, catalyst_magnitude,
+                    published_at, scored_at)
                    VALUES (%(article_id)s, %(ticker)s, %(headline)s, %(sentiment)s,
                            %(confidence)s, %(catalyst_type)s, %(already_moved)s,
-                           %(published_at)s, %(scored_at)s)""",
-                [{**r, "already_moved": int(r.get("already_moved", False)), "scored_at": now}
+                           %(catalyst_magnitude)s, %(published_at)s, %(scored_at)s)""",
+                [{**r, "already_moved": int(r.get("already_moved", False)),
+                  "catalyst_magnitude": r.get("catalyst_magnitude"),
+                  "scored_at": now}
                  for r in rows],
             )
 

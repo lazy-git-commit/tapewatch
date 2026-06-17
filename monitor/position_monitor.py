@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from market.price_check import get_current_price, is_market_open, minutes_until_close
 from trading.executor import (
     sell, get_order_status, cancel_order, _fetch_fill, _parse_fill,
+    get_broker_positions,
 )
 from storage.database import (
     get_open_trades, close_trade, set_tp_order_id, touch_heartbeat,
@@ -223,6 +224,47 @@ def _cancel_tp_before_sell(trade: dict) -> bool:
     return False
 
 
+def _reconcile_positions(db_open_trades: list[dict]) -> None:
+    """
+    Compare DB-open trades against the broker's live portfolio. Log any
+    divergence at CRITICAL level — these require manual investigation.
+
+    Never auto-reconciles: a transient /equity/portfolio timeout looks
+    identical to "broker has no positions" — auto-closing on that would
+    flatten real positions. Alerting and letting a human decide is safer.
+    """
+    broker_positions = get_broker_positions()
+    if broker_positions is None:
+        # API failure — skip this cycle rather than false-alerting.
+        return
+
+    db_tickers = {trade["ticker"] for trade in db_open_trades}
+    broker_tickers = set(broker_positions.keys())
+
+    # Phantom: DB says open, broker says flat.
+    for trade in db_open_trades:
+        ticker = trade["ticker"]
+        if ticker not in broker_tickers:
+            logger.critical(
+                "RECONCILIATION: trade %d (%s qty=%.4f) is OPEN in DB but NOT in "
+                "broker portfolio — possible missed close_trade() after a sell. "
+                "Manual review required: either close DB record if position is "
+                "truly flat, or investigate if the sell failed silently.",
+                trade["id"], ticker, trade["quantity"],
+            )
+
+    # Orphan: broker says open, DB says flat.
+    for ticker, qty in broker_positions.items():
+        if ticker not in db_tickers:
+            logger.critical(
+                "RECONCILIATION: broker holds %.4f of %s but NO open trade in DB "
+                "— possible failed open_trade() after a buy fill, or manual trade. "
+                "Manual review required: close the position manually if it is an "
+                "orphan, or add a DB record if it was a manual entry.",
+                qty, ticker,
+            )
+
+
 def monitor_positions() -> None:
     """
     Called by the scheduler every cfg.monitor_interval_seconds.
@@ -241,6 +283,24 @@ def monitor_positions() -> None:
 
     if not open_trades:
         return
+
+    # ── Broker reconciliation ─────────────────────────────────────────────────
+    # The DB is the system's source of truth for position management, but it
+    # can drift from the broker after a DB write failure or a kill -9. Comparing
+    # the two every cycle catches two dangerous divergences:
+    #
+    #   Phantom (DB-open, broker-flat): close_trade() failed after a successful
+    #   sell. The monitor will keep trying to exit a position that no longer
+    #   exists. We log CRITICAL — manual review required (we never auto-close
+    #   these because a transient /portfolio API error looks identical).
+    #
+    #   Orphan (broker-open, DB-flat): buy() succeeded but open_trade() failed,
+    #   and the emergency flatten also failed. An unmanaged live position with no
+    #   stop or EOD logic. We log CRITICAL — manual intervention required.
+    #
+    # We only alert, never auto-reconcile, because a transient API error would
+    # make every DB-open trade look like a phantom and trigger mass closes.
+    _reconcile_positions(open_trades)
 
     # ── Market-hours guard ────────────────────────────────────────────────────
     # Selling into a closed market queues orders blind into the next open.
