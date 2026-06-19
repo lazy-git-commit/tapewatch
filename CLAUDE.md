@@ -35,7 +35,11 @@ python -m backtest.backtest --week               # last full Mon–Fri trading w
 
 # DB-replay backtest: replays current v15 logic against signals already in the production DB
 # Uses yfinance for prices — no Benzinga API key needed, no Twelvedata credits used.
-# Run this on the VM (or set DB_URL to the VM DB) to analyse last week's performance.
+# NOTE: Postgres is bound to localhost on the VM (not exposed beyond the host), so the
+# <your-vm-host> host below only resolves when this command is run ON the VM. From the dev
+# box, either SSH in and run it there, or open an SSH tunnel first:
+#   ssh -fNL 5432:localhost:5432 root@<your-vm-host> -i ~/.ssh/<your-ssh-key>
+#   then use DB_URL=postgresql://<db-user>:<db-password>@localhost:5432/momentum_trader
 DB_URL=postgresql://<db-user>:<db-password>@<your-vm-host>:5432/momentum_trader \
   python -m backtest.backtest_db --week
 DB_URL=postgresql://<db-user>:<db-password>@<your-vm-host>:5432/momentum_trader \

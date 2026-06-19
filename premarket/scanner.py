@@ -38,6 +38,7 @@ hour trade) and at the end of the day they were created.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pytz
@@ -67,6 +68,20 @@ _EVAL_WINDOW_MINUTES = 30
 # every minute, so 5 min gives comfortable overlap without re-scoring stale
 # news (dedup via premarket_candidates handles repeats anyway).
 _SCAN_MAX_AGE_MINUTES = 5.0
+
+# At the open, candidates are price-confirmed CONCURRENTLY rather than one at a
+# time. Root cause (2026-06-18 zero-trades incident): serial evaluation of
+# ~13 candidates, several with Finnhub-pc=0 + Twelvedata 429/404 retry backoff
+# (3+6+9s each), pushed a single eval cycle past 60s — the scanner skipped whole
+# minutes and 9 candidates EXPIRED having never been price-checked once. With a
+# bounded thread pool + the fast (no-retry) quote path, one slow/dead ticker can
+# no longer starve the rest: they all resolve in parallel within the budget, and
+# anything that doesn't simply stays pending for next cycle (~60s away, still
+# inside the 30-min window). See docs/algorithm.md §7 "Known failure mode".
+_EVAL_MAX_WORKERS = 8
+# Hard wall-clock ceiling for the parallel confirm phase. Comfortably under the
+# 60s news-cycle interval so the scanner always completes a full pass per minute.
+_EVAL_CYCLE_BUDGET_SECONDS = 30.0
 
 
 def _now_et() -> datetime:
@@ -151,33 +166,18 @@ def _minutes_since_open() -> float:
     return (now - open_).total_seconds() / 60
 
 
-def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
+def _live_candidates(pending: list[dict], minutes_open: float) -> list[dict]:
     """
-    At-open evaluation of the watchlist. Returns the candidates that passed
-    BOTH the gap gate and full price confirmation, paired with their
-    PriceConfirmation — main.py executes them through its standard risk
-    gates and buy path (this module never places orders itself).
-
-    Every candidate's outcome is recorded on its row (status + eval_note)
-    so the watchlist is fully auditable after the fact.
+    Sequential, NO-I/O pre-pass: expire candidates that are stale (created on a
+    prior day) or whose 30-min eval window has closed, and return the ones still
+    worth price-checking. Runs before the (parallel, I/O-bound) confirm phase so
+    we never spend a quote/credit on a candidate that's already expired.
     """
-    pending = get_pending_premarket_candidates()
-    if not pending:
-        return []
-
-    minutes_open = _minutes_since_open()
     today_london = datetime.now(_LONDON).date()
-    approved: list[tuple[dict, PriceConfirmation]] = []
-
+    live: list[dict] = []
     for cand in pending:
-        cand_id = cand["id"]
-        ticker = cand["ticker"]
-
-        # ── Expire stale candidates ──────────────────────────────────────────
-        # (a) created on a previous day — the catalyst is old news now;
-        # (b) evaluation window closed — gap-and-go is a first-30-min trade.
-        # created_at is stored as a London-offset ISO string; parse it back
-        # to a London date so midnight-straddling comparisons are correct.
+        # created_at is stored as a London-offset ISO string; parse it back to a
+        # London date so midnight-straddling comparisons are correct.
         try:
             created_ts = datetime.fromisoformat(str(cand.get("created_at", "")))
             if created_ts.tzinfo is None:
@@ -186,81 +186,165 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
         except (ValueError, TypeError):
             created_day = None
         if created_day != today_london:
-            update_premarket_candidate(cand_id, "expired", f"stale: created {created_day}")
+            update_premarket_candidate(cand["id"], "expired", f"stale: created {created_day}")
             continue
         if minutes_open > _EVAL_WINDOW_MINUTES:
             update_premarket_candidate(
-                cand_id, "expired",
+                cand["id"], "expired",
                 f"eval window closed ({minutes_open:.0f} min after open)",
             )
             continue
+        live.append(cand)
+    return live
 
-        # ── Price confirmation (also yields the gap via day_change_pct) ─────
-        try:
-            conf = confirm_price_signal(ticker)
-        except Exception as exc:
-            logger.error("Pre-market eval: confirm_price_signal raised for %s: %s", ticker, exc)
-            continue  # leave pending — retried next cycle inside the window
 
-        if conf is None:
-            # Data outage — leave pending and retry next cycle. The window
-            # expiry above bounds how long we keep trying.
-            logger.info("Pre-market eval [%s]: price data unavailable — retrying next cycle", ticker)
-            continue
+def _apply_confirmation(
+    cand: dict, conf: PriceConfirmation | None
+) -> tuple[dict, PriceConfirmation] | None:
+    """
+    Turn one candidate's PriceConfirmation into a verdict: write a terminal
+    status to its row and return (cand, conf) if APPROVED, else None. Pure given
+    `conf` (no network) — this is the gate logic, unchanged from the original
+    serial loop; only the quote fetch that produces `conf` has been parallelized.
 
-        # ── Gap gate: vs previous close, gap included ────────────────────────
-        gap_pct = conf.day_change_pct
-        if gap_pct is None:
-            # A missing previous close at the open is a TRANSIENT data condition,
-            # not a verdict on the candidate (Finnhub returns pc=0 in the first
-            # minutes; the Twelvedata daily bar can lag too). Treat it like
-            # opening_block / data-unavailable: stay pending and retry next cycle
-            # within the 30-min window. Before 2026-06-16 this was a terminal
-            # rejection that killed every real catalyst (OTLK +27%, SPCB +18%).
-            logger.info(
-                "Pre-market eval [%s]: prev close unavailable — retrying next cycle", ticker
-            )
-            continue
-        if gap_pct < cfg.min_gap_pct:
-            update_premarket_candidate(
-                cand_id, "rejected",
-                f"gap {gap_pct:+.2f}% < {cfg.min_gap_pct}% — market doesn't believe the catalyst",
-            )
-            continue
-        if gap_pct > cfg.max_gap_pct:
-            update_premarket_candidate(
-                cand_id, "rejected",
-                f"gap {gap_pct:+.2f}% > {cfg.max_gap_pct}% — move exhausted pre-open",
-            )
-            continue
+    Returning None with NO status write means "stay pending, retry next cycle"
+    (data outage, missing prev close, or opening block still active) — all
+    transient conditions bounded by the 30-min window expiry in _live_candidates.
+    """
+    cand_id = cand["id"]
+    ticker = cand["ticker"]
 
-        # ── Standard confirmation: post-open follow-through required ────────
-        if not conf.is_confirmed:
-            # The opening block is NOT a verdict on the candidate — it is a
-            # deterministic timing gate that lifts at open+5min. The news
-            # cycle runs every minute from 09:30, so without this exception
-            # every candidate would be permanently rejected on the 09:30/09:31
-            # cycles before it could ever be legitimately evaluated.
-            if conf.reason_code == "opening_block":
-                logger.debug(
-                    "Pre-market eval [%s]: opening block active — re-evaluating after it lifts",
-                    ticker,
-                )
-                continue  # stays pending
-            # All other rejections are final: re-evaluating every cycle for
-            # 30 min would cost up to ~60 Twelvedata credits per candidate
-            # (2 calls/eval), and a candidate that fails momentum/volume
-            # confirmation at its one post-block evaluation is gap-and-crap,
-            # not gap-and-go.
-            update_premarket_candidate(
-                cand_id, "rejected", f"{conf.reason_code}: {conf.reason}"
-            )
-            continue
+    if conf is None:
+        # Data outage — leave pending and retry next cycle.
+        logger.info("Pre-market eval [%s]: price data unavailable — retrying next cycle", ticker)
+        return None
 
+    # ── Gap gate: vs previous close, gap included ────────────────────────────
+    gap_pct = conf.day_change_pct
+    if gap_pct is None:
+        # A missing previous close at the open is a TRANSIENT data condition,
+        # not a verdict on the candidate (Finnhub returns pc=0 in the first
+        # minutes; the Twelvedata daily bar can lag too). Treat it like
+        # opening_block / data-unavailable: stay pending and retry next cycle
+        # within the 30-min window. Before 2026-06-16 this was a terminal
+        # rejection that killed every real catalyst (OTLK +27%, SPCB +18%).
         logger.info(
-            "Pre-market candidate APPROVED: [%s] gap=%+.2f%% %s — %s",
-            ticker, gap_pct, conf.reason, cand["headline"][:60],
+            "Pre-market eval [%s]: prev close unavailable — retrying next cycle", ticker
         )
-        approved.append((cand, conf))
+        return None
+    if gap_pct < cfg.min_gap_pct:
+        update_premarket_candidate(
+            cand_id, "rejected",
+            f"gap {gap_pct:+.2f}% < {cfg.min_gap_pct}% — market doesn't believe the catalyst",
+        )
+        return None
+    if gap_pct > cfg.max_gap_pct:
+        update_premarket_candidate(
+            cand_id, "rejected",
+            f"gap {gap_pct:+.2f}% > {cfg.max_gap_pct}% — move exhausted pre-open",
+        )
+        return None
+
+    # ── Standard confirmation: post-open follow-through required ──────────────
+    if not conf.is_confirmed:
+        # The opening block is NOT a verdict on the candidate — it is a
+        # deterministic timing gate that lifts at open+5min. The news cycle runs
+        # every minute from 09:30, so without this exception every candidate
+        # would be permanently rejected on the 09:30/09:31 cycles before it
+        # could ever be legitimately evaluated.
+        if conf.reason_code == "opening_block":
+            logger.debug(
+                "Pre-market eval [%s]: opening block active — re-evaluating after it lifts",
+                ticker,
+            )
+            return None  # stays pending
+        # All other rejections are final: re-evaluating every cycle for 30 min
+        # would cost up to ~60 Twelvedata credits per candidate, and a candidate
+        # that fails momentum/volume confirmation at its post-block evaluation is
+        # gap-and-crap, not gap-and-go.
+        update_premarket_candidate(cand_id, "rejected", f"{conf.reason_code}: {conf.reason}")
+        return None
+
+    logger.info(
+        "Pre-market candidate APPROVED: [%s] gap=%+.2f%% %s — %s",
+        ticker, gap_pct, conf.reason, cand["headline"][:60],
+    )
+    return (cand, conf)
+
+
+def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
+    """
+    At-open evaluation of the watchlist. Returns the candidates that passed
+    BOTH the gap gate and full price confirmation, paired with their
+    PriceConfirmation — main.py executes them through its standard risk
+    gates and buy path (this module never places orders itself).
+
+    Candidates are price-confirmed CONCURRENTLY (bounded thread pool + fast,
+    no-retry quote path) under a hard wall-clock budget, so one slow or
+    unpriceable ticker can never starve the window — the failure that produced
+    the 2026-06-18 zero-trades day. Anything not resolved within the budget
+    stays pending for the next cycle (~60s away, still inside the 30-min window).
+
+    Every candidate's outcome is recorded on its row (status + eval_note) so the
+    watchlist is fully auditable after the fact.
+    """
+    pending = get_pending_premarket_candidates()
+    if not pending:
+        return []
+
+    minutes_open = _minutes_since_open()
+    live = _live_candidates(pending, minutes_open)
+    if not live:
+        return []
+
+    # ── Parallel confirm phase ───────────────────────────────────────────────
+    # Each confirm_price_signal does its own fast (single-attempt, no-backoff)
+    # I/O — worst case ~one HTTP timeout (_TIMEOUT=8s), never the 18s retry storm
+    # that broke 2026-06-18. Running them across a small thread pool makes the
+    # cycle's wall time ≈ the slowest single candidate, not the sum. The budget
+    # is a secondary guard: when it fires we record verdicts for whatever
+    # finished and leave the rest pending (no status write) for next cycle.
+    #
+    # shutdown(wait=False, cancel_futures=True): cancel any not-yet-started
+    # futures and DON'T block the cycle on a straggler already mid-call — it
+    # finishes harmlessly in a daemon-ish background thread; we simply ignore its
+    # result. This keeps the news cycle returning promptly (well under its 60s
+    # interval) so the fast candidates' verdicts get acted on immediately.
+    confs: dict[int, PriceConfirmation | None] = {}
+    workers = min(_EVAL_MAX_WORKERS, len(live))
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pmc-eval")
+    future_to_cand = {
+        pool.submit(confirm_price_signal, cand["ticker"], fast=True): cand
+        for cand in live
+    }
+    try:
+        for future in as_completed(future_to_cand, timeout=_EVAL_CYCLE_BUDGET_SECONDS):
+            cand = future_to_cand[future]
+            try:
+                confs[cand["id"]] = future.result()
+            except Exception as exc:
+                logger.error(
+                    "Pre-market eval: confirm_price_signal raised for %s: %s",
+                    cand["ticker"], exc,
+                )
+    except TimeoutError:
+        unresolved = [c["ticker"] for c in live if c["id"] not in confs]
+        logger.warning(
+            "Pre-market eval: %d/%d candidates unresolved within %.0fs budget "
+            "(%s) — left pending for next cycle",
+            len(unresolved), len(live), _EVAL_CYCLE_BUDGET_SECONDS,
+            ",".join(unresolved),
+        )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    # ── Verdict phase (sequential DB writes; pure given each conf) ────────────
+    approved: list[tuple[dict, PriceConfirmation]] = []
+    for cand in live:
+        if cand["id"] not in confs:
+            continue  # unresolved within budget — stays pending
+        result = _apply_confirmation(cand, confs[cand["id"]])
+        if result is not None:
+            approved.append(result)
 
     return approved

@@ -162,11 +162,15 @@ def _to_yf_ticker(t212_ticker: str) -> str:
     return t212_ticker.split("_")[0]
 
 
-def get_quote_with_fallback(symbol: str) -> dict | None:
+def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
     """
     Real-time quote with a two-source fallback chain:
       1. Finnhub /quote  — primary (fastest, generous rate limit)
       2. Twelvedata /quote — fallback when Finnhub has no coverage
+
+    `fast` (default False) propagates to the Twelvedata fallback/backfill so
+    time-boxed callers (the pre-market eval window) never block on retry
+    backoff — see get_twelvedata_quote(). RTH callers keep full retries.
 
     Finnhub's free tier silently omits many small caps and recent IPOs
     (observed 2026-06-15: CUPR/ELAN/WBD/INBX/SAIL all returned no Finnhub
@@ -189,7 +193,7 @@ def get_quote_with_fallback(symbol: str) -> dict | None:
     quote = get_finnhub_quote(symbol)
     if quote is not None:
         if not (float(quote.get("pc") or 0) > 0):
-            td = get_twelvedata_quote(symbol)
+            td = get_twelvedata_quote(symbol, fast=fast)
             td_pc = float(td.get("pc") or 0) if td else 0
             if td_pc > 0:
                 logger.info(
@@ -199,7 +203,7 @@ def get_quote_with_fallback(symbol: str) -> dict | None:
                 quote["pc"] = td_pc
         return quote
     logger.info("Quote [%s]: no Finnhub coverage — trying Twelvedata fallback", symbol)
-    return get_twelvedata_quote(symbol)
+    return get_twelvedata_quote(symbol, fast=fast)
 
 
 def minutes_until_close() -> float | None:
@@ -328,7 +332,7 @@ def _reject(base: dict, code: str, reason: str) -> "PriceConfirmation":
     return PriceConfirmation(**base, is_confirmed=False, reason=reason, reason_code=code)
 
 
-def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
+def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmation | None:
     """
     Check whether a ticker is experiencing active, tradeable upward momentum
     that corroborates a bullish news signal.
@@ -336,12 +340,20 @@ def confirm_price_signal(t212_ticker: str) -> PriceConfirmation | None:
     Returns None only when a hard data failure makes it impossible to evaluate
     the signal (Finnhub down, Twelvedata down). Confirmed/rejected signals
     are returned as PriceConfirmation with is_confirmed set accordingly.
+
+    `fast` (default False) is for the time-boxed pre-market eval window: it
+    makes the Twelvedata quote fallback/backfill non-blocking (no retry
+    backoff — see get_quote_with_fallback). The momentum/volume/VWAP calls
+    further down keep their retries because they only run AFTER the 5-min
+    opening block, by which point the open-auction data storm (Finnhub pc=0,
+    Twelvedata 429/404 on small-caps) has cleared; during the storm this
+    function returns at the opening_block gate before reaching them.
     """
     symbol = _to_yf_ticker(t212_ticker)
 
     try:
         # ── Current price + previous close (Finnhub → Twelvedata fallback) ──
-        quote = get_quote_with_fallback(symbol)
+        quote = get_quote_with_fallback(symbol, fast=fast)
         if quote is None:
             logger.warning(
                 "Price check [%s]: no quote from Finnhub or Twelvedata — cannot evaluate signal",

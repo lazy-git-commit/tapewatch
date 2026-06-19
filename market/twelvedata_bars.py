@@ -219,7 +219,7 @@ def _parse_bar_time(bar: dict) -> datetime | None:
         return None
 
 
-def get_twelvedata_quote(symbol: str) -> dict | None:
+def get_twelvedata_quote(symbol: str, fast: bool = False) -> dict | None:
     """
     Fetch a real-time quote from Twelvedata /quote — the FALLBACK for when
     Finnhub has no coverage of a symbol (small caps, recent IPOs, many names
@@ -234,16 +234,42 @@ def get_twelvedata_quote(symbol: str) -> dict | None:
     Plus a passthrough "av" (average_volume) when present.
 
     Costs 1 Twelvedata credit. Returns None on any error or missing price.
-    Retries are handled the same way as the time-series calls (429/5xx aware).
+
+    `fast` (default False) is for time-boxed callers — chiefly the pre-market
+    eval window, where every second of retry backoff is a second the gap-and-go
+    edge decays, and candidates are evaluated concurrently so blocking one
+    thread for 18s on a 429 starves nothing but does waste the window. In fast
+    mode there are NO retries and NO sleeps: a 429/5xx/timeout returns None
+    immediately (skip this candidate this cycle, re-try on the NEXT cycle, which
+    is the retry), and a 404 is treated as terminal either way (the symbol does
+    not exist on Twelvedata — see below). Normal (RTH) callers keep the
+    full 429/5xx-aware retry behaviour.
+
+    A 404 is ALWAYS terminal, even in non-fast mode: it means Twelvedata has no
+    such symbol, so re-requesting it 3× with backoff (the old behaviour: 404 →
+    raise_for_status → RequestException → sleep → repeat, ~4.5s of pure dead
+    time per call) can never succeed. Returning None on the first 404 is both
+    correct and ~3× faster for the no-coverage small-caps this fallback targets.
     """
     url = f"{_BASE_URL}/quote"
     params = {"symbol": symbol, "apikey": cfg.twelvedata_api_key}
     _record_credit_use()
     last_exc: Exception | None = None
-    for attempt in range(1, 4):
+    attempts = 1 if fast else 3
+    for attempt in range(1, attempts + 1):
         try:
             resp = requests.get(url, params=params, timeout=_TIMEOUT)
+            # 404 = symbol genuinely not on Twelvedata — retrying cannot help.
+            if resp.status_code == 404:
+                logger.debug("Twelvedata /quote: %s not found (404) — terminal", symbol)
+                return None
             if resp.status_code == 429:
+                if fast:
+                    logger.info(
+                        "Twelvedata /quote rate limit for %s — fast mode, skipping "
+                        "(retry next cycle)", symbol,
+                    )
+                    return None
                 wait = 1.5 * attempt * 2
                 logger.warning(
                     "Twelvedata /quote rate limit for %s (attempt %d/3) — waiting %.1fs",
@@ -252,6 +278,8 @@ def get_twelvedata_quote(symbol: str) -> dict | None:
                 time.sleep(wait)
                 continue
             if resp.status_code >= 500:
+                if fast:
+                    return None
                 time.sleep(1.5 * attempt)
                 continue
             resp.raise_for_status()
@@ -278,6 +306,8 @@ def get_twelvedata_quote(symbol: str) -> dict | None:
             return quote
         except requests.exceptions.RequestException as exc:
             last_exc = exc
+            if fast:
+                return None
             time.sleep(1.5 * attempt)
         except (KeyError, ValueError, TypeError) as exc:
             logger.warning("Twelvedata /quote malformed data for %s: %s", symbol, exc)

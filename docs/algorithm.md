@@ -339,6 +339,22 @@ the entire gap with zero confirmation ("gap-and-crap"). Instead:
    signals. Candidates expire at open+30min or end of day, every outcome
    recorded on the row (`status`, `eval_note`).
 
+**Known failure mode — data-storm starvation of the eval window (2026-06-18).**
+Single-candidate handling is correct: a missing `pc` or `opening_block` leaves a
+candidate *pending* to retry next cycle (above). But with **many** candidates,
+that per-candidate retry is run **serially** every cycle and each retry re-fetches
+quotes. On 2026-06-18, 18 candidates + Finnhub `pc=0` through the whole 5-min
+block + Twelvedata 404/rate-limit backoff (3+6+9s per no-coverage small-cap)
+produced 205 "prev close unavailable" and 174 Twelvedata-failure lines in one
+30-min window. A single eval cycle exceeded 60s (the scanner skipped whole
+minutes), the first *real* evaluations landed only at open+6min, and **9
+candidates expired with `eval window closed` having never been price-checked
+once**. The ones that *were* evaluated were correctly rejected (gap-and-crap /
+RVOL<1.5) — so the defect is starvation, not a wrong verdict. Mitigations to
+consider: backfill `pc` from the Twelvedata daily bar up front; bound per-cycle
+eval cost / parallelize quote fetches; suppress or shorten Twelvedata retry
+backoff inside the time-boxed pre-market window.
+
 ---
 
 ## 8. Reliability and failure policy

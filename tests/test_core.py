@@ -847,3 +847,209 @@ class TestBacktestCosts:
         # Net = gross − FX RT − 2× slippage; always strictly below gross
         assert net < gross
         assert net == pytest.approx(gross - FX_COST_RT_PCT - 2 * 0.05)
+
+
+# ── Pre-market eval hardening (2026-06-18 zero-trades incident) ────────────────
+
+def _mk_conf(reason_code="approved", day_change_pct=5.0, is_confirmed=True):
+    """Build a minimal PriceConfirmation for verdict-logic tests."""
+    from market.price_check import PriceConfirmation
+    return PriceConfirmation(
+        ticker="X_US_EQ", symbol="X", current_price=10.0, open_price=9.5,
+        prev_close=9.5, day_move_pct=5.0, day_change_pct=day_change_pct,
+        recent_move_pct=1.0, current_volume=1000, avg_volume=500, rvol=2.0,
+        avg_dollar_volume=1e7, spread_proxy_pct=0.5,
+        is_confirmed=is_confirmed, reason="test", reason_code=reason_code,
+    )
+
+
+def _resp(status_code, json_body=None):
+    """Mock a requests.Response with a given status code / JSON body."""
+    import requests as _rq
+    m = MagicMock()
+    m.status_code = status_code
+    m.json.return_value = json_body or {}
+    if status_code >= 400:
+        m.raise_for_status.side_effect = _rq.exceptions.HTTPError(
+            f"{status_code} Client Error"
+        )
+    else:
+        m.raise_for_status.return_value = None
+    return m
+
+
+class TestTwelvedataFastQuote:
+    """
+    get_twelvedata_quote(fast=True) must NOT block on retry backoff — the
+    pre-market window is time-boxed and every retry second decays the edge.
+    A 404 must be terminal even in normal mode (the symbol doesn't exist).
+    """
+
+    @patch("market.twelvedata_bars.time.sleep")
+    @patch("market.twelvedata_bars.requests.get")
+    def test_fast_429_no_retry_no_sleep(self, mock_get, mock_sleep):
+        from market.twelvedata_bars import get_twelvedata_quote
+        mock_get.return_value = _resp(429)
+        assert get_twelvedata_quote("SLOW", fast=True) is None
+        assert mock_get.call_count == 1          # no retry
+        mock_sleep.assert_not_called()           # no backoff burned
+
+    @patch("market.twelvedata_bars.time.sleep")
+    @patch("market.twelvedata_bars.requests.get")
+    def test_fast_timeout_no_retry_no_sleep(self, mock_get, mock_sleep):
+        import requests
+        from market.twelvedata_bars import get_twelvedata_quote
+        mock_get.side_effect = requests.exceptions.Timeout("boom")
+        assert get_twelvedata_quote("SLOW", fast=True) is None
+        assert mock_get.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("market.twelvedata_bars.time.sleep")
+    @patch("market.twelvedata_bars.requests.get")
+    def test_404_terminal_even_in_normal_mode(self, mock_get, mock_sleep):
+        from market.twelvedata_bars import get_twelvedata_quote
+        mock_get.return_value = _resp(404)
+        assert get_twelvedata_quote("NOPE", fast=False) is None
+        assert mock_get.call_count == 1          # 404 not retried 3×
+        mock_sleep.assert_not_called()
+
+    @patch("market.twelvedata_bars.time.sleep")
+    @patch("market.twelvedata_bars.requests.get")
+    def test_normal_429_does_retry(self, mock_get, mock_sleep):
+        """Non-fast callers keep the full retry behaviour (regression guard)."""
+        from market.twelvedata_bars import get_twelvedata_quote
+        mock_get.return_value = _resp(429)
+        assert get_twelvedata_quote("BUSY", fast=False) is None
+        assert mock_get.call_count == 3          # 3 attempts
+        assert mock_sleep.call_count == 3        # backoff between each
+
+    @patch("market.twelvedata_bars.requests.get")
+    def test_fast_success_returns_quote(self, mock_get):
+        from market.twelvedata_bars import get_twelvedata_quote
+        mock_get.return_value = _resp(200, {
+            "close": "12.5", "open": "12.0", "previous_close": "11.0",
+        })
+        q = get_twelvedata_quote("OK", fast=True)
+        assert q is not None and q["c"] == 12.5 and q["pc"] == 11.0
+
+
+class TestPremarketEvalConcurrency:
+    """
+    evaluate_premarket_candidates must price-confirm candidates concurrently
+    and never let one slow/dead ticker starve the rest — the root cause of the
+    2026-06-18 zero-trades day (serial eval + retry backoff blew the cycle).
+    """
+
+    def _candidates(self, n):
+        from datetime import datetime as _dt
+        import pytz
+        now = _dt.now(pytz.timezone("Europe/London")).isoformat()
+        return [
+            {"id": i, "ticker": f"T{i}_US_EQ", "headline": f"news {i}",
+             "created_at": now}
+            for i in range(n)
+        ]
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    @patch("premarket.scanner.get_pending_premarket_candidates")
+    @patch("premarket.scanner._minutes_since_open", return_value=6.0)
+    @patch("premarket.scanner.confirm_price_signal")
+    def test_one_slow_ticker_does_not_block_others(
+        self, mock_confirm, _mo, mock_pending, _upd
+    ):
+        import time as _t
+        from premarket.scanner import evaluate_premarket_candidates
+        mock_pending.return_value = self._candidates(6)
+
+        def side_effect(ticker, fast=False):
+            assert fast is True  # window must use the fast path
+            _t.sleep(0.3)        # every confirm has the SAME latency
+            return _mk_conf(reason_code="approved", day_change_pct=5.0)
+
+        mock_confirm.side_effect = side_effect
+        t0 = _t.monotonic()
+        approved = evaluate_premarket_candidates()
+        elapsed = _t.monotonic() - t0
+
+        # 6 confirms at 0.3s each = 1.8s serial; in parallel (pool of 8) the wall
+        # time is ~one call. <1.0s proves they ran concurrently, not summed.
+        assert elapsed < 1.0
+        assert len(approved) == 6  # all confirmed
+
+    @patch("premarket.scanner._EVAL_CYCLE_BUDGET_SECONDS", 0.2)
+    @patch("premarket.scanner.update_premarket_candidate")
+    @patch("premarket.scanner.get_pending_premarket_candidates")
+    @patch("premarket.scanner._minutes_since_open", return_value=6.0)
+    @patch("premarket.scanner.confirm_price_signal")
+    def test_budget_exceeded_leaves_candidate_pending(
+        self, mock_confirm, _mo, mock_pending, mock_upd
+    ):
+        import time as _t
+        from premarket.scanner import evaluate_premarket_candidates
+        mock_pending.return_value = self._candidates(2)
+
+        def side_effect(ticker, fast=False):
+            if ticker == "T1_US_EQ":
+                _t.sleep(0.6)    # exceeds the 0.2s budget
+            return _mk_conf(reason_code="approved", day_change_pct=5.0)
+
+        mock_confirm.side_effect = side_effect
+        approved = evaluate_premarket_candidates()
+        # T0 resolves and is approved; T1 blows the budget → NOT given a verdict
+        # (no status write) so it stays pending for the next cycle.
+        approved_ids = {c["id"] for c, _ in approved}
+        assert 0 in approved_ids
+        assert 1 not in approved_ids
+        # T1 must NOT have been written to any terminal status this cycle.
+        written_ids = {call.args[0] for call in mock_upd.call_args_list}
+        assert 1 not in written_ids
+
+
+class TestApplyConfirmation:
+    """_apply_confirmation preserves the exact gate verdicts of the old loop."""
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_none_conf_stays_pending(self, mock_upd):
+        from premarket.scanner import _apply_confirmation
+        assert _apply_confirmation({"id": 1, "ticker": "A"}, None) is None
+        mock_upd.assert_not_called()  # no status write → pending
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_missing_prev_close_stays_pending(self, mock_upd):
+        from premarket.scanner import _apply_confirmation
+        conf = _mk_conf(day_change_pct=None, is_confirmed=False,
+                        reason_code="opening_block")
+        assert _apply_confirmation({"id": 1, "ticker": "A"}, conf) is None
+        mock_upd.assert_not_called()
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_opening_block_stays_pending(self, mock_upd):
+        from premarket.scanner import _apply_confirmation
+        conf = _mk_conf(day_change_pct=5.0, is_confirmed=False,
+                        reason_code="opening_block")
+        assert _apply_confirmation({"id": 1, "ticker": "A"}, conf) is None
+        mock_upd.assert_not_called()
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_gap_too_small_rejected(self, mock_upd):
+        from premarket.scanner import _apply_confirmation
+        conf = _mk_conf(day_change_pct=0.2)  # below MIN_GAP_PCT (1.0)
+        assert _apply_confirmation({"id": 1, "ticker": "A"}, conf) is None
+        assert mock_upd.call_args.args[1] == "rejected"
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_low_momentum_rejected_terminally(self, mock_upd):
+        from premarket.scanner import _apply_confirmation
+        conf = _mk_conf(day_change_pct=5.0, is_confirmed=False,
+                        reason_code="low_momentum")
+        assert _apply_confirmation({"id": 1, "ticker": "A"}, conf) is None
+        assert mock_upd.call_args.args[1] == "rejected"
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_confirmed_in_band_approved(self, mock_upd):
+        from premarket.scanner import _apply_confirmation
+        conf = _mk_conf(day_change_pct=5.0, is_confirmed=True)
+        cand = {"id": 1, "ticker": "A", "headline": "h"}
+        result = _apply_confirmation(cand, conf)
+        assert result is not None and result[0] is cand
+        mock_upd.assert_not_called()  # approval status is written by caller
