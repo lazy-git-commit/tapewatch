@@ -244,8 +244,13 @@ class Settings:
         default_factory=lambda: os.getenv("PREMARKET_ENABLED", "true").lower() in ("1", "true", "yes")
     )
     # When the pre-market scanner starts collecting news (ET, HH:MM).
+    # 07:00 captures the early catalyst block (earnings/FDA/M&A print from
+    # ~07:00 ET — see scanner.py docstring). Scanning earlier only runs the
+    # Benzinga+Claude watchlist build; it makes NO price-API calls, so it adds
+    # no pre-open Twelvedata/Finnhub load — the concurrent price-confirm fan-out
+    # happens only at the open via evaluate_premarket_candidates().
     premarket_scan_start_et: str = field(
-        default_factory=lambda: os.getenv("PREMARKET_SCAN_START_ET", "08:00")
+        default_factory=lambda: os.getenv("PREMARKET_SCAN_START_ET", "07:00")
     )
     # Gap band for at-open evaluation of pre-market candidates:
     #   gap < min  → the market doesn't believe the catalyst; skip.
