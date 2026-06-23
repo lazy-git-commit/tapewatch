@@ -33,6 +33,7 @@ API call optimisations:
 
 import html
 import logging
+import time
 import requests
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -50,6 +51,93 @@ logger = logging.getLogger(__name__)
 _BASE_URL = "https://api.massive.com/benzinga/v2/news"
 _TIMEOUT = 10
 _claude = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
+
+# ── Claude availability guard ───────────────────────────────────────────────────
+# The classifier is the one external dependency with NO fallback: if Claude can't
+# score articles, there are no signals at all (positive/neutral/negative are all
+# Claude's call). Two failure modes have to be handled distinctly, because they
+# need opposite responses, and 2026-06-23 saw a real Claude outage mid-session:
+#
+#   • OUTAGE / OVERLOAD (HTTP 529 overloaded_error, 500 api_error, or a network
+#     error) — transient. Self-heals in minutes. We back off briefly so we don't
+#     hammer a struggling API every 60s, then resume automatically.
+#   • OUT-OF-CREDITS / BILLING (HTTP 403 with error type "billing_error", or the
+#     401 auth case) — does NOT self-heal until the human tops up / fixes the key.
+#     A 60s retry loop here just burns log noise and (for some error classes) can
+#     accrue charges. We back off much longer and log it as a distinct CRITICAL
+#     so it's obvious in the journal what actually broke.
+#
+# In BOTH cases _batch_score_sentiment returns {} (fail-closed: unscored articles
+# are never traded), and the cooldown simply suppresses the *call* until it's
+# worth trying again. While Claude is down the system makes no trades — correctly,
+# since it can't assess the news — but the rest of the pipeline stays alive.
+_CLAUDE_OUTAGE_COOLDOWN_SECONDS = 120        # transient outage / overload / 529
+_CLAUDE_BILLING_COOLDOWN_SECONDS = 1800      # out-of-credits / auth — needs a human
+# {"until": monotonic deadline, "reason": str} — None means Claude is believed up.
+_claude_cooldown: dict | None = None
+
+
+def _claude_available() -> bool:
+    """
+    False while a cooldown from a prior Claude failure is still active.
+
+    Skips the Claude call entirely during the cooldown window so an outage or a
+    spent credit balance doesn't trigger a fresh API attempt (and a fresh stack
+    trace) on every 60s cycle. Logs once when the cooldown lifts.
+    """
+    global _claude_cooldown
+    if _claude_cooldown is None:
+        return True
+    if time.monotonic() >= _claude_cooldown["until"]:
+        logger.info(
+            "Claude cooldown elapsed (was: %s) — resuming sentiment scoring",
+            _claude_cooldown["reason"],
+        )
+        _claude_cooldown = None
+        return True
+    return False
+
+
+def _enter_claude_cooldown(seconds: float, reason: str) -> None:
+    """Suppress Claude calls for `seconds`; record the reason for logging."""
+    global _claude_cooldown
+    _claude_cooldown = {"until": time.monotonic() + seconds, "reason": reason}
+
+
+def _record_claude_event(event_type: str, detail: str) -> None:
+    """Best-effort system_event for a Claude failure (alerting/observability).
+
+    Import-local and swallowing — an event-log failure must never affect the
+    news path. See storage.database.record_system_event.
+    """
+    try:
+        from storage.database import record_system_event
+        record_system_event(event_type, detail)
+    except Exception as exc:
+        logger.debug("Could not record Claude system_event: %s", exc)
+
+
+def _api_error_type(exc: Exception) -> str | None:
+    """
+    Extract the Anthropic API error type (e.g. "billing_error") from an SDK error.
+
+    The SDK exception's `.type` attribute is populated from the TOP level of the
+    response body, which for a real API error is the literal wrapper string
+    "error" — NOT the specific type. The actual error type lives nested at
+    `body["error"]["type"]` (verified against anthropic 0.103.1: a 403 with
+    `{"type":"error","error":{"type":"billing_error",...}}` has `exc.type ==
+    "error"`). So read the nested field, defensively, and fall back to `.type`.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        inner = body.get("error")
+        if isinstance(inner, dict) and inner.get("type"):
+            return str(inner["type"])
+        # Some shapes put the type at the top level of body directly.
+        if body.get("type") and body.get("type") != "error":
+            return str(body["type"])
+    t = getattr(exc, "type", None)
+    return str(t) if t and t != "error" else None
 
 # Catalyst taxonomy. The model must pick exactly one per article. Which of
 # these actually trade is a CODE decision (cfg.tradeable_catalysts) — see
@@ -277,6 +365,12 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
     if not articles:
         return {}
 
+    # Skip the call while a prior outage/billing failure cooldown is active —
+    # returning {} fails closed (no scores → no trades) without re-hitting a
+    # known-down API every cycle.
+    if not _claude_available():
+        return {}
+
     # Per-cycle content goes in the user message; the static rubric stays in
     # the cached system block.
     lines = [
@@ -332,7 +426,72 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
                 len(results), len(articles),
             )
         return results
+
+    # ── Billing / auth: NOT self-healing — needs a human ─────────────────────
+    # 403 covers both permission_error and billing_error; the nested API error
+    # type disambiguates (see _api_error_type — the SDK's .type is the useless
+    # "error" wrapper). Out of Anthropic credits or an over-quota workspace lands
+    # here. 401 is a bad/expired key. Either way, retrying every 60s is pointless
+    # and noisy, so back off long and shout once.
+    except anthropic.PermissionDeniedError as exc:
+        err_type = _api_error_type(exc) or "permission_error"
+        if err_type == "billing_error":
+            logger.critical(
+                "Claude OUT OF CREDITS / billing error (403 %s): %s — sentiment "
+                "scoring suspended for %d min; NO TRADES until Anthropic billing is "
+                "resolved. The pipeline keeps running but cannot assess news.",
+                err_type, exc, _CLAUDE_BILLING_COOLDOWN_SECONDS // 60,
+            )
+        else:
+            logger.critical(
+                "Claude permission denied (403 %s): %s — sentiment scoring "
+                "suspended for %d min; check the API key's workspace/permissions.",
+                err_type, exc, _CLAUDE_BILLING_COOLDOWN_SECONDS // 60,
+            )
+        _enter_claude_cooldown(_CLAUDE_BILLING_COOLDOWN_SECONDS, f"403 {err_type}")
+        _record_claude_event("claude_billing_error", f"403 {err_type}: {exc}")
+        return {}
+    except anthropic.AuthenticationError as exc:
+        logger.critical(
+            "Claude authentication failed (401): %s — sentiment scoring suspended "
+            "for %d min; the ANTHROPIC_API_KEY is invalid or revoked.",
+            exc, _CLAUDE_BILLING_COOLDOWN_SECONDS // 60,
+        )
+        _enter_claude_cooldown(_CLAUDE_BILLING_COOLDOWN_SECONDS, "401 auth")
+        _record_claude_event("claude_auth_error", f"401: {exc}")
+        return {}
+
+    # ── Outage / overload / network: transient — short back-off, auto-resume ──
+    # 529 overloaded_error (today's outage), 500 api_error, rate limit, or a
+    # connection failure. These self-heal in minutes; cool down briefly so we
+    # don't pile onto a struggling API, then retry on the next cycle.
+    except anthropic.RateLimitError as exc:
+        logger.warning(
+            "Claude rate limited (429): %s — sentiment scoring paused %ds",
+            exc, _CLAUDE_OUTAGE_COOLDOWN_SECONDS,
+        )
+        _enter_claude_cooldown(_CLAUDE_OUTAGE_COOLDOWN_SECONDS, "429 rate limit")
+        # Record it too: a SUSTAINED 429 stops all scoring (→ zero trades) and
+        # must be visible to the degradation alert, not just the zero-trade
+        # tripwire 3 sessions later.
+        _record_claude_event("claude_outage", f"429 rate limit: {exc}")
+        return {}
+    except (anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
+        status = getattr(exc, "status_code", None)
+        logger.error(
+            "Claude API unavailable (status=%s): %s — sentiment scoring paused %ds "
+            "(transient outage/overload; will auto-resume)",
+            status, exc, _CLAUDE_OUTAGE_COOLDOWN_SECONDS,
+        )
+        _enter_claude_cooldown(
+            _CLAUDE_OUTAGE_COOLDOWN_SECONDS, f"API status {status}"
+        )
+        _record_claude_event("claude_outage", f"status {status}: {exc}")
+        return {}
     except Exception as exc:
+        # Unknown failure (malformed response, schema parse, etc.) — fail closed,
+        # but DON'T enter a cooldown: this may be a one-off bad batch, and we
+        # don't want a single odd article to silence scoring for minutes.
         logger.error("Batch sentiment classification failed: %s", exc, exc_info=True)
         return {}
 

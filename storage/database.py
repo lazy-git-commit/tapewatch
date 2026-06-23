@@ -18,7 +18,7 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.errors
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 import pytz
 from config.settings import cfg
@@ -205,6 +205,32 @@ def init_db() -> None:
                     job          TEXT PRIMARY KEY,
                     last_beat_at TEXT NOT NULL
                 )
+            """)
+            # System events: degradation/outage markers the system would
+            # otherwise fail SILENTLY on (the 2026-06-23 root cause — 9 sessions
+            # of zero trades with green heartbeats). One row per occurrence:
+            #   twelvedata_credits_exhausted | claude_outage |
+            #   claude_billing_error | claude_auth_error | zero_trade_session
+            # Grafana/alerting reads this so a data-pipeline collapse is visible
+            # instead of looking like a quiet, healthy market day. Severity is
+            # 'warning' | 'critical' so an alert rule can filter.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS system_events (
+                    id          SERIAL PRIMARY KEY,
+                    event_type  TEXT NOT NULL,
+                    severity    TEXT NOT NULL DEFAULT 'warning',
+                    detail      TEXT,
+                    created_at  TEXT NOT NULL,
+                    event_day   TEXT NOT NULL
+                )
+            """)
+            # Atomic one-row-per-(type, day) dedup: a UNIQUE index + ON CONFLICT
+            # in record_system_event closes the SELECT-then-INSERT race where two
+            # threads (8-worker premarket pool, or startup racing the cron) both
+            # see no row and both insert. event_day is the London calendar date.
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_system_events_type_day
+                ON system_events (event_type, event_day)
             """)
     logger.info("Database initialised at %s", cfg.db_url.split("@")[-1])
 
@@ -427,6 +453,69 @@ def count_trades_today() -> int:
             return int(cur.fetchone()["n"])
 
 
+_NYSE_CALENDAR = None  # lazily built once; mcal.get_calendar loads the full holiday set
+
+
+def _nyse_calendar():
+    """Module-cached NYSE calendar (mcal.get_calendar is expensive; build once)."""
+    global _NYSE_CALENDAR
+    if _NYSE_CALENDAR is None:
+        import pandas_market_calendars as mcal
+        _NYSE_CALENDAR = mcal.get_calendar("NYSE")
+    return _NYSE_CALENDAR
+
+
+def trading_days_since_last_trade() -> int | None:
+    """
+    Count COMPLETED NYSE sessions strictly after the most recent trade's entry.
+
+    Backs the zero-trade-drought alert: a long stretch with signals flowing but
+    no NEW entries is the silent-failure signature (2026-06-23: 9 sessions, last
+    trade 2026-06-10). Returns 0 when the last entry was today or no session has
+    closed since it, a positive count for an idle streak, and None when there are
+    no trades at all (fresh DB — nothing to compare against).
+
+    NOTE: this counts from the last ENTRY (buy_time), so a position bought N
+    sessions ago and still held open is reported as an N-session entry-drought —
+    that is intentional (the alert is about entries drying up, not about whether
+    any position is held).
+
+    Off-by-one safety (the reason this counts CLOSED sessions, not calendar
+    days): the startup call can run at any hour, including between London midnight
+    and the NYSE close, when the London calendar date is already "tomorrow" while
+    today's US session has not finished. Bounding by sessions whose market_close
+    is in the past avoids counting a not-yet-finished session as elapsed.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT MAX((buy_time::timestamptz AT TIME ZONE 'Europe/London')::date) AS d
+                   FROM trades WHERE mode = %s AND buy_time IS NOT NULL""",
+                (cfg.trading_mode,),
+            )
+            row = cur.fetchone()
+    last = row["d"] if row else None
+    if last is None:
+        return None
+    try:
+        import pandas as pd
+        now_utc = pd.Timestamp.now(tz="UTC")
+        # Look from the day after the last entry through ~2 weeks ahead (covers any
+        # realistic drought + holidays); end-bound generously, then filter by close.
+        start = (last + timedelta(days=1)).isoformat()
+        end = (now_utc.date() + timedelta(days=1)).isoformat()
+        sched = _nyse_calendar().schedule(start_date=start, end_date=end)
+        if sched.empty:
+            return 0
+        # Count only sessions whose close has already passed — a session still in
+        # progress (or yet to open) is not an "elapsed" idle session.
+        closed = sched[sched["market_close"] <= now_utc]
+        return int(len(closed))
+    except Exception as exc:
+        logger.debug("trading_days_since_last_trade: calendar calc failed: %s", exc)
+        return None
+
+
 def get_today_realized_pnl() -> float:
     """
     Sum of realized P&L (GBP) for trades CLOSED today. Backs the daily kill
@@ -580,6 +669,51 @@ def touch_heartbeat(job: str) -> None:
                    ON CONFLICT (job) DO UPDATE SET last_beat_at = EXCLUDED.last_beat_at""",
                 (job, _now_london()),
             )
+
+
+# ── System events (v17: outage/degradation observability) ──────────────────────
+
+# Event types that mean the system CANNOT trade even though it's "up". These are
+# the silent-failure class — recording them is what turns a 9-session zero-trade
+# drought into something an alert fires on. Kept here so callers use stable names.
+_CRITICAL_EVENT_TYPES = {
+    "twelvedata_credits_exhausted",
+    "claude_billing_error",
+    "claude_auth_error",
+    "zero_trade_session",
+}
+
+
+def record_system_event(event_type: str, detail: str = "") -> None:
+    """
+    Append a system event (outage / degradation marker). Best-effort: any failure
+    is swallowed so observability can never break the trading/news path.
+
+    Severity is derived from the event type — billing/auth/credit-exhaustion are
+    'critical' (no self-heal, needs a human), everything else 'warning'.
+    De-dupes within the same London day: at most one row per (event_type, day),
+    enforced ATOMICALLY by a UNIQUE(event_type, event_day) index + ON CONFLICT
+    DO NOTHING, so concurrent callers (8-worker premarket pool, or startup racing
+    the cron) can't both insert.
+    """
+    severity = "critical" if event_type in _CRITICAL_EVENT_TYPES else "warning"
+    try:
+        now = _now_london()
+        event_day = now[:10]  # 'YYYY-MM-DD' prefix of the London ISO ts
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO system_events
+                           (event_type, severity, detail, created_at, event_day)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (event_type, event_day) DO NOTHING""",
+                    (event_type, severity, detail[:500], now, event_day),
+                )
+                inserted = cur.rowcount > 0
+        if inserted:
+            logger.info("system_event recorded: [%s/%s] %s", severity, event_type, detail[:120])
+    except Exception as exc:
+        logger.debug("record_system_event(%s) failed: %s", event_type, exc)
 
 
 # ── Portfolio snapshots ───────────────────────────────────────────────────────

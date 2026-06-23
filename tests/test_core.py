@@ -13,6 +13,7 @@ Run with: pytest tests/
 """
 
 import pytest
+import time
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
@@ -1053,3 +1054,180 @@ class TestApplyConfirmation:
         result = _apply_confirmation(cand, conf)
         assert result is not None and result[0] is cand
         mock_upd.assert_not_called()  # approval status is written by caller
+
+
+# ── Claude resilience tests (v17: outage / out-of-credits handling) ────────────
+
+def _httpx_response(status: int):
+    """Minimal httpx.Response for constructing typed anthropic errors in tests."""
+    import httpx
+    return httpx.Response(status_code=status, request=httpx.Request("POST", "https://x"))
+
+
+class TestClaudeResilience:
+    """news/fetcher.py: typed Claude failures → fail-closed + correct cooldown."""
+
+    def setup_method(self):
+        # Clear any cooldown left by a prior test so each starts with Claude "up".
+        import news.fetcher as f
+        f._claude_cooldown = None
+
+    def teardown_method(self):
+        # Don't leak a cooldown into later test classes (would silently no-op any
+        # later _batch_score_sentiment call).
+        import news.fetcher as f
+        f._claude_cooldown = None
+
+    def _article(self):
+        return {"id": "1", "headline": "Earnings beat", "teaser": "Revenue up"}
+
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_overload_529_enters_short_cooldown(self, mock_claude, _ev):
+        import anthropic, news.fetcher as f
+        mock_claude.messages.create.side_effect = anthropic.APIStatusError(
+            "overloaded", response=_httpx_response(529), body=None
+        )
+        assert f._batch_score_sentiment([self._article()]) == {}      # fail closed
+        assert f._claude_cooldown is not None
+        # Short (transient) cooldown, not the long billing one.
+        assert f._claude_cooldown["until"] - time.monotonic() <= f._CLAUDE_OUTAGE_COOLDOWN_SECONDS + 1
+
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_billing_403_enters_long_cooldown(self, mock_claude, record_ev):
+        import anthropic, news.fetcher as f
+        # Build the error EXACTLY as the SDK does for a real out-of-credits 403:
+        # the type lives at body["error"]["type"], NOT exc.type (which is the
+        # outer "error" wrapper). This is the prod shape the unit test must mirror
+        # so we don't re-introduce the dead-branch bug.
+        body = {"type": "error", "error": {"type": "billing_error", "message": "credit balance too low"}}
+        err = anthropic.PermissionDeniedError(
+            "credit balance too low", response=_httpx_response(403), body=body["error"]
+        )
+        mock_claude.messages.create.side_effect = err
+        assert f._batch_score_sentiment([self._article()]) == {}
+        # Billing cooldown is much longer than the transient-outage one.
+        remaining = f._claude_cooldown["until"] - time.monotonic()
+        assert remaining > f._CLAUDE_OUTAGE_COOLDOWN_SECONDS + 1
+        # The billing_error must have been correctly disambiguated (not the
+        # generic permission fallback) and recorded as such.
+        recorded_types = [c.args[0] for c in record_ev.call_args_list]
+        assert "claude_billing_error" in recorded_types
+        detail = next(c.args[1] for c in record_ev.call_args_list if c.args[0] == "claude_billing_error")
+        assert "billing_error" in detail  # proves _api_error_type read the body
+
+    def test_api_error_type_reads_nested_body(self):
+        # Direct unit test of the extraction: SDK .type is the "error" wrapper;
+        # the real type is at body["error"]["type"].
+        import anthropic, news.fetcher as f
+        body = {"type": "error", "error": {"type": "billing_error", "message": "x"}}
+        err = anthropic.PermissionDeniedError(
+            "x", response=_httpx_response(403), body=body["error"]
+        )
+        assert f._api_error_type(err) == "billing_error"
+        # A plain permission error (no billing type) → None → caller defaults.
+        err2 = anthropic.PermissionDeniedError(
+            "x", response=_httpx_response(403), body={"type": "permission_error", "message": "x"}
+        )
+        assert f._api_error_type(err2) == "permission_error"
+
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_cooldown_suppresses_subsequent_calls(self, mock_claude, _ev):
+        import anthropic, news.fetcher as f
+        mock_claude.messages.create.side_effect = anthropic.APIStatusError(
+            "overloaded", response=_httpx_response(529), body=None
+        )
+        f._batch_score_sentiment([self._article()])
+        assert mock_claude.messages.create.call_count == 1
+        # Second call within the cooldown window must NOT hit the API again.
+        assert f._batch_score_sentiment([self._article()]) == {}
+        assert mock_claude.messages.create.call_count == 1
+
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_cooldown_lifts_after_window(self, mock_claude, _ev):
+        import anthropic, news.fetcher as f
+        mock_claude.messages.create.side_effect = anthropic.APIStatusError(
+            "overloaded", response=_httpx_response(529), body=None
+        )
+        f._batch_score_sentiment([self._article()])
+        # Force the cooldown into the past — the next call should try Claude again.
+        f._claude_cooldown["until"] = time.monotonic() - 1
+        block = MagicMock(); block.type = "tool_use"
+        block.input = {"classifications": [
+            {"id": "1", "sentiment": "neutral", "confidence": 0.3,
+             "catalyst_type": "other", "already_moved": False, "catalyst_magnitude": 1},
+        ]}
+        msg = MagicMock(); msg.content = [block]
+        mock_claude.messages.create.side_effect = None
+        mock_claude.messages.create.return_value = msg
+        scores = f._batch_score_sentiment([self._article()])
+        assert scores["1"]["sentiment"] == "neutral"
+        assert f._claude_cooldown is None  # cleared on successful resume
+
+
+# ── Twelvedata credit-budget guard tests (v17) ─────────────────────────────────
+
+class TestTwelvedataCreditGuard:
+    """market/twelvedata_bars.py: exhausted budget short-circuits before any HTTP."""
+
+    def setup_method(self):
+        import market.twelvedata_bars as td
+        td._credit_meter = {"date": None, "used": 0}
+        td._meter_latches = {"date": None, "warned": False,
+                             "exhausted_logged": False, "exhausted_emitted": False}
+
+    def teardown_method(self):
+        # Reset so a frozen/exhausted meter doesn't block a later test's TD path.
+        import market.twelvedata_bars as td
+        td._credit_meter = {"date": None, "used": 0}
+        td._meter_latches = {"date": None, "warned": False,
+                             "exhausted_logged": False, "exhausted_emitted": False}
+
+    def test_not_exhausted_under_soft_cap(self):
+        import market.twelvedata_bars as td
+        td._credit_meter = {"date": __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc).date(), "used": 10}
+        assert td.credits_exhausted() is False
+
+    @patch("market.twelvedata_bars._emit_credit_exhausted_event")
+    def test_exhausted_at_soft_cap(self, _emit):
+        import market.twelvedata_bars as td
+        from datetime import datetime, timezone
+        td._credit_meter = {"date": datetime.now(timezone.utc).date(),
+                            "used": td._DAILY_CREDIT_SOFT_CAP}
+        assert td.credits_exhausted() is True
+
+    @patch("market.twelvedata_bars.requests.get")
+    @patch("market.twelvedata_bars._emit_credit_exhausted_event")
+    def test_time_series_skips_http_when_exhausted(self, _emit, mock_get):
+        import market.twelvedata_bars as td
+        from datetime import datetime, timezone
+        td._credit_meter = {"date": datetime.now(timezone.utc).date(),
+                            "used": td._DAILY_CREDIT_SOFT_CAP}
+        assert td._get_time_series("AAPL", "1min", 10) is None
+        mock_get.assert_not_called()  # the whole point: no call, no 18s 429 storm
+
+    @patch("market.twelvedata_bars.requests.get")
+    @patch("market.twelvedata_bars._emit_credit_exhausted_event")
+    def test_quote_skips_http_when_exhausted(self, _emit, mock_get):
+        import market.twelvedata_bars as td
+        from datetime import datetime, timezone
+        td._credit_meter = {"date": datetime.now(timezone.utc).date(),
+                            "used": td._DAILY_CREDIT_SOFT_CAP}
+        assert td.get_twelvedata_quote("AAPL") is None
+        mock_get.assert_not_called()
+
+    @patch("market.twelvedata_bars._record_credit_use")
+    @patch("market.twelvedata_bars.requests.get")
+    def test_fast_mode_no_retry_on_429(self, mock_get, _rec):
+        import market.twelvedata_bars as td
+        from datetime import datetime, timezone
+        td._credit_meter = {"date": datetime.now(timezone.utc).date(), "used": 0}
+        resp = MagicMock(); resp.status_code = 429
+        mock_get.return_value = resp
+        # fast=True must make exactly ONE attempt (no 3+6+9s backoff loop).
+        assert td._get_time_series("AAPL", "1min", 10, fast=True) is None
+        assert mock_get.call_count == 1

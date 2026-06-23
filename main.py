@@ -46,6 +46,7 @@ from storage.database import (
     is_article_seen, set_rejection_reason, set_tp_order_id, touch_heartbeat,
     count_open_trades, count_trades_today, get_today_realized_pnl,
     update_premarket_candidate, save_snapshot,
+    trading_days_since_last_trade, record_system_event,
 )
 from news.fetcher import fetch_all_news, NewsItem
 from market.price_check import (
@@ -499,6 +500,39 @@ def _read_version() -> dict:
         return {}
 
 
+def check_zero_trade_drought() -> None:
+    """
+    Alert when ZERO_TRADE_ALERT_SESSIONS+ consecutive trading days pass with no
+    trades. This is the tripwire for the silent-failure class that ran undetected
+    for nine sessions in June 2026 (a Twelvedata credit collapse): the service was
+    up, heartbeats green, news scored — but no signal could ever be confirmed, so
+    nothing traded and nothing alerted.
+
+    It only RAISES AN ALERT — it never stands the system down. A multi-day drought
+    can be a legitimately bad tape, so a human looks and decides; record_system_event
+    de-dupes to one row per day so this won't spam.
+    """
+    try:
+        idle = trading_days_since_last_trade()
+    except Exception as exc:
+        logger.warning("zero-trade drought check failed: %s", exc)
+        return
+    if idle is None or idle < cfg.zero_trade_alert_sessions:
+        return
+    logger.critical(
+        "ZERO-TRADE DROUGHT: %d consecutive trading sessions with no trades "
+        "(threshold %d). Service is up and scoring news — investigate whether the "
+        "price-confirmation/data pipeline is silently failing (Twelvedata credits, "
+        "Claude outage) vs a genuinely untradeable tape. See system_events.",
+        idle, cfg.zero_trade_alert_sessions,
+    )
+    record_system_event(
+        "zero_trade_session",
+        f"{idle} consecutive trading sessions with no trades "
+        f"(threshold {cfg.zero_trade_alert_sessions})",
+    )
+
+
 def _nightly_forward_returns() -> None:
     """Nightly eval-loop job — see analysis/forward_returns.py."""
     try:
@@ -590,6 +624,17 @@ def main() -> None:
         misfire_grace_time=3600,
     )
 
+    # Zero-trade drought tripwire. 21:30 UTC is after the US close year-round, so
+    # "today" is already settled when it runs. Weekdays only — a Saturday alert
+    # would just re-report Friday's idle count.
+    _scheduler.add_job(
+        check_zero_trade_drought,
+        trigger=CronTrigger(hour=21, minute=30, day_of_week="mon-fri"),
+        id="zero_trade_drought",
+        name="Zero-trade drought alert",
+        misfire_grace_time=3600,
+    )
+
     # Portfolio value snapshots for the Grafana time-series panel.
     # Every 5 min; the job itself returns immediately when the market is closed.
     _scheduler.add_job(
@@ -599,6 +644,9 @@ def main() -> None:
         name="Portfolio value snapshot",
         misfire_grace_time=60,
     )
+
+    # Surface an in-progress drought immediately on startup, not only at 21:30.
+    check_zero_trade_drought()
 
     # Run once immediately on startup
     logger.info("Running initial news cycle...")

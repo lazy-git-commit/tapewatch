@@ -10,11 +10,25 @@ Why not yfinance?
   at 11:42 giving false +1.20% momentum signal). Twelvedata Basic plan provides
   near-real-time 1-min bars and is reliable under load.
 
-Credit model:
-  Twelvedata Basic = 800 credits/day. Each symbol in a call costs 1 credit.
-  We meter usage in-process (_credit_meter) and log a WARNING at 80% so a
-  bursty news day doesn't silently exhaust the budget — once credits run out,
-  every price check fails and every signal is dropped for the rest of the day.
+Credit model (HARD budget guard — 2026-06-23 credit-collapse fix):
+  Twelvedata Basic = 800 credits/day (free/trial tier — we deliberately do NOT
+  pay for a larger plan until the strategy is net-profitable). Each symbol in a
+  call costs 1 credit. We meter usage in-process (_credit_meter).
+
+  CRITICAL: once the daily budget is spent, every public entry point in this
+  module SHORT-CIRCUITS — it returns its "data unavailable" sentinel WITHOUT
+  making the HTTP call. Before this guard, an exhausted budget kept calling the
+  API anyway, getting 429s, and burning the full 3+6+9=18s retry backoff per
+  call; on a busy news day that storm (plus the premarket fan-out draining the
+  budget by mid-morning) silently took the system down for NINE consecutive
+  sessions, 2026-06-11→06-23, with zero trades and no alert. See
+  docs/algorithm.md §"Data-budget collapse" and credits_exhausted() below.
+
+  When credits are exhausted the system has NO way to run its momentum/RVOL/
+  VWAP/liquidity gates (Finnhub provides only a quote, never bars), so it CANNOT
+  and MUST NOT trade — it fails closed. News scoring is unaffected (Claude +
+  Benzinga only) and keeps running so the eval loop still measures classifier
+  accuracy on days we can't trade.
 
 Momentum baseline (BY TIMESTAMP, not index):
   /time_series returns bars newest-first. Earlier versions took values[5] as
@@ -33,6 +47,7 @@ Liquidity (ADV-based, deliberately):
 """
 
 import logging
+import threading
 import time
 import requests
 from datetime import datetime, timedelta, timezone
@@ -48,39 +63,132 @@ _ET = pytz.timezone("America/New_York")
 # ── Credit metering ───────────────────────────────────────────────────────────
 # Basic plan: 800 credits/day, 1 credit per symbol per call. Resets at UTC
 # midnight (Twelvedata's reset). In-process counter — resets on restart, which
-# is acceptable: it under-counts, and the purpose is the 80% early warning,
-# not exact accounting.
+# is acceptable: it under-counts (the budget guard then errs toward letting a
+# few extra real calls through after a mid-day restart), and exact accounting
+# was never the point.
+#
+# We reserve a small headroom margin below the true limit: the in-process meter
+# can under-count (calls that raced, or were made before a restart reset it), so
+# treating the FULL 800 as spendable risks overshooting into real 429s. Stopping
+# at the soft cap keeps us inside the budget even when the counter is slightly
+# behind reality.
 _DAILY_CREDIT_LIMIT = 800
-_CREDIT_WARN_FRACTION = 0.8
+_CREDIT_HEADROOM = 20                                  # stop this many short of the hard cap
+_DAILY_CREDIT_SOFT_CAP = _DAILY_CREDIT_LIMIT - _CREDIT_HEADROOM
+_CREDIT_WARN_AT = int(_DAILY_CREDIT_LIMIT * 0.8)       # 80% early-warning threshold (640)
 _credit_meter = {"date": None, "used": 0}
+# Per-day latches so the 80% WARNING and the EXHAUSTED transition each log once
+# per UTC day rather than on every call (the old EXHAUSTED path logged hundreds
+# of times — 120 lines on 2026-06-22 alone). `exhausted_emitted` is separate
+# from `exhausted_logged` so a transient DB failure on the first emit doesn't
+# permanently suppress the system_events row: the log latches immediately, the
+# emit keeps retrying until one succeeds.
+_meter_latches = {"date": None, "warned": False, "exhausted_logged": False, "exhausted_emitted": False}
+# All reads AND mutations of _credit_meter / _meter_latches happen under this
+# lock. The pre-market eval runs confirm_price_signal across an 8-worker thread
+# pool (premarket/scanner.py), so each `used += 1` and each latch check-then-set
+# is genuinely concurrent — a bare dict op is not guaranteed atomic and the
+# check-then-set would otherwise double-fire logs/emits across threads.
+_meter_lock = threading.Lock()
 
 
-def _record_credit_use() -> None:
-    """Count one Twelvedata credit and warn when approaching the daily cap."""
+def _roll_meter_locked() -> None:
+    """Reset counter + latches on a UTC-day change. CALLER MUST HOLD _meter_lock."""
     today = datetime.now(timezone.utc).date()
     if _credit_meter["date"] != today:
         _credit_meter["date"] = today
         _credit_meter["used"] = 0
-    _credit_meter["used"] += 1
-    used = _credit_meter["used"]
-    if used == int(_DAILY_CREDIT_LIMIT * _CREDIT_WARN_FRACTION):
-        logger.warning(
-            "Twelvedata credit budget at %d/%d (80%%) — price checks will start "
-            "failing when the budget is exhausted",
-            used, _DAILY_CREDIT_LIMIT,
+    if _meter_latches["date"] != today:
+        _meter_latches.update(
+            date=today, warned=False, exhausted_logged=False, exhausted_emitted=False
         )
-    elif used >= _DAILY_CREDIT_LIMIT:
-        logger.error(
-            "Twelvedata credit budget EXHAUSTED (%d/%d) — momentum/volume data "
-            "unavailable until UTC midnight",
-            used, _DAILY_CREDIT_LIMIT,
+
+
+def credits_exhausted() -> bool:
+    """
+    True when the Twelvedata daily budget is spent (at/over the soft cap).
+
+    This is the single gate every public entry point checks BEFORE making a
+    network call: when it returns True the call is skipped entirely (no HTTP, no
+    retry backoff) and the caller gets its "unavailable" sentinel. That is what
+    keeps an exhausted budget from re-triggering the 18s-per-call 429 storm.
+
+    Logs the EXHAUSTED transition once per UTC day and records a system_event so
+    the outage is visible to alerting/Grafana instead of being buried in INFO
+    spam (observability gap that hid the 9-session drought). The DB emit is
+    attempted (outside the lock) until it succeeds, so a momentary DB blip at the
+    instant of first exhaustion doesn't lose the alert row for the whole day.
+    """
+    emit_now = False
+    with _meter_lock:
+        _roll_meter_locked()
+        if _credit_meter["used"] < _DAILY_CREDIT_SOFT_CAP:
+            return False
+        used = _credit_meter["used"]
+        if not _meter_latches["exhausted_logged"]:
+            _meter_latches["exhausted_logged"] = True
+            logger.error(
+                "Twelvedata credit budget EXHAUSTED (%d/%d, soft cap %d) — momentum/"
+                "volume/VWAP data unavailable until UTC midnight; the system will keep "
+                "scoring news but CANNOT confirm signals, so it will not trade for the "
+                "rest of the day",
+                used, _DAILY_CREDIT_LIMIT, _DAILY_CREDIT_SOFT_CAP,
+            )
+        if not _meter_latches["exhausted_emitted"]:
+            emit_now = True  # retry the DB emit until one call succeeds
+    if emit_now and _emit_credit_exhausted_event():
+        with _meter_lock:
+            _meter_latches["exhausted_emitted"] = True
+    return True
+
+
+def _emit_credit_exhausted_event() -> bool:
+    """Record a one-per-day system_event for the credit-exhaustion outage.
+
+    Returns True on success, False if the write failed (so the caller leaves the
+    `exhausted_emitted` latch unset and retries on a later call). Best-effort and
+    import-local: market.* must not hard-depend on storage.* at import time, and
+    an event-log failure must never affect the data path. Called WITHOUT the lock
+    held (it does I/O).
+    """
+    try:
+        from storage.database import record_system_event
+        record_system_event(
+            "twelvedata_credits_exhausted",
+            f"{_DAILY_CREDIT_SOFT_CAP}+/{_DAILY_CREDIT_LIMIT} credits used "
+            f"— trading suspended until UTC midnight",
         )
+        return True
+    except Exception as exc:
+        logger.debug("Could not record credit-exhaustion system_event: %s", exc)
+        return False
+
+
+def _record_credit_use() -> None:
+    """Count one Twelvedata credit and warn (once/day) when approaching the cap.
+
+    Callers must already have checked credits_exhausted() and skipped the call
+    when it was True — this only meters calls we actually make. Thread-safe: the
+    increment and the warn check-then-set run under _meter_lock so the 8-worker
+    pre-market pool can't lose increments or skip the warning.
+    """
+    with _meter_lock:
+        _roll_meter_locked()
+        _credit_meter["used"] += 1
+        if _credit_meter["used"] >= _CREDIT_WARN_AT and not _meter_latches["warned"]:
+            _meter_latches["warned"] = True
+            logger.warning(
+                "Twelvedata credit budget at %d/%d (80%%) — approaching the daily cap; "
+                "price confirmation will stop (and trading will pause) at %d",
+                _credit_meter["used"], _DAILY_CREDIT_LIMIT, _DAILY_CREDIT_SOFT_CAP,
+            )
 
 
 def get_credits_used_today() -> int:
     """Expose the in-process credit count (for logging/diagnostics)."""
-    today = datetime.now(timezone.utc).date()
-    return _credit_meter["used"] if _credit_meter["date"] == today else 0
+    with _meter_lock:
+        today = datetime.now(timezone.utc).date()
+        return _credit_meter["used"] if _credit_meter["date"] == today else 0
 
 
 # ── GBP/USD live rate ─────────────────────────────────────────────────────────
@@ -127,13 +235,32 @@ def _get_time_series(
     outputsize: int,
     retries: int = 3,
     retry_delay: float = 1.5,
+    fast: bool = False,
 ) -> list[dict] | None:
     """
     Call Twelvedata /time_series. Returns the 'values' list (newest first) or None.
 
     Retries on transient network errors and HTTP 5xx. Does NOT retry 4xx
     (invalid symbol, auth failure) — these won't self-heal.
+
+    `fast` (default False) is for time-boxed callers — chiefly the pre-market
+    eval window, where every second of retry backoff is a second the gap-and-go
+    edge decays and candidates are evaluated concurrently under a wall-clock
+    budget. In fast mode there are NO retries and NO sleeps: a 429/5xx/timeout
+    returns None immediately (skip this candidate this cycle; the next cycle is
+    the retry). This matches the no-retry contract already on get_twelvedata_
+    quote() — before 2026-06-23 the fast path covered only the quote, while the
+    momentum/volume/VWAP calls (which all route through here) still did the full
+    3+6+9s backoff, so a single slow ticker could blow the 30s budget and starve
+    the rest. See premarket/scanner.evaluate_premarket_candidates.
+
+    Budget guard: returns None WITHOUT any HTTP call when the daily credit budget
+    is exhausted (credits_exhausted()). This is what stops the 18s-per-call 429
+    storm once the budget is spent.
     """
+    if credits_exhausted():
+        return None
+
     url = f"{_BASE_URL}/time_series"
     params = {
         "symbol": symbol,
@@ -142,24 +269,33 @@ def _get_time_series(
         "apikey": cfg.twelvedata_api_key,
     }
     _record_credit_use()
+    attempts = 1 if fast else retries
     last_exc: Exception | None = None
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, attempts + 1):
         try:
             resp = requests.get(url, params=params, timeout=_TIMEOUT)
             if resp.status_code == 429:
+                if fast:
+                    logger.info(
+                        "Twelvedata rate limit for %s — fast mode, skipping (retry next cycle)",
+                        symbol,
+                    )
+                    return None
                 # Rate limited — wait longer before retry
                 wait = retry_delay * attempt * 2
                 logger.warning(
                     "Twelvedata rate limit for %s (attempt %d/%d) — waiting %.1fs",
-                    symbol, attempt, retries, wait,
+                    symbol, attempt, attempts, wait,
                 )
                 time.sleep(wait)
                 continue
             if resp.status_code >= 500:
+                if fast:
+                    return None
                 wait = retry_delay * attempt
                 logger.warning(
                     "Twelvedata HTTP %d for %s (attempt %d/%d) — waiting %.1fs",
-                    resp.status_code, symbol, attempt, retries, wait,
+                    resp.status_code, symbol, attempt, attempts, wait,
                 )
                 time.sleep(wait)
                 continue
@@ -179,26 +315,32 @@ def _get_time_series(
             return values
         except requests.exceptions.Timeout:
             logger.warning(
-                "Twelvedata timeout for %s (attempt %d/%d)", symbol, attempt, retries
+                "Twelvedata timeout for %s (attempt %d/%d)", symbol, attempt, attempts
             )
             last_exc = Exception(f"timeout after {_TIMEOUT}s")
+            if fast:
+                return None
         except requests.exceptions.ConnectionError as exc:
             logger.warning(
                 "Twelvedata connection error for %s (attempt %d/%d): %s",
-                symbol, attempt, retries, exc,
+                symbol, attempt, attempts, exc,
             )
             last_exc = exc
+            if fast:
+                return None
         except Exception as exc:
             logger.warning(
                 "Twelvedata unexpected error for %s (attempt %d/%d): %s",
-                symbol, attempt, retries, exc,
+                symbol, attempt, attempts, exc,
             )
             last_exc = exc
-        if attempt < retries:
+            if fast:
+                return None
+        if attempt < attempts:
             time.sleep(retry_delay * attempt)
     logger.error(
         "Twelvedata: all %d attempts failed for %s — last error: %s",
-        retries, symbol, last_exc,
+        attempts, symbol, last_exc,
     )
     return None
 
@@ -251,6 +393,8 @@ def get_twelvedata_quote(symbol: str, fast: bool = False) -> dict | None:
     time per call) can never succeed. Returning None on the first 404 is both
     correct and ~3× faster for the no-coverage small-caps this fallback targets.
     """
+    if credits_exhausted():
+        return None
     url = f"{_BASE_URL}/quote"
     params = {"symbol": symbol, "apikey": cfg.twelvedata_api_key}
     _record_credit_use()
@@ -316,10 +460,17 @@ def get_twelvedata_quote(symbol: str, fast: bool = False) -> dict | None:
     return None
 
 
-def get_momentum_baseline(symbol: str) -> tuple[float | None, float | None, float | None]:
+def get_momentum_baseline(
+    symbol: str, fast: bool = False
+) -> tuple[float | None, float | None, float | None]:
     """
     Fetch 1-min intraday bars and return
     (past_price, current_bar_price, spread_proxy_pct).
+
+    `fast` (default False) propagates to _get_time_series for the time-boxed
+    pre-market eval window (no retry backoff). Returns (None, None, None) on a
+    fast-mode miss or when the credit budget is exhausted — the caller treats
+    that as "data unavailable, retry next cycle".
 
     past_price        — close of the newest bar that is at least
                         cfg.momentum_lookback_minutes old (selected by
@@ -339,7 +490,7 @@ def get_momentum_baseline(symbol: str) -> tuple[float | None, float | None, floa
     # Fetch enough bars to cover the look-back window even if some minutes
     # are missing (thin stocks skip bars when no trades print).
     outputsize = max(10, cfg.momentum_lookback_minutes * 3)
-    values = _get_time_series(symbol, interval="1min", outputsize=outputsize)
+    values = _get_time_series(symbol, interval="1min", outputsize=outputsize, fast=fast)
     if values is None or len(values) < 2:
         return None, None, None
 
@@ -414,7 +565,7 @@ def get_momentum_baseline(symbol: str) -> tuple[float | None, float | None, floa
     return past_price, current_bar_price, spread_proxy_pct
 
 
-def get_session_vwap(symbol: str) -> tuple[float | None, float | None]:
+def get_session_vwap(symbol: str, fast: bool = False) -> tuple[float | None, float | None]:
     """
     Compute today's session VWAP and return (vwap, last_price).
 
@@ -434,11 +585,14 @@ def get_session_vwap(symbol: str) -> tuple[float | None, float | None]:
 
     Returns (None, None) if data is unavailable. Costs 1 credit.
 
+    `fast` (default False) propagates to _get_time_series for the time-boxed
+    pre-market eval window (no retry backoff).
+
     Implementation note: we pull up to 390 1-min bars (a full RTH session) and
     accumulate only today's bars. Early in the session there are few bars, which
     is fine — VWAP is simply the average so far.
     """
-    values = _get_time_series(symbol, interval="1min", outputsize=390)
+    values = _get_time_series(symbol, interval="1min", outputsize=390, fast=fast)
     if values is None or len(values) < 1:
         return None, None
 
@@ -474,10 +628,15 @@ def get_session_vwap(symbol: str) -> tuple[float | None, float | None]:
     return vwap, last_price
 
 
-def get_volume_stats(symbol: str) -> tuple[int | None, int | None, float | None, float | None]:
+def get_volume_stats(
+    symbol: str, fast: bool = False
+) -> tuple[int | None, int | None, float | None, float | None]:
     """
     Fetch 21 daily bars and return
     (today_volume, avg_daily_volume, avg_dollar_volume, prev_close).
+
+    `fast` (default False) propagates to _get_time_series for the time-boxed
+    pre-market eval window (no retry backoff).
 
     today_volume      — today's cumulative volume so far (bar[0], partial)
     avg_daily_volume  — 20-day average daily share volume (bars[1..20])
@@ -489,7 +648,7 @@ def get_volume_stats(symbol: str) -> tuple[int | None, int | None, float | None,
 
     Returns (None, None, None, None) if data is unavailable.
     """
-    values = _get_time_series(symbol, interval="1day", outputsize=21)
+    values = _get_time_series(symbol, interval="1day", outputsize=21, fast=fast)
     if values is None or len(values) < 2:
         return None, None, None, None
 

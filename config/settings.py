@@ -262,6 +262,17 @@ class Settings:
         default_factory=lambda: float(os.getenv("MAX_GAP_PCT", "20.0"))
     )
 
+    # ── Observability ─────────────────────────────────────────────────────────
+    # Alert (system_event + CRITICAL log) when this many consecutive NYSE
+    # trading sessions pass with signals flowing but ZERO trades. This is the
+    # silent-failure tripwire: the 2026-06-23 incident ran 9 sessions of green
+    # heartbeats and healthy news scoring while a data-budget collapse quietly
+    # prevented every trade. A multi-day drought CAN be legitimate (genuinely bad
+    # tape), so this alerts — it does not stand the system down. Default 3.
+    zero_trade_alert_sessions: int = field(
+        default_factory=lambda: int(os.getenv("ZERO_TRADE_ALERT_SESSIONS", "3"))
+    )
+
     # ── News Settings ─────────────────────────────────────────────────────────
     blocklist: list[str] = field(
         default_factory=lambda: [
@@ -329,6 +340,7 @@ class Settings:
             ("EOD_FLATTEN_MINUTES", self.eod_flatten_minutes >= 0),
             ("SELL_LIMIT_SLACK_PCT", self.sell_limit_slack_pct >= 0),
             ("MIN_GAP_PCT/MAX_GAP_PCT", self.max_gap_pct > self.min_gap_pct),
+            ("ZERO_TRADE_ALERT_SESSIONS", self.zero_trade_alert_sessions > 0),
         ]
         errors.extend(name for name, ok in numeric_checks if not ok)
         if errors:

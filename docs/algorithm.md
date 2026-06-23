@@ -350,10 +350,48 @@ produced 205 "prev close unavailable" and 174 Twelvedata-failure lines in one
 minutes), the first *real* evaluations landed only at open+6min, and **9
 candidates expired with `eval window closed` having never been price-checked
 once**. The ones that *were* evaluated were correctly rejected (gap-and-crap /
-RVOL<1.5) — so the defect is starvation, not a wrong verdict. Mitigations to
-consider: backfill `pc` from the Twelvedata daily bar up front; bound per-cycle
-eval cost / parallelize quote fetches; suppress or shorten Twelvedata retry
-backoff inside the time-boxed pre-market window.
+RVOL<1.5) — so the defect is starvation, not a wrong verdict. **Fixed in v16.0**
+(parallel confirm under a 30s wall-clock budget) and **v16.1** (07:00 scan start).
+
+**Known failure mode — data-budget collapse (2026-06-11 → 06-23, nine sessions
+of zero trades).** A deeper instance of the same class, found 2026-06-23. The
+service was up the whole time, all four heartbeats green, news scoring healthy
+(1283 articles → 80 fully-qualified candidates on 06-22). Yet the last trade was
+2026-06-10. Two compounding causes, both of which fail **closed and silently**:
+
+1. **Twelvedata 800/day credit budget exhausted by mid-morning** (06-22: ~14:01
+   ET; 06-23: ~11:46 ET). The premarket fan-out (≈4 credits/candidate/cycle ×
+   ~35 candidates × ~30 cycles) plus RTH retry loops that re-bill a failing
+   signal every minute drain the free-tier budget before noon. After that, the
+   entire RTH path goes dark: `get_momentum_baseline` returns `None` →
+   `confirm_price_signal` returns `None` → signal parked → dropped. No trade can
+   ever confirm. (Finnhub gives only a quote, never the bars the gates need, so
+   there is **no fallback** — the system correctly does not trade blind.)
+2. **The credit meter was cosmetic.** It logged "EXHAUSTED" but did **not** stop
+   the call — execution fell through into the HTTP request, which 429'd, burning
+   the full 3+6+9 = 18s backoff *per call*. The v16.0 storm, reincarnated in the
+   RTH path (the `fast=` no-retry path had only been threaded into the quote
+   call, not the three `_get_time_series` consumers).
+
+**Fixed in v17 (`market/twelvedata_bars.py`):**
+- `credits_exhausted()` is now a **hard gate** every public entry point checks
+  *before* any HTTP call — once spent (soft cap 780 = 800 − 20 headroom for
+  under-counting), the call is skipped entirely and the caller gets its
+  "unavailable" sentinel. This kills the 18s-per-call 429 storm. The transition
+  is logged once per UTC day and written to `system_events`.
+- `fast=` is threaded into `_get_time_series` and all three bar consumers
+  (`get_momentum_baseline`, `get_volume_stats`, `get_session_vwap`), so the
+  pre-market eval is now *fully* no-retry — a single slow ticker can no longer
+  blow the 30s budget. VWAP (the 4th/last credit) degrades to "confirm on
+  momentum + RVOL only" on a fast miss, matching a genuine data gap.
+- The pre-market eval phase short-circuits when credits are exhausted (no thread
+  pool spun up, candidates left pending for next cycle / window expiry).
+
+**No paid plan (deliberate):** we stay on the 800/day free tier until the
+strategy is net-profitable. The fix makes the system **fail gracefully and
+loudly** within that budget — it stops trading but keeps scoring news so the
+eval loop still measures classifier accuracy on days we can't trade — rather
+than buying a bigger plan to paper over the leak.
 
 ---
 
@@ -362,12 +400,15 @@ backoff inside the time-boxed pre-market window.
 | Failure | Behaviour |
 |---|---|
 | Finnhub quote down | 3 retries (1s/2s/4s); position monitor falls back to Twelvedata bar close |
-| Twelvedata down | 3 retries (1.5s/3s/6s + 429-aware); signal parked in the **retry queue** (5-min TTL) — previously "will retry next cycle" was a lie because the freshness filter dropped the aged article (SPCX, Jun 12) |
-| Twelvedata credit budget | metered in-process; WARNING at 80% of the 800/day cap |
+| Twelvedata down | 3 retries (1.5s/3s/6s + 429-aware) RTH; `fast=` no-retry inside the time-boxed pre-market eval; signal parked in the **retry queue** (5-min TTL) — previously "will retry next cycle" was a lie because the freshness filter dropped the aged article (SPCX, Jun 12) |
+| Twelvedata credit budget exhausted | **v17: hard gate** — `credits_exhausted()` short-circuits every call *before* HTTP once past the 780 soft cap (was: cosmetic 80% WARNING that let the 18s-429 storm run). System stops trading (no bar data = no confirmation = fail-closed) but keeps scoring news; logged once/day + `system_events` row (2026-06-23 nine-session drought) |
+| Claude outage / overload (529/500/network) | typed-exception handled: fail-closed (no scores → no trades) + short cooldown (`_CLAUDE_OUTAGE_COOLDOWN_SECONDS`, 120s) so we don't hammer a struggling API; auto-resumes; `system_events` row (`claude_outage`) |
+| Claude out-of-credits / billing (403 `billing_error`) or auth (401) | does **not** self-heal — CRITICAL log + long cooldown (`_CLAUDE_BILLING_COOLDOWN_SECONDS`, 30 min) + `system_events` (`claude_billing_error`/`claude_auth_error`) so the journal shows what actually broke |
 | Both feeds down with open position | TP/SL skipped that cycle; time stop still fires (needs no price) |
 | DB down | 3 retries on OperationalError; eval-loop writes never block the trading path |
 | T212 symbol map 429 at startup | retries with 30s backoff + daily 08:00 UTC rebuild (a single startup 429 used to poison the whole session) |
 | Service crash | systemd `Restart=always` + deploy-time config validation + post-restart health check + **heartbeat table** (below) |
+| Silent zero-trade drought | **v17: tripwire** — `check_zero_trade_drought` (startup + daily 21:30 UTC) fires CRITICAL + `system_events` after `ZERO_TRADE_ALERT_SESSIONS` (3) consecutive NYSE sessions with no trades while up and scoring. Alerts only; never stands the system down (a drought can be a legitimately bad tape) |
 
 **Heartbeat / alerting:** every job updates `heartbeat(job, last_beat_at)`.
 Grafana alert query (fires when the news cycle is silent >10 min):
@@ -375,6 +416,24 @@ Grafana alert query (fires when the news cycle is silent >10 min):
 ```sql
 SELECT EXTRACT(EPOCH FROM (NOW() - last_beat_at::timestamptz)) / 60 AS minutes_stale
 FROM heartbeat WHERE job = 'news_cycle';
+```
+
+**System events / degradation alerting (v17):** the heartbeat catches a *dead*
+process, but the nine-session drought (above) had green heartbeats the whole
+time — the process was alive and degraded. `system_events(event_type, severity,
+detail, created_at, event_day)` records the silent-failure class so a
+degraded-but-up system is visible. One row per `(event_type, event_day)`,
+de-duped atomically by a UNIQUE index + `ON CONFLICT DO NOTHING` (safe under the
+8-worker pre-market pool). Critical types:
+`twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`,
+`zero_trade_session`; warning: `claude_outage`. Grafana alert query (fires on
+any critical event today):
+
+```sql
+SELECT event_type, detail, created_at FROM system_events
+WHERE severity = 'critical'
+  AND (created_at::timestamptz AT TIME ZONE 'Europe/London')::date =
+      (NOW() AT TIME ZONE 'Europe/London')::date;
 ```
 
 The 2026-06-11 incident — a missing `TWELVEDATA_API_KEY` crash-looping the

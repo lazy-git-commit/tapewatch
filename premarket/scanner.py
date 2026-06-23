@@ -45,6 +45,7 @@ import pytz
 
 from config.settings import cfg
 from market.price_check import confirm_price_signal, PriceConfirmation
+from market.twelvedata_bars import credits_exhausted
 from news.fetcher import fetch_all_news, NewsItem
 from storage.database import (
     is_premarket_candidate_seen,
@@ -290,6 +291,19 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
     """
     pending = get_pending_premarket_candidates()
     if not pending:
+        return []
+
+    # Budget guard: if Twelvedata credits are spent, every confirm_price_signal
+    # would return None anyway (the bar calls short-circuit). Don't spin up the
+    # thread pool or write any verdict — leave candidates pending so they're
+    # re-evaluated for free next cycle (within their 30-min window) or expire via
+    # _live_candidates. Trading is suspended for the day; news scoring continues.
+    if credits_exhausted():
+        logger.warning(
+            "Pre-market eval skipped — Twelvedata credit budget exhausted; "
+            "%d candidate(s) left pending (no trades until UTC midnight)",
+            len(pending),
+        )
         return []
 
     minutes_open = _minutes_since_open()

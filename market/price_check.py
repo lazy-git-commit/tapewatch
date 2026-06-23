@@ -341,13 +341,21 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
     the signal (Finnhub down, Twelvedata down). Confirmed/rejected signals
     are returned as PriceConfirmation with is_confirmed set accordingly.
 
-    `fast` (default False) is for the time-boxed pre-market eval window: it
-    makes the Twelvedata quote fallback/backfill non-blocking (no retry
-    backoff — see get_quote_with_fallback). The momentum/volume/VWAP calls
-    further down keep their retries because they only run AFTER the 5-min
-    opening block, by which point the open-auction data storm (Finnhub pc=0,
-    Twelvedata 429/404 on small-caps) has cleared; during the storm this
-    function returns at the opening_block gate before reaching them.
+    `fast` (default False) is for the time-boxed pre-market eval window: it makes
+    EVERY Twelvedata call non-blocking (no retry backoff) — the quote fallback/
+    backfill AND the momentum/volume/VWAP bar pulls. Before 2026-06-23 only the
+    quote was fast while the three bar calls still did the full 3+6+9s backoff,
+    so a single slow ticker could consume the scanner's 30s wall-clock budget and
+    starve the rest of the watchlist (the candidates simply expired unevaluated —
+    26 of 37 on 2026-06-23). Fast misses return None and are retried next cycle.
+
+    When Twelvedata's daily credit budget is exhausted, the bar calls return None
+    without any HTTP request (see twelvedata_bars.credits_exhausted): this
+    function then returns None ("can't evaluate"), the signal is parked/retried,
+    and — because confirmation is impossible without bars — no trade is opened.
+    Failing closed here is correct: Finnhub gives a quote but never the momentum/
+    RVOL/VWAP/liquidity bars the gates need, so there is no safe way to trade
+    blind. The system keeps scoring news regardless (eval loop continues).
     """
     symbol = _to_yf_ticker(t212_ticker)
 
@@ -407,7 +415,7 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             )
 
         # ── Momentum baseline + spread proxy (Twelvedata 1-min bars) ─────────
-        past_price, current_bar_price, spread_proxy_pct = get_momentum_baseline(symbol)
+        past_price, current_bar_price, spread_proxy_pct = get_momentum_baseline(symbol, fast=fast)
         base["spread_proxy_pct"] = spread_proxy_pct
 
         if past_price is None:
@@ -441,7 +449,7 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             )
 
         # ── Volume stats + prev close (Twelvedata 1-day bars) ────────────────
-        today_volume, avg_daily_volume, avg_dollar_volume, td_prev_close = get_volume_stats(symbol)
+        today_volume, avg_daily_volume, avg_dollar_volume, td_prev_close = get_volume_stats(symbol, fast=fast)
 
         # Prefer Finnhub's prev close (real-time source); Twelvedata's daily
         # bar is the backup when the quote lacks `pc`.
@@ -562,7 +570,13 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         # Research basis: PEAD literature + VWAP-reclaim practitioner playbooks
         # (citations in docs/algorithm.md).
         if cfg.require_vwap_confirmation:
-            vwap, vwap_last = get_session_vwap(symbol)
+            # fast= keeps the pre-market eval window inside its wall-clock budget:
+            # a fast miss returns (None, None), which falls through to the
+            # "confirm on momentum + RVOL only" branch below — the same graceful
+            # degradation as a genuine VWAP data gap. This also makes VWAP the
+            # cheapest credit to lose under budget pressure (it's the 4th/last
+            # TD call), without weakening confirmation when data IS available.
+            vwap, vwap_last = get_session_vwap(symbol, fast=fast)
             if vwap is not None and vwap > 0:
                 base["vwap"] = vwap
                 # Accept at/above VWAP minus a small tolerance (handles a fresh
