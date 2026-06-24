@@ -1178,6 +1178,8 @@ class TestTwelvedataCreditGuard:
         td._credit_meter = {"date": None, "used": 0}
         td._meter_latches = {"date": None, "warned": False,
                              "exhausted_logged": False, "exhausted_emitted": False}
+        # Refill the per-minute bucket so tests start with a clean slate.
+        td._bucket_tokens = float(td._PER_MINUTE_LIMIT)
 
     def teardown_method(self):
         # Reset so a frozen/exhausted meter doesn't block a later test's TD path.
@@ -1185,6 +1187,7 @@ class TestTwelvedataCreditGuard:
         td._credit_meter = {"date": None, "used": 0}
         td._meter_latches = {"date": None, "warned": False,
                              "exhausted_logged": False, "exhausted_emitted": False}
+        td._bucket_tokens = float(td._PER_MINUTE_LIMIT)
 
     def test_not_exhausted_under_soft_cap(self):
         import market.twelvedata_bars as td
@@ -1231,3 +1234,28 @@ class TestTwelvedataCreditGuard:
         # fast=True must make exactly ONE attempt (no 3+6+9s backoff loop).
         assert td._get_time_series("AAPL", "1min", 10, fast=True) is None
         assert mock_get.call_count == 1
+
+    @patch("market.twelvedata_bars.requests.get")
+    def test_per_minute_bucket_blocks_when_empty(self, mock_get):
+        import market.twelvedata_bars as td
+        from datetime import datetime, timezone
+        td._credit_meter = {"date": datetime.now(timezone.utc).date(), "used": 0}
+        # Drain the bucket completely.
+        td._bucket_tokens = 0.0
+        # Next call should be blocked before HTTP.
+        assert td._get_time_series("AAPL", "1min", 10, fast=True) is None
+        mock_get.assert_not_called()
+
+    @patch("market.twelvedata_bars.requests.get")
+    def test_per_minute_bucket_allows_when_full(self, mock_get):
+        import market.twelvedata_bars as td
+        from datetime import datetime, timezone
+        td._credit_meter = {"date": datetime.now(timezone.utc).date(), "used": 0}
+        td._bucket_tokens = float(td._PER_MINUTE_LIMIT)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"status": "ok", "values": [{"datetime": "2026-01-01 10:00:00", "open": "1", "high": "1", "low": "1", "close": "1", "volume": "1"}]}
+        mock_get.return_value = resp
+        result = td._get_time_series("AAPL", "1min", 1, fast=True)
+        assert result is not None
+        mock_get.assert_called_once()

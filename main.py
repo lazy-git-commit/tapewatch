@@ -82,6 +82,23 @@ logger = logging.getLogger(__name__)
 _RETRY_TTL_MINUTES = 5
 _retry_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"item", "expires_at"}
 
+# ── Session-level no-quote blackout ──────────────────────────────────────────
+# Tickers with no coverage on Finnhub or Twelvedata (e.g. OTC/special-purpose
+# instruments like EGGF, OXAC) can loop indefinitely: they pass Claude scoring,
+# hit no-data at price-check, enter the retry queue, expire, then re-enter when
+# Benzinga publishes a follow-up article about the same event with a new ID
+# (which the seen-checker can't recognise as the same ticker). On 2026-06-24,
+# EGGF/OXAC looped from 15:38 to past 18:00 with zero upside.
+#
+# After _NO_QUOTE_BLACKOUT_RETRIES consecutive no-data retries for a ticker, we
+# add it to this set for the rest of the session. New articles for blacklisted
+# tickers are skipped before price-check (same as a seen-article). The set resets
+# on service restart (it's session-scoped, not persistent — a daily restart
+# gives a clean slate).
+_NO_QUOTE_BLACKOUT_RETRIES = 2   # strikes before permanent session suppression
+_no_quote_ticker_strikes: dict[str, int] = {}   # ticker → consecutive no-data count
+_no_quote_blackout: set[str] = set()            # tickers suppressed for this session
+
 
 def _queue_retry(item: NewsItem) -> None:
     key = (item.article_id, item.ticker)
@@ -89,10 +106,21 @@ def _queue_retry(item: NewsItem) -> None:
         "item": item,
         "expires_at": datetime.now(timezone.utc) + timedelta(minutes=_RETRY_TTL_MINUTES),
     }
-    logger.info(
-        "Signal [%s] parked for retry (price data unavailable) — expires in %d min",
-        item.ticker, _RETRY_TTL_MINUTES,
-    )
+    # Track consecutive no-data strikes for this ticker.
+    strikes = _no_quote_ticker_strikes.get(item.ticker, 0) + 1
+    _no_quote_ticker_strikes[item.ticker] = strikes
+    if strikes >= _NO_QUOTE_BLACKOUT_RETRIES:
+        _no_quote_blackout.add(item.ticker)
+        logger.warning(
+            "Signal [%s] blacklisted for session — no quote after %d retries "
+            "(no Finnhub/Twelvedata coverage); future articles for this ticker suppressed",
+            item.ticker, strikes,
+        )
+    else:
+        logger.info(
+            "Signal [%s] parked for retry (price data unavailable) — expires in %d min",
+            item.ticker, _RETRY_TTL_MINUTES,
+        )
 
 
 def _drain_retry_queue() -> list[NewsItem]:
@@ -439,6 +467,13 @@ def news_cycle() -> None:
             logger.debug(
                 "Skipping %s — article %s already processed", item.ticker, item.article_id,
             )
+            continue
+
+        # Session no-quote blackout: ticker has no Finnhub/Twelvedata coverage —
+        # price-check will always return None; suppress to avoid looping all day.
+        if item.ticker in _no_quote_blackout:
+            funnel["already_seen"] += 1
+            logger.debug("Skipping %s — session no-quote blackout", item.ticker)
             continue
 
         # 24h per-ticker cooldown (open position or traded recently).

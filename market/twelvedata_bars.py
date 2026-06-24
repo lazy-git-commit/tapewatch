@@ -91,6 +91,39 @@ _meter_latches = {"date": None, "warned": False, "exhausted_logged": False, "exh
 # check-then-set would otherwise double-fire logs/emits across threads.
 _meter_lock = threading.Lock()
 
+# ── Per-minute rate-limit token bucket ───────────────────────────────────────
+# Twelvedata Basic plan = 8 API calls/minute (separate from the 800/day budget).
+# The pre-market eval at market open fires all 34 candidates simultaneously via
+# an 8-worker pool — 34 × ~4 calls = ~136 burst calls in the first minute,
+# guaranteed to hit this limit and return 429s. We guard it in-process so we
+# never waste an HTTP round-trip on a call we know will be rejected.
+#
+# Token bucket: replenishes at 1 token per (60 / _PER_MINUTE_LIMIT) seconds.
+# Each call claims one token. If the bucket is empty, the call is skipped
+# (same as a fast-mode 429 — caller gets None, retries next cycle). This keeps
+# the system well inside the 8/min cap even under concurrent burst load.
+_PER_MINUTE_LIMIT = 8
+_bucket_lock = threading.Lock()
+_bucket_tokens = float(_PER_MINUTE_LIMIT)          # starts full
+_bucket_last_refill = time.monotonic()
+
+
+def _claim_minute_token() -> bool:
+    """Claim one per-minute token. Returns True if a token was available, False if rate-limited."""
+    global _bucket_tokens, _bucket_last_refill
+    with _bucket_lock:
+        now = time.monotonic()
+        elapsed = now - _bucket_last_refill
+        _bucket_tokens = min(
+            float(_PER_MINUTE_LIMIT),
+            _bucket_tokens + elapsed * (_PER_MINUTE_LIMIT / 60.0),
+        )
+        _bucket_last_refill = now
+        if _bucket_tokens >= 1.0:
+            _bucket_tokens -= 1.0
+            return True
+        return False
+
 
 def _roll_meter_locked() -> None:
     """Reset counter + latches on a UTC-day change. CALLER MUST HOLD _meter_lock."""
@@ -260,6 +293,11 @@ def _get_time_series(
     """
     if credits_exhausted():
         return None
+    if not _claim_minute_token():
+        logger.info(
+            "Twelvedata per-minute rate limit for %s — skipping (retry next cycle)", symbol,
+        )
+        return None
 
     url = f"{_BASE_URL}/time_series"
     params = {
@@ -394,6 +432,12 @@ def get_twelvedata_quote(symbol: str, fast: bool = False) -> dict | None:
     correct and ~3× faster for the no-coverage small-caps this fallback targets.
     """
     if credits_exhausted():
+        return None
+    if not _claim_minute_token():
+        logger.info(
+            "Twelvedata per-minute rate limit for %s /quote — skipping (retry next cycle)",
+            symbol,
+        )
         return None
     url = f"{_BASE_URL}/quote"
     params = {"symbol": symbol, "apikey": cfg.twelvedata_api_key}
