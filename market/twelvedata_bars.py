@@ -61,21 +61,15 @@ _TIMEOUT = 8
 _ET = pytz.timezone("America/New_York")
 
 # ── Credit metering ───────────────────────────────────────────────────────────
-# Basic plan: 800 credits/day, 1 credit per symbol per call. Resets at UTC
-# midnight (Twelvedata's reset). In-process counter — resets on restart, which
-# is acceptable: it under-counts (the budget guard then errs toward letting a
-# few extra real calls through after a mid-day restart), and exact accounting
-# was never the point.
-#
-# We reserve a small headroom margin below the true limit: the in-process meter
-# can under-count (calls that raced, or were made before a restart reset it), so
-# treating the FULL 800 as spendable risks overshooting into real 429s. Stopping
-# at the soft cap keeps us inside the budget even when the counter is slightly
-# behind reality.
-_DAILY_CREDIT_LIMIT = 800
-_CREDIT_HEADROOM = 20                                  # stop this many short of the hard cap
+# Grow plan: no daily credit cap. We keep the in-process counter and guard
+# active as a sanity backstop (runaway loop, misconfiguration) but set the
+# limit high enough that it will never fire under normal operation. The 80%
+# warning threshold is similarly raised so it doesn't false-alarm.
+# Previously: Basic plan = 800/day; upgraded 2026-06-25 to Grow ($29/month).
+_DAILY_CREDIT_LIMIT = 50_000                           # Grow: no hard cap; backstop only
+_CREDIT_HEADROOM = 100                                 # headroom on the backstop
 _DAILY_CREDIT_SOFT_CAP = _DAILY_CREDIT_LIMIT - _CREDIT_HEADROOM
-_CREDIT_WARN_AT = int(_DAILY_CREDIT_LIMIT * 0.8)       # 80% early-warning threshold (640)
+_CREDIT_WARN_AT = int(_DAILY_CREDIT_LIMIT * 0.8)       # 80% of backstop (40,000)
 _credit_meter = {"date": None, "used": 0}
 # Per-day latches so the 80% WARNING and the EXHAUSTED transition each log once
 # per UTC day rather than on every call (the old EXHAUSTED path logged hundreds
@@ -92,17 +86,11 @@ _meter_latches = {"date": None, "warned": False, "exhausted_logged": False, "exh
 _meter_lock = threading.Lock()
 
 # ── Per-minute rate-limit token bucket ───────────────────────────────────────
-# Twelvedata Basic plan = 8 API calls/minute (separate from the 800/day budget).
-# The pre-market eval at market open fires all 34 candidates simultaneously via
-# an 8-worker pool — 34 × ~4 calls = ~136 burst calls in the first minute,
-# guaranteed to hit this limit and return 429s. We guard it in-process so we
-# never waste an HTTP round-trip on a call we know will be rejected.
-#
-# Token bucket: replenishes at 1 token per (60 / _PER_MINUTE_LIMIT) seconds.
-# Each call claims one token. If the bucket is empty, the call is skipped
-# (same as a fast-mode 429 — caller gets None, retries next cycle). This keeps
-# the system well inside the 8/min cap even under concurrent burst load.
-_PER_MINUTE_LIMIT = 8
+# Grow plan = 55 API calls/minute. Token bucket guards the in-process burst
+# rate so we never send more than this to the API even under concurrent load
+# (e.g. 34 pre-market candidates firing in the first open cycle).
+# Previously: Basic = 8/min; raised to 55 on 2026-06-25 Grow upgrade.
+_PER_MINUTE_LIMIT = 55
 _bucket_lock = threading.Lock()
 _bucket_tokens = float(_PER_MINUTE_LIMIT)          # starts full
 _bucket_last_refill = time.monotonic()
