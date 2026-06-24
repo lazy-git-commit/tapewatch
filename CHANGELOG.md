@@ -7,6 +7,60 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v17.2 — 2026-06-25 (Twelvedata Grow plan — raise rate limits)
+
+Upgraded from Twelvedata Basic (800 credits/day, 8 calls/minute) to Grow
+$29/month (no daily cap, 55 calls/minute). Updated constants in
+`market/twelvedata_bars.py`:
+
+- `_DAILY_CREDIT_LIMIT` 800 → 50,000 (backstop safety ceiling only — no hard cap on Grow)
+- `_CREDIT_HEADROOM` 20 → 100
+- `_DAILY_CREDIT_SOFT_CAP` 780 → 49,900
+- `_CREDIT_WARN_AT` 640 → 40,000
+- `_PER_MINUTE_LIMIT` 8 → 55
+
+The 8/minute Basic ceiling was the root cause of the systematic 429 burst at
+09:30 ET: 35 pre-market candidates × ~4 TD calls each = ~140 in-flight requests
+against an 8/minute allowance. On the Grow plan the token bucket never depletes
+before the burst completes. No logic changes.
+
+---
+
+## v17.1 — 2026-06-24 (session no-quote blackout + per-minute TD rate-limit guard)
+
+Post-mortem of 2026-06-24 zero-trade day revealed two compounding bugs:
+
+### Session no-quote blackout (`main.py`)
+
+Tickers with zero Finnhub/Twelvedata coverage (e.g. EGGF, OXAC on 2026-06-24)
+were parked in the retry queue on every news cycle for hours. After
+`_RETRY_TTL_MINUTES` (5 min) the item expired — and the next Benzinga article
+about the same catalyst created a new queue entry. Net effect: a no-coverage
+ticker consumed TD credits and log noise every minute for the entire session
+with zero possibility of confirmation.
+
+**Fix:** `_queue_retry()` now tracks per-ticker strike counts
+(`_no_quote_ticker_strikes`). After `_NO_QUOTE_BLACKOUT_RETRIES=2` consecutive
+retries with no price data, the ticker is added to `_no_quote_blackout` and
+silently skipped for the rest of the session. Strikes and the blackout set reset
+on service restart (i.e. next trading day).
+
+### Per-minute Twelvedata token bucket (`market/twelvedata_bars.py`)
+
+The 429 storm at 09:30 ET was not just a premarket fan-out problem — any RTH
+cycle with many signals could burst past the per-minute rate limit.
+
+**Fix:** Thread-safe token bucket (`threading.Lock`, `_bucket_tokens`,
+`_bucket_last_refill`) refills at `_PER_MINUTE_LIMIT / 60` tokens per second.
+`_claim_minute_token()` is called after `credits_exhausted()` in every public
+entry point that calls `_get_time_series` or `get_twelvedata_quote`. A miss
+returns `None` and logs at INFO — the caller treats it as a transient data gap
+and parks the signal in the retry queue.
+
+Tests: 91 → 94 (two new bucket tests in `TestTwelvedataCreditGuard`).
+
+---
+
 ## v15.8 — 2026-06-17 (catalyst materiality scoring + broker reconciliation)
 
 Two strategy and safety upgrades recommended by quant review:

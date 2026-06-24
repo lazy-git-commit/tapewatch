@@ -1,6 +1,6 @@
 # How the Algorithm Works
 
-This is the authoritative description of the trading algorithm as of **v15**.
+This is the authoritative description of the trading algorithm as of **v17**.
 Every filter exists because a specific, named loss demonstrated the need for it —
 those incidents are cited inline. When changing any rule, update this document
 and `CHANGELOG.md` in the same commit.
@@ -387,11 +387,21 @@ service was up the whole time, all four heartbeats green, news scoring healthy
 - The pre-market eval phase short-circuits when credits are exhausted (no thread
   pool spun up, candidates left pending for next cycle / window expiry).
 
-**No paid plan (deliberate):** we stay on the 800/day free tier until the
-strategy is net-profitable. The fix makes the system **fail gracefully and
-loudly** within that budget — it stops trading but keeps scoring news so the
-eval loop still measures classifier accuracy on days we can't trade — rather
-than buying a bigger plan to paper over the leak.
+**Twelvedata Grow plan (upgraded 2026-06-25):** The system now runs on the
+Grow $29/month plan — no hard daily credit cap, 55 calls/minute (was Basic:
+800/day, 8/minute). The internal backstop (`_DAILY_CREDIT_LIMIT=50_000`,
+soft-cap 49,900) is a safety ceiling, not a budget. The 8/minute burst problem
+is fixed by a thread-safe token-bucket (`_claim_minute_token()`) that returns
+the "unavailable" sentinel rather than sending HTTP requests that would 429.
+
+**Session no-quote blackout (v17.1, 2026-06-24):** A separate class of
+permanent-retry loop was found: tickers with zero Finnhub/Twelvedata coverage
+(e.g. EGGF, OXAC on 2026-06-24) were parked in the retry queue every cycle for
+hours — each re-fetch consuming credits and log noise. After 2 failed retries
+(`_NO_QUOTE_BLACKOUT_RETRIES`) a ticker is added to `_no_quote_blackout` and
+suppressed for the rest of the session. Strikes reset on service restart (next
+day). This is distinct from the 24h per-ticker cooldown (`main.py::COOLDOWN_HOURS`),
+which tracks tickers we *traded*, not tickers we couldn't price.
 
 ---
 
@@ -401,7 +411,8 @@ than buying a bigger plan to paper over the leak.
 |---|---|
 | Finnhub quote down | 3 retries (1s/2s/4s); position monitor falls back to Twelvedata bar close |
 | Twelvedata down | 3 retries (1.5s/3s/6s + 429-aware) RTH; `fast=` no-retry inside the time-boxed pre-market eval; signal parked in the **retry queue** (5-min TTL) — previously "will retry next cycle" was a lie because the freshness filter dropped the aged article (SPCX, Jun 12) |
-| Twelvedata credit budget exhausted | **v17: hard gate** — `credits_exhausted()` short-circuits every call *before* HTTP once past the 780 soft cap (was: cosmetic 80% WARNING that let the 18s-429 storm run). System stops trading (no bar data = no confirmation = fail-closed) but keeps scoring news; logged once/day + `system_events` row (2026-06-23 nine-session drought) |
+| Twelvedata daily backstop hit | **v17: hard gate** — `credits_exhausted()` short-circuits every call *before* HTTP once past 49,900 (Grow plan: soft cap 50,000 − 100 headroom; was Basic: 780 = 800 − 20). System stops trading (no bar data = no confirmation = fail-closed) but keeps scoring news; logged once/day + `system_events` row. Backstop is a safety ceiling — the Grow plan has no hard daily cap. |
+| Twelvedata per-minute limit | **v17.1: token bucket** — `_claim_minute_token()` blocks the call and returns `None` if the 55-call/minute budget is spent (was Basic: 8/min burst caused systematic 429 storms at market open with 35 pre-market candidates). No HTTP, no backoff. |
 | Claude outage / overload (529/500/network) | typed-exception handled: fail-closed (no scores → no trades) + short cooldown (`_CLAUDE_OUTAGE_COOLDOWN_SECONDS`, 120s) so we don't hammer a struggling API; auto-resumes; `system_events` row (`claude_outage`) |
 | Claude out-of-credits / billing (403 `billing_error`) or auth (401) | does **not** self-heal — CRITICAL log + long cooldown (`_CLAUDE_BILLING_COOLDOWN_SECONDS`, 30 min) + `system_events` (`claude_billing_error`/`claude_auth_error`) so the journal shows what actually broke |
 | Both feeds down with open position | TP/SL skipped that cycle; time stop still fires (needs no price) |

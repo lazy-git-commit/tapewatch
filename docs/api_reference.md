@@ -208,14 +208,16 @@ GET https://finnhub.io/api/v1/quote?symbol=AAPL&token=<FINNHUBIO_API_KEY>
 
 **Base URL:** `https://api.twelvedata.com`
 **Auth:** `apikey=<TWELVEDATA_API_KEY>` query parameter
-**Plan:** Basic (800 credits/day — 1 credit per symbol per call)
+**Plan:** Grow $29/month — no daily credit cap, 55 calls/minute
 **Used by:** `market/twelvedata_bars.py`
 
 ### Purpose
 
 Provides near-real-time 1-minute intraday bars for the momentum baseline, and 1-day bars for volume statistics. Replaces yfinance, which served stale bars on high-volume days (VECO root cause: bar from 09:56 returned at 11:42, giving a false +1.20% momentum signal).
 
-**Credit budget:** At ~50 price checks/day (2 calls per check: 1-min + 1-day), usage is ~100 credits/day — well within the 800/day Basic limit.
+**Rate limiting:** The Grow plan allows 55 calls/minute. `market/twelvedata_bars.py` enforces this via a thread-safe token-bucket (`_claim_minute_token()`), which returns `None` rather than sending a burst that triggers 429s. The internal daily backstop (`_DAILY_CREDIT_LIMIT=50_000`, soft-cap 49,900) is a safety ceiling only — the Grow plan has no hard daily cap.
+
+**Per-minute burst risk:** At market open the pre-market evaluator fans out ~35 candidates × ~4 TD calls in parallel. At 55 calls/minute this is safe; the old Basic plan's 8/minute ceiling caused systematic 429 storms at 09:30 ET on every session with a large pre-market watchlist (root cause of the 2026-06-24 zero-trade post-mortem).
 
 ---
 
@@ -283,10 +285,12 @@ GET https://api.twelvedata.com/time_series
 ### Retry policy
 
 Both calls use the same retry logic in `market/twelvedata_bars.py`:
-- 3 attempts
+- 3 attempts (1 attempt when `fast=True` — used inside the time-boxed pre-market eval)
 - Exponential backoff: 1.5s, 3s, 6s
 - Retries on `Timeout`, `ConnectionError`, HTTP 5xx, and HTTP 429 (rate limit)
 - Does NOT retry HTTP 4xx (bad symbol, auth failure — won't self-heal)
+
+Two hard gates run **before** any HTTP call: `credits_exhausted()` (daily backstop) and `_claim_minute_token()` (per-minute bucket). Either returning `False`/empty causes the function to return its "unavailable" sentinel immediately — no HTTP request, no backoff timer.
 
 ---
 

@@ -159,3 +159,36 @@ FROM heartbeat WHERE job = 'news_cycle';
 |---|---|---|
 | `job` | TEXT PK | Job name: `news_cycle`, `monitor`, `premarket_scan`, `forward_returns`. |
 | `last_beat_at` | TEXT | ISO 8601 timestamp (London time) of the job's last successful start. |
+
+---
+
+## `system_events` (v17)
+
+Degradation and outage markers. The heartbeat catches a *dead* process, but the
+2026-06-11–23 nine-session drought had green heartbeats the whole time — the
+process was alive and silently degraded. This table records the events that make
+a degraded-but-up system visible.
+
+One row per `(event_type, event_day)`, de-duped atomically by a UNIQUE index +
+`ON CONFLICT DO NOTHING` (safe under the 8-worker pre-market thread pool).
+
+Written by `storage/database.py::record_system_event()`, which derives severity
+automatically from `event_type`.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | SERIAL PK | Auto-incrementing primary key. |
+| `event_type` | TEXT | Machine-readable event key. Critical: `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`, `zero_trade_session`. Warning: `claude_outage`. |
+| `severity` | TEXT | `"critical"` or `"warning"`. |
+| `detail` | TEXT | Human-readable context (e.g. credits used at exhaustion, drought session count). |
+| `created_at` | TIMESTAMPTZ | When the event was first recorded. |
+| `event_day` | DATE | Calendar date the event belongs to (used in the UNIQUE constraint with `event_type`). |
+
+Grafana alert query (fires on any critical event today):
+
+```sql
+SELECT event_type, detail, created_at FROM system_events
+WHERE severity = 'critical'
+  AND (created_at::timestamptz AT TIME ZONE 'Europe/London')::date =
+      (NOW() AT TIME ZONE 'Europe/London')::date;
+```
