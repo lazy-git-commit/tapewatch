@@ -688,21 +688,30 @@ def get_volume_stats(
         today_bar = values[0]
         today_bar_time = _parse_bar_time(today_bar)
         today_et = datetime.now(_ET).date()
-        if today_bar_time is None or today_bar_time.astimezone(_ET).date() != today_et:
+        today_rolled = (
+            today_bar_time is not None
+            and today_bar_time.astimezone(_ET).date() == today_et
+        )
+
+        # prior_bars and prev_close are derived from COMPLETED sessions and are
+        # valid regardless of whether today's bar has appeared yet. Only
+        # today_volume / RVOL require today's bar to have rolled.
+        if today_rolled:
+            prior_bars = values[1:]
+            today_volume: int | None = int(float(today_bar.get("volume", 0)))
+        else:
             logger.warning(
                 "Twelvedata daily bar for %s has not rolled to today yet "
                 "(latest=%s, expected=%s) — volume/RVOL unavailable",
                 symbol, today_bar.get("datetime", "?"), today_et,
             )
-            return None, None, None, None
+            prior_bars = values  # bar[0] is yesterday — still valid for ADV+prev_close
+            today_volume = None
 
-        today_volume = int(float(today_bar.get("volume", 0)))
-
-        prior_bars = values[1:]  # up to 20 prior trading days
         prior_volumes = [int(float(b.get("volume", 0))) for b in prior_bars if b.get("volume")]
         avg_daily_volume = int(sum(prior_volumes) / len(prior_volumes)) if prior_volumes else 0
 
-        # Previous close = close of the most recent COMPLETED session (bar[1]).
+        # Previous close = close of the most recent COMPLETED session.
         prev_close = float(prior_bars[0].get("close", 0)) or None
 
         # ADV-based dollar volume — normal liquidity, not spike-day liquidity.
@@ -712,7 +721,7 @@ def get_volume_stats(
         )
 
         logger.debug(
-            "Twelvedata volume [%s]: today=%d avg20d=%d adv$=%.0f prev_close=%s",
+            "Twelvedata volume [%s]: today=%s avg20d=%d adv$=%.0f prev_close=%s",
             symbol, today_volume, avg_daily_volume,
             avg_dollar_volume or 0, prev_close,
         )

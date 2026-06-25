@@ -756,7 +756,11 @@ class TestTwelvedataVolumeStats:
         return {"datetime": dt, "close": str(close), "volume": str(volume)}
 
     @patch("market.twelvedata_bars._get_time_series")
-    def test_daily_bar_must_be_today_for_rvol(self, mock_ts):
+    def test_daily_bar_not_rolled_returns_none_today_volume_but_valid_prev_close(self, mock_ts):
+        # When today's daily bar hasn't appeared yet (common at 09:30 ET), we
+        # must still return prev_close and ADV — those come from completed
+        # sessions and are required for the dead_cat and extended_move gates.
+        # Only today_volume (needed for RVOL) is unavailable.
         import pytz
         import market.twelvedata_bars as td
         now_et = datetime.now(pytz.timezone("America/New_York"))
@@ -766,7 +770,11 @@ class TestTwelvedataVolumeStats:
             self._daily_bar(yesterday, close=10, volume=5000),
             self._daily_bar(before, close=9, volume=1000),
         ]
-        assert td.get_volume_stats("AAPL") == (None, None, None, None)
+        today_vol, avg_vol, adv_dollars, prev_close = td.get_volume_stats("AAPL")
+        assert today_vol is None                          # bar not rolled — RVOL unavailable
+        assert avg_vol == pytest.approx(3000)             # avg of both prior bars: (5000+1000)/2
+        assert adv_dollars == pytest.approx(30_000)       # 3000 avg * close=10
+        assert prev_close == pytest.approx(10)            # most recent completed close
 
     @patch("market.twelvedata_bars._get_time_series")
     def test_date_only_daily_bar_parses(self, mock_ts):

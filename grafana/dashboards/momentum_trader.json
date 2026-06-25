@@ -625,20 +625,35 @@
         "defaults": {},
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "avg_15m_pct" },
+            "matcher": {
+              "id": "byName",
+              "options": "avg_15m_pct"
+            },
             "properties": [
               {
                 "id": "thresholds",
                 "value": {
                   "mode": "absolute",
                   "steps": [
-                    { "color": "red", "value": null },
-                    { "color": "yellow", "value": 0 },
-                    { "color": "green", "value": 1 }
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0
+                    },
+                    {
+                      "color": "green",
+                      "value": 1
+                    }
                   ]
                 }
               },
-              { "id": "custom.displayMode", "value": "color-background" }
+              {
+                "id": "custom.displayMode",
+                "value": "color-background"
+              }
             ]
           }
         ]
@@ -655,7 +670,7 @@
       "id": 17,
       "title": "Magnitude Gate Funnel (sentiment_scores, last 7 days)",
       "type": "table",
-      "description": "Shows how many signals the magnitude gate is filtering. All fetcher-gate drops (confidence, catalyst type, already_moved, magnitude) are visible here via sentiment_scores — which stores every Claude classification before any gate is applied.",
+      "description": "Shows how many signals the magnitude gate is filtering. All fetcher-gate drops (confidence, catalyst type, already_moved, magnitude) are visible here via sentiment_scores \u2014 which stores every Claude classification before any gate is applied.",
       "gridPos": {
         "x": 12,
         "y": 45,
@@ -677,6 +692,70 @@
           "rawSql": "SELECT catalyst_magnitude AS mag, sentiment, COUNT(*) AS n FROM sentiment_scores WHERE scored_at >= TO_CHAR(NOW() - INTERVAL '7 days', 'YYYY-MM-DD') AND catalyst_magnitude IS NOT NULL GROUP BY catalyst_magnitude, sentiment ORDER BY catalyst_magnitude DESC, sentiment",
           "format": "table",
           "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "System Events (degradation alerts)",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 24,
+        "h": 7
+      },
+      "datasource": "${DS_POSTGRES}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "datasource": "${DS_POSTGRES}",
+          "format": "table",
+          "group": [],
+          "metricColumn": "none",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  event_day,\n  event_type,\n  severity,\n  detail,\n  created_at\nFROM system_events\nORDER BY created_at DESC\nLIMIT 50",
+          "refId": "A",
+          "select": [
+            [
+              {
+                "params": [
+                  "id"
+                ],
+                "type": "column"
+              }
+            ]
+          ],
+          "table": "system_events",
+          "timeColumn": "created_at",
+          "where": []
         }
       ]
     }

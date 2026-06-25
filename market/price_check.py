@@ -460,15 +460,16 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         )
         base["day_change_pct"] = day_change_pct
 
-        # FAIL-CLOSED on missing volume data. Without it we have neither the
-        # liquidity gate (avg_dollar_volume) nor the participation gate (RVOL) —
-        # the two checks that keep us out of untradeable / unconfirmed names.
-        # Trading on momentum + VWAP alone here would be the worst kind of
-        # silent fail-open: a Twelvedata volume outage would relax risk exactly
-        # when data is least reliable. Quant standard: no confirmation = no
-        # trade. Returning None (not a reject) means "couldn't evaluate" — the
-        # signal is parked in main.py's retry queue and re-tried next cycle.
-        if today_volume is None or avg_daily_volume is None or avg_dollar_volume is None:
+        # FAIL-CLOSED if ADV data is missing entirely: without avg_dollar_volume
+        # we cannot run the liquidity gate, and without avg_daily_volume we
+        # cannot run RVOL — both are non-negotiable risk controls.
+        # today_volume may be None when Twelvedata's daily bar hasn't rolled yet
+        # at the open (first ~5 min). That is a TRANSIENT condition: prev_close
+        # and avg_daily_volume come from prior completed bars and are still
+        # valid. We defer RVOL and today_volume-based gates until the bar rolls,
+        # but allow the remaining gates (dead_cat, extended_move, illiquid,
+        # momentum, VWAP) to proceed with the data we do have.
+        if avg_daily_volume is None or avg_dollar_volume is None:
             logger.warning(
                 "Price check [%s]: volume/liquidity data unavailable — cannot run "
                 "liquidity or RVOL gates; deferring (will retry)",
@@ -476,8 +477,17 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             )
             return None
 
-        current_volume = today_volume
-        rvol = compute_rvol(current_volume, avg_daily_volume or 0, minutes_since_open)
+        if today_volume is None:
+            logger.warning(
+                "Price check [%s]: today's volume bar not yet available — "
+                "RVOL gate deferred; continuing with dead_cat/extended_move/liquidity checks",
+                symbol,
+            )
+            current_volume = 0
+            rvol = 0.0
+        else:
+            current_volume = today_volume
+            rvol = compute_rvol(current_volume, avg_daily_volume or 0, minutes_since_open)
 
         base.update(
             current_volume=current_volume,
@@ -543,9 +553,11 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             )
 
         # ── 9. RVOL band ─────────────────────────────────────────────────────
-        # Skip when we have no average volume to normalize against (RVOL would
-        # be meaningless either way) — the liquidity filter above still applies.
-        if avg_daily_volume and avg_daily_volume > 0:
+        # Skip when today_volume is unavailable (daily bar hasn't rolled at the
+        # very open) or when avg_daily_volume is zero (RVOL meaningless). The
+        # liquidity filter (step 6) still applied — this is a participation
+        # check, not a liquidity check.
+        if today_volume is not None and avg_daily_volume and avg_daily_volume > 0:
             if rvol < cfg.min_rvol:
                 return _reject(
                     base, "low_volume",
