@@ -7,6 +7,34 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v17.3 — 2026-06-25 (prev-close available before daily bar rolls at 09:30 ET)
+
+`get_volume_stats()` was returning `(None, None, None, None)` whenever
+Twelvedata's daily bar hadn't rolled to today yet — a transient 5-minute
+window at the start of every session. `prev_close` and `avg_daily_volume`
+come from prior completed sessions (`values[1..]`) so they are always valid.
+Only `today_volume` (required for RVOL) genuinely needs today's bar.
+
+Root cause of the 10-session zero-trade drought (2026-06-11 to 2026-06-25):
+every pre-market candidate hit "prev close unavailable — retrying" for the
+full 31-minute evaluation window and expired without ever being evaluated.
+
+Changes:
+- `market/twelvedata_bars.py`: when today's bar hasn't appeared, use
+  `values[0..]` (which is yesterday's completed bar) as `prior_bars` and
+  return `(None, avg_daily_volume, avg_dollar_volume, prev_close)` instead
+  of `(None, None, None, None)`.
+- `market/price_check.py`: split the fail-closed guard — hard fail only on
+  missing ADV/liquidity data; when `today_volume is None` log a warning and
+  skip the RVOL gates but continue with dead_cat / extended_move / illiquid /
+  momentum / VWAP. RVOL gate now guarded by `today_volume is not None`.
+- `grafana/dashboards/momentum_trader.json`: added **System Events** panel
+  showing the `system_events` table — critical events (zero_trade_session,
+  twelvedata_credits_exhausted) were invisible in Grafana before this.
+- Tests: `TestTwelvedataVolumeStats` updated to assert the new contract.
+
+---
+
 ## v17.2 — 2026-06-25 (Twelvedata Grow plan — raise rate limits)
 
 Upgraded from Twelvedata Basic (800 credits/day, 8 calls/minute) to Grow
