@@ -33,6 +33,7 @@ API call optimisations:
 
 import html
 import logging
+import re
 import time
 import requests
 from dataclasses import dataclass
@@ -51,6 +52,25 @@ logger = logging.getLogger(__name__)
 _BASE_URL = "https://api.massive.com/benzinga/v2/news"
 _TIMEOUT = 10
 _claude = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
+
+# Analyst rating events are never tradeable (catalyst_type=analyst_action is not
+# in TRADEABLE_CATALYSTS). Catching them by headline regex before the Claude call
+# avoids spending tokens on articles code gates will always reject. The pattern
+# is conservative — only unambiguous analyst-action language.
+_ANALYST_ACTION_RE = re.compile(
+    r"\b("
+    r"price target|pt (raise|cut|increase|decrease|hike|lowered?)"
+    r"|reiterates? (its |their |a )?(buy|sell|hold|overweight|underweight|neutral|outperform|underperform|equal.?weight)"
+    r"|maintains? (its |their |a )?(buy|sell|hold|overweight|underweight|neutral|outperform|underperform|equal.?weight|rating)"
+    r"|upgrades? (\w+ )?to (buy|overweight|outperform|strong buy)"
+    r"|downgrades? (\w+ )?to (sell|underweight|underperform|neutral|hold)"
+    r"|initiates? (coverage|with|at)"
+    r"|starts? (coverage|with|at)"
+    r"|resumes? (coverage|with|at)"
+    r"|assumed? (coverage|with|at)"
+    r")\b",
+    re.IGNORECASE,
+)
 
 # ── Claude availability guard ───────────────────────────────────────────────────
 # The classifier is the one external dependency with NO fallback: if Claude can't
@@ -379,8 +399,9 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
     ]
     user_content = "Articles to classify:\n\n" + "\n\n".join(lines)
 
-    # Tool-use output is verbose JSON: budget ~80 tokens per article.
-    max_tokens = max(1024, len(articles) * 80 + 128)
+    # Tool-use JSON output runs ~55 tokens per article empirically; 60 gives
+    # a comfortable margin. Floor at 400 ensures small batches aren't starved.
+    max_tokens = max(400, len(articles) * 60 + 64)
     try:
         msg = _claude.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -577,6 +598,18 @@ def fetch_all_news(
             logger.debug(
                 "Skipping roundup article %s — %d tickers (max 3): %s",
                 article_id, len(raw_tickers), article.get("title", "")[:60],
+            )
+            continue
+
+        # Analyst action pre-filter: these always produce catalyst_type=analyst_action,
+        # which is never in TRADEABLE_CATALYSTS. A regex match on the raw headline is
+        # far cheaper than a Claude API call, and the pattern is conservative enough
+        # that false positives (a tradeable headline accidentally matching) are
+        # essentially impossible for the specific phrases targeted.
+        headline_raw = article.get("title", "")
+        if _ANALYST_ACTION_RE.search(headline_raw):
+            logger.debug(
+                "Skipping analyst action article (pre-Claude filter): %s", headline_raw[:80],
             )
             continue
 

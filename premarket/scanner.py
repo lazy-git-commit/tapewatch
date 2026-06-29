@@ -84,6 +84,13 @@ _EVAL_MAX_WORKERS = 8
 # 60s news-cycle interval so the scanner always completes a full pass per minute.
 _EVAL_CYCLE_BUDGET_SECONDS = 30.0
 
+# Per-candidate strike counter for consecutive no-data cycles.
+# After this many consecutive conf=None returns the ticker has no
+# Finnhub/Twelvedata coverage — expire it rather than retrying for 30 min.
+# The threshold absorbs 1-2 transient token-bucket misses (those resolve fast).
+_no_quote_strikes: dict[int, int] = {}
+_NO_QUOTE_EXPIRE_AFTER = 3
+
 
 def _now_et() -> datetime:
     return datetime.now(_ET)
@@ -216,19 +223,52 @@ def _apply_confirmation(
     ticker = cand["ticker"]
 
     if conf is None:
-        # Data outage — leave pending and retry next cycle.
-        logger.info("Pre-market eval [%s]: price data unavailable — retrying next cycle", ticker)
+        # Track consecutive no-data cycles. After _NO_QUOTE_EXPIRE_AFTER strikes
+        # the ticker has no Finnhub/Twelvedata coverage — expire it immediately
+        # rather than burning API credits for the full 30-min eval window.
+        # Token-bucket exhaustion also produces conf=None but resolves within
+        # 1-2 cycles; the threshold absorbs those transient misses.
+        strikes = _no_quote_strikes.get(cand_id, 0) + 1
+        _no_quote_strikes[cand_id] = strikes
+        if strikes >= _NO_QUOTE_EXPIRE_AFTER:
+            _no_quote_strikes.pop(cand_id, None)
+            update_premarket_candidate(
+                cand_id, "expired",
+                f"no_coverage: no quote after {_NO_QUOTE_EXPIRE_AFTER} consecutive retries",
+            )
+            logger.info(
+                "Pre-market eval [%s]: no quote after %d retries — expiring "
+                "(not covered by Finnhub/Twelvedata)",
+                ticker, _NO_QUOTE_EXPIRE_AFTER,
+            )
+            return None
+        logger.info(
+            "Pre-market eval [%s]: price data unavailable (attempt %d/%d) — retrying next cycle",
+            ticker, strikes, _NO_QUOTE_EXPIRE_AFTER,
+        )
         return None
+
+    # Any successful price check resets the strike counter.
+    _no_quote_strikes.pop(cand_id, None)
+
+    # ── Opening-block guard: must come BEFORE gap_pct ─────────────────────────
+    # The opening block early-returns from confirm_price_signal before prev_close
+    # is computed, so conf.day_change_pct=None on all opening_block cycles.
+    # Checking gap_pct first would misattribute every opening_block cycle as
+    # "prev close unavailable" — observed 2026-06-29: all 40 candidates mis-logged
+    # for the first 5 minutes after the open, including liquid names like AMGN/PFE.
+    if not conf.is_confirmed and conf.reason_code == "opening_block":
+        logger.debug(
+            "Pre-market eval [%s]: opening block active — re-evaluating after it lifts",
+            ticker,
+        )
+        return None  # stays pending
 
     # ── Gap gate: vs previous close, gap included ────────────────────────────
     gap_pct = conf.day_change_pct
     if gap_pct is None:
-        # A missing previous close at the open is a TRANSIENT data condition,
-        # not a verdict on the candidate (Finnhub returns pc=0 in the first
-        # minutes; the Twelvedata daily bar can lag too). Treat it like
-        # opening_block / data-unavailable: stay pending and retry next cycle
-        # within the 30-min window. Before 2026-06-16 this was a terminal
-        # rejection that killed every real catalyst (OTLK +27%, SPCB +18%).
+        # Genuine prev-close miss (both Finnhub pc=0 and Twelvedata daily bar
+        # unavailable). Transient at open; resolved once TD's daily bar rolls.
         logger.info(
             "Pre-market eval [%s]: prev close unavailable — retrying next cycle", ticker
         )
@@ -248,21 +288,9 @@ def _apply_confirmation(
 
     # ── Standard confirmation: post-open follow-through required ──────────────
     if not conf.is_confirmed:
-        # The opening block is NOT a verdict on the candidate — it is a
-        # deterministic timing gate that lifts at open+5min. The news cycle runs
-        # every minute from 09:30, so without this exception every candidate
-        # would be permanently rejected on the 09:30/09:31 cycles before it
-        # could ever be legitimately evaluated.
-        if conf.reason_code == "opening_block":
-            logger.debug(
-                "Pre-market eval [%s]: opening block active — re-evaluating after it lifts",
-                ticker,
-            )
-            return None  # stays pending
-        # All other rejections are final: re-evaluating every cycle for 30 min
-        # would cost up to ~60 Twelvedata credits per candidate, and a candidate
-        # that fails momentum/volume confirmation at its post-block evaluation is
-        # gap-and-crap, not gap-and-go.
+        # opening_block already handled above; all remaining rejections are final.
+        # Re-evaluating every cycle for 30 min would cost ~60 Twelvedata credits
+        # per candidate, and a candidate that fails post-block is gap-and-crap.
         update_premarket_candidate(cand_id, "rejected", f"{conf.reason_code}: {conf.reason}")
         return None
 
