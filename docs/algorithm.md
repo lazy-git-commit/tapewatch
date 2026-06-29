@@ -101,6 +101,7 @@ trades, forward returns on all classified articles, and costed replay.
 | Blocklist | `BLOCKLIST` env tickers dropped | Manual permanent exclusions |
 | Dedup | `(article_id, ticker)` already in DB | Never re-score the same pair |
 | Roundup | >3 tickers tagged → skip | Market digests have no per-stock catalyst (v11) |
+| Analyst action | headline matches `_ANALYST_ACTION_RE` → skip | `analyst_action` is never in `TRADEABLE_CATALYSTS`. A regex on the raw headline is far cheaper than a Claude call. Catches "reiterates buy", "price target", "upgrades to overweight", "initiates coverage" etc. Added v17.4. |
 
 ### 3.2 Claude classification
 
@@ -402,6 +403,25 @@ hours — each re-fetch consuming credits and log noise. After 2 failed retries
 suppressed for the rest of the session. Strikes reset on service restart (next
 day). This is distinct from the 24h per-ticker cooldown (`main.py::COOLDOWN_HOURS`),
 which tracks tickers we *traded*, not tickers we couldn't price.
+
+**Premarket no-coverage expiry (v17.4, 2026-06-29):** The RTH no-quote
+blackout had no counterpart in the pre-market evaluator. Tickers with zero
+Finnhub/Twelvedata coverage retried every minute for the full 30-min eval
+window — ~600–900 wasted API calls per session. A per-candidate strike counter
+(`_no_quote_strikes`, module-level dict) in `_apply_confirmation()` now expires
+a candidate after `_NO_QUOTE_EXPIRE_AFTER=3` consecutive `conf=None` returns
+rather than letting it exhaust the window. The threshold absorbs 1–2 transient
+token-bucket misses (those resolve within one cycle).
+
+**Opening-block log misattribution (v17.4, 2026-06-29):** The opening-block
+rejection (`reason_code="opening_block"`) returns from `confirm_price_signal()`
+before `prev_close` is computed, so `conf.day_change_pct=None` on all
+opening-block cycles. `_apply_confirmation()` was checking `gap_pct is None`
+BEFORE `reason_code == "opening_block"`, so every covered stock logged "prev
+close unavailable" for the first 5 minutes after the open — observed 2026-06-29:
+all 40 candidates mis-logged even for liquid names like AMGN/PFE. Behavior was
+correct (candidates stayed pending), but the log message was misleading. Fixed
+by moving the opening_block guard above the `gap_pct is None` check.
 
 ---
 

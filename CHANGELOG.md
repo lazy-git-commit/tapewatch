@@ -7,6 +7,46 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v17.4 — 2026-06-29 (premarket no-coverage expiry + opening-block log fix + Claude cost cuts + Grafana fixes)
+
+### Premarket no-coverage expiry (`premarket/scanner.py`)
+Uncoverable tickers (no Finnhub/Twelvedata quote) were retrying every minute for
+the full 30-min eval window — ~600–900 wasted API calls per session. A per-candidate
+strike counter (`_no_quote_strikes`) now expires candidates after 3 consecutive
+`conf=None` returns. Threshold absorbs 1–2 transient token-bucket misses.
+
+### Opening-block log misattribution fix (`premarket/scanner.py`)
+`_apply_confirmation()` checked `gap_pct is None` BEFORE `reason_code == "opening_block"`.
+The opening block returns before `prev_close` is computed, so `conf.day_change_pct=None`
+on all opening-block cycles — every covered stock logged "prev close unavailable" for
+the first 5 minutes after the open (observed 2026-06-29: all 40 candidates including
+AMGN, PFE). Behavior was correct; logging was wrong. Reordered the checks.
+
+### Pre-Claude analyst action filter + tighter max_tokens (`news/fetcher.py`)
+Analyst rating events (price target, upgrades, downgrades, coverage initiations) are
+never tradeable (`analyst_action` not in `TRADEABLE_CATALYSTS`) but previously consumed
+Claude tokens before being rejected at Gate 2. A conservative `_ANALYST_ACTION_RE` regex
+drops them before the API call, saving ~15–25% of Claude output tokens/day. Also tightened
+`max_tokens` from `articles × 80 + 128` to `articles × 60 + 64` (empirical output is
+~55 tokens/article; old formula over-budgeted ~45%).
+
+### Grafana fixes (`grafana/dashboards/momentum_trader.json`)
+- Panels 12, 13, 17: replaced `TO_CHAR(NOW(), 'YYYY-MM-DD')` date filters with proper
+  `::timestamptz` casts — the old pattern used UTC midnight as a cutoff while timestamps
+  are stored in London time, causing panels to go blank or miss data during BST.
+- Panel 18 (System Events): fixed datasource from broken `"${DS_POSTGRES}"` variable
+  reference to the consistent `{"type":"postgres","uid":"trader-postgres"}` used by all
+  other panels. Panel 18 would silently fail on a clean provisioned Grafana install.
+- New panel 19: Pre-market Scan Heartbeat — the `premarket_scan` job writes heartbeats
+  but was invisible in Grafana; added alongside the existing news_cycle/monitor panels.
+
+### Docs updated
+- `docs/algorithm.md`: §3.1 analyst-action pre-filter, §7 no-coverage expiry + log fix.
+- `docs/api_reference.md`: updated max_tokens formula; removed stale DEMO_PORTFOLIO_VALUE claim.
+- `docs/database_schema.md`: added `catalyst_magnitude` to news_signals table; clarified what gets saved vs dropped.
+
+---
+
 ## v17.3 — 2026-06-25 (prev-close available before daily bar rolls at 09:30 ET)
 
 `get_volume_stats()` was returning `(None, None, None, None)` whenever

@@ -387,7 +387,7 @@
       "title": "Today Realised P&L (kill switch at -2%)",
       "type": "stat",
       "gridPos": {
-        "x": 8,
+        "x": 12,
         "y": 26,
         "w": 4,
         "h": 4
@@ -442,7 +442,7 @@
       "title": "Trades Today (cap 10)",
       "type": "stat",
       "gridPos": {
-        "x": 12,
+        "x": 16,
         "y": 26,
         "w": 4,
         "h": 4
@@ -496,9 +496,9 @@
       "title": "Rejection Funnel (last 7 days)",
       "type": "table",
       "gridPos": {
-        "x": 16,
+        "x": 20,
         "y": 26,
-        "w": 8,
+        "w": 4,
         "h": 8
       },
       "datasource": {
@@ -513,7 +513,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT rejection_code, COUNT(*) AS signals FROM news_signals WHERE created_at >= TO_CHAR(NOW() - INTERVAL '7 days', 'YYYY-MM-DD') AND rejection_code IS NOT NULL GROUP BY rejection_code ORDER BY signals DESC",
+          "rawSql": "SELECT rejection_code, COUNT(*) AS signals FROM news_signals WHERE created_at::timestamptz >= NOW() - INTERVAL '7 days' AND rejection_code IS NOT NULL GROUP BY rejection_code ORDER BY signals DESC",
           "format": "table",
           "refId": "A"
         }
@@ -541,7 +541,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ticker, catalyst_type, catalyst_magnitude AS mag, ROUND(confidence::numeric, 2) AS conf, status, eval_note, headline FROM premarket_candidates WHERE created_at LIKE TO_CHAR(NOW(), 'YYYY-MM-DD') || '%' ORDER BY confidence DESC",
+          "rawSql": "SELECT ticker, catalyst_type, catalyst_magnitude AS mag, ROUND(confidence::numeric, 2) AS conf, status, eval_note, headline FROM premarket_candidates WHERE (created_at::timestamptz AT TIME ZONE 'Europe/London')::date = (NOW() AT TIME ZONE 'Europe/London')::date ORDER BY confidence DESC",
           "format": "table",
           "refId": "A"
         }
@@ -689,7 +689,62 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT catalyst_magnitude AS mag, sentiment, COUNT(*) AS n FROM sentiment_scores WHERE scored_at >= TO_CHAR(NOW() - INTERVAL '7 days', 'YYYY-MM-DD') AND catalyst_magnitude IS NOT NULL GROUP BY catalyst_magnitude, sentiment ORDER BY catalyst_magnitude DESC, sentiment",
+          "rawSql": "SELECT catalyst_magnitude AS mag, sentiment, COUNT(*) AS n FROM sentiment_scores WHERE scored_at::timestamptz >= NOW() - INTERVAL '7 days' AND catalyst_magnitude IS NOT NULL GROUP BY catalyst_magnitude, sentiment ORDER BY catalyst_magnitude DESC, sentiment",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "Pre-market Scan Heartbeat (min ago)",
+      "type": "stat",
+      "gridPos": {
+        "x": 8,
+        "y": 26,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 3
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(EXTRACT(EPOCH FROM (NOW() - last_beat_at::timestamptz)) / 60) AS minutes_stale FROM heartbeat WHERE job = 'premarket_scan'",
           "format": "table",
           "refId": "A"
         }
@@ -705,7 +760,10 @@
         "w": 24,
         "h": 7
       },
-      "datasource": "${DS_POSTGRES}",
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -736,26 +794,14 @@
       },
       "targets": [
         {
-          "datasource": "${DS_POSTGRES}",
+          "datasource": {
+            "type": "postgres",
+            "uid": "trader-postgres"
+          },
           "format": "table",
-          "group": [],
-          "metricColumn": "none",
           "rawQuery": true,
           "rawSql": "SELECT\n  event_day,\n  event_type,\n  severity,\n  detail,\n  created_at\nFROM system_events\nORDER BY created_at DESC\nLIMIT 50",
-          "refId": "A",
-          "select": [
-            [
-              {
-                "params": [
-                  "id"
-                ],
-                "type": "column"
-              }
-            ]
-          ],
-          "table": "system_events",
-          "timeColumn": "created_at",
-          "where": []
+          "refId": "A"
         }
       ]
     }

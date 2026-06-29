@@ -102,7 +102,7 @@ Three v14 design choices (see `news/fetcher.py` for the full implementation):
 client = anthropic.Anthropic()
 msg = client.messages.create(
     model="claude-haiku-4-5-20251001",
-    max_tokens=max(1024, len(articles) * 80 + 128),
+    max_tokens=max(400, len(articles) * 60 + 64),  # ~55 tokens/article empirically
     temperature=0,
     system=[{"type": "text", "text": RUBRIC, "cache_control": {"type": "ephemeral"}}],
     messages=[{"role": "user", "content": articles_text}],
@@ -371,7 +371,7 @@ Authorization: Basic <base64(KEY_ID:KEY)>
 
 ### Endpoint: GET `/equity/account/cash`
 
-**Purpose:** Fetch account total value and available cash for position sizing (live mode only; demo mode uses `DEMO_PORTFOLIO_VALUE` from `.env`).
+**Purpose:** Fetch account total value and available cash for position sizing. Called in both demo and live mode against the appropriate base URL (T212's demo API has its own paper account balance).
 
 **Request:**
 ```

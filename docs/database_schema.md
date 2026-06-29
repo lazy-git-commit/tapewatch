@@ -8,12 +8,13 @@ PostgreSQL database: `momentum_trader`
 
 One row per news article-ticker pair that the system evaluated. An article mentioning three tickers produces three rows.
 
-Articles pass through three pre-filters before reaching Claude or the DB:
+Articles pass through pre-filters before reaching Claude or the DB:
 1. **Freshness** — must be published within 60 seconds of the fetch time.
 2. **Crypto filter** — tickers prefixed `X:` (e.g. `X:BTCUSD`) are stripped; not equities.
 3. **Roundup filter** — articles tagging more than 3 tickers are skipped; these are market digests, not single-stock catalysts.
+4. **Analyst action filter** — headlines matching price-target, upgrade/downgrade, or coverage-initiation patterns are dropped before the Claude call (added v17.4).
 
-Only articles that pass all three filters, are classified `"positive"` by Claude, and proceed through the price check are saved here. Articles dropped by a pre-filter or classified neutral/negative are silently discarded before any DB write.
+Articles that pass all pre-filters and are classified `"positive"` by Claude are saved here — **including ones that fail the subsequent price check** (those land with `acted_on=0` and a `rejection_code`). Neutral/negative classifications go to `sentiment_scores` only. Articles dropped by a pre-filter are never written to any table.
 
 | Column | Type | Description |
 |---|---|---|
@@ -28,6 +29,7 @@ Only articles that pass all three filters, are classified `"positive"` by Claude
 | `rejection_reason` | TEXT | Human-readable explanation of why the signal was not traded (e.g. `"Insufficient recent momentum: +0.12% over last 15 min"`). NULL if the signal led to a trade. |
 | `rejection_code` | TEXT | Short keyword for the rejection reason: `low_momentum`, `high_momentum`, `low_volume`, `high_volume`, `below_vwap`, `dead_cat`, `extended_move`, `wide_spread`, `no_price_data`, `buy_failed`, `illiquid`, `opening_block`, or `penny_stock`. NULL if the signal led to a trade (`acted_on = 1`). |
 | `catalyst_type` | TEXT | Claude's catalyst classification (e.g. `earnings_beat`, `fda_approval`, `ma_target`). See `news/fetcher.py::CATALYST_TYPES` for the full taxonomy. |
+| `catalyst_magnitude` | INTEGER | Relative-to-market-cap impact score 1–5 (5=transformative, 1=noise). Added v15.8. Used in Gate 4 (`MIN_CATALYST_MAGNITUDE`). |
 | `published_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when Benzinga published the article. |
 | `fetched_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when our news cycle fetched this article from the API. The gap between `published_at` and `fetched_at` shows detection latency. |
 | `created_at` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when this row was inserted. |
