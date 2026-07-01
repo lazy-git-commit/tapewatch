@@ -33,8 +33,11 @@ What we do instead (the professional version):
   3. Candidates that survive are returned to main.py, which executes them
      through the exact same risk gates and buy path as regular-hours signals.
 
-Candidates expire at open+_EVAL_WINDOW_MINUTES (gap-and-go is a first-half-
-hour trade) and at the end of the day they were created.
+Candidates expire at open+_EVAL_WINDOW_MINUTES and at the end of the day
+they were created. 45 min covers the full gap-and-go window: candidates
+added late in pre-market (09:20–09:29 ET) clear the opening block at 09:35
+but then compete with RTH news_cycle for Twelvedata token-bucket credits,
+so 30 min was not enough to guarantee evaluation for all of them.
 """
 
 import logging
@@ -63,7 +66,7 @@ _LONDON = pytz.timezone("Europe/London")
 # Candidates are only evaluated during the first N minutes after the open.
 # Past that, the gap-and-go edge is gone — late entries on morning news are
 # exactly the "buying the top" failure v13 eliminated intraday.
-_EVAL_WINDOW_MINUTES = 30
+_EVAL_WINDOW_MINUTES = 45
 
 # Pre-market articles can be up to this old when scanned. The scanner runs
 # every minute, so 5 min gives comfortable overlap without re-scoring stale
@@ -78,7 +81,7 @@ _SCAN_MAX_AGE_MINUTES = 5.0
 # bounded thread pool + the fast (no-retry) quote path, one slow/dead ticker can
 # no longer starve the rest: they all resolve in parallel within the budget, and
 # anything that doesn't simply stays pending for next cycle (~60s away, still
-# inside the 30-min window). See docs/algorithm.md §7 "Known failure mode".
+# inside the eval window). See docs/algorithm.md §7 "Known failure mode".
 _EVAL_MAX_WORKERS = 8
 # Hard wall-clock ceiling for the parallel confirm phase. Comfortably under the
 # 60s news-cycle interval so the scanner always completes a full pass per minute.
@@ -86,7 +89,7 @@ _EVAL_CYCLE_BUDGET_SECONDS = 30.0
 
 # Per-candidate strike counter for consecutive no-data cycles.
 # After this many consecutive conf=None returns the ticker has no
-# Finnhub/Twelvedata coverage — expire it rather than retrying for 30 min.
+# Finnhub/Twelvedata coverage — expire it rather than retrying all window.
 # The threshold absorbs 1-2 transient token-bucket misses (those resolve fast).
 _no_quote_strikes: dict[int, int] = {}
 _NO_QUOTE_EXPIRE_AFTER = 3
@@ -177,7 +180,7 @@ def _minutes_since_open() -> float:
 def _live_candidates(pending: list[dict], minutes_open: float) -> list[dict]:
     """
     Sequential, NO-I/O pre-pass: expire candidates that are stale (created on a
-    prior day) or whose 30-min eval window has closed, and return the ones still
+    prior day) or whose eval window has closed, and return the ones still
     worth price-checking. Runs before the (parallel, I/O-bound) confirm phase so
     we never spend a quote/credit on a candidate that's already expired.
     """
@@ -217,7 +220,7 @@ def _apply_confirmation(
 
     Returning None with NO status write means "stay pending, retry next cycle"
     (data outage, missing prev close, or opening block still active) — all
-    transient conditions bounded by the 30-min window expiry in _live_candidates.
+    transient conditions bounded by the eval window expiry in _live_candidates.
     """
     cand_id = cand["id"]
     ticker = cand["ticker"]
@@ -225,7 +228,7 @@ def _apply_confirmation(
     if conf is None:
         # Track consecutive no-data cycles. After _NO_QUOTE_EXPIRE_AFTER strikes
         # the ticker has no Finnhub/Twelvedata coverage — expire it immediately
-        # rather than burning API credits for the full 30-min eval window.
+        # rather than burning API credits for the full eval window.
         # Token-bucket exhaustion also produces conf=None but resolves within
         # 1-2 cycles; the threshold absorbs those transient misses.
         strikes = _no_quote_strikes.get(cand_id, 0) + 1
@@ -289,7 +292,7 @@ def _apply_confirmation(
     # ── Standard confirmation: post-open follow-through required ──────────────
     if not conf.is_confirmed:
         # opening_block already handled above; all remaining rejections are final.
-        # Re-evaluating every cycle for 30 min would cost ~60 Twelvedata credits
+        # Re-evaluating every cycle for 45 min would cost ~90 Twelvedata credits
         # per candidate, and a candidate that fails post-block is gap-and-crap.
         update_premarket_candidate(cand_id, "rejected", f"{conf.reason_code}: {conf.reason}")
         return None
@@ -312,7 +315,7 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
     no-retry quote path) under a hard wall-clock budget, so one slow or
     unpriceable ticker can never starve the window — the failure that produced
     the 2026-06-18 zero-trades day. Anything not resolved within the budget
-    stays pending for the next cycle (~60s away, still inside the 30-min window).
+    stays pending for the next cycle (~60s away, still inside the eval window).
 
     Every candidate's outcome is recorded on its row (status + eval_note) so the
     watchlist is fully auditable after the fact.
@@ -324,7 +327,7 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
     # Budget guard: if Twelvedata credits are spent, every confirm_price_signal
     # would return None anyway (the bar calls short-circuit). Don't spin up the
     # thread pool or write any verdict — leave candidates pending so they're
-    # re-evaluated for free next cycle (within their 30-min window) or expire via
+    # re-evaluated for free next cycle (within their eval window) or expire via
     # _live_candidates. Trading is suspended for the day; news scoring continues.
     if credits_exhausted():
         logger.warning(

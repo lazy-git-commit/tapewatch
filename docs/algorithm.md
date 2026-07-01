@@ -68,7 +68,7 @@ trades, forward returns on all classified articles, and costed replay.
 ┌──────────┐  closed +  ├────────────────────────────────────────────┤
 │ Scheduler ├─premarket→│ premarket_scan → watchlist (DB)            │
 └──────────┘  window    │                                            │
-      │       market    │ 1. evaluate_premarket_candidates (≤30 min  │
+      │       market    │ 1. evaluate_premarket_candidates (≤45 min  │
       │       open  ──→ │    after open: gap gate + confirmation)    │
       │                 │ 2. retry queue (transient data failures)   │
       │                 │ 3. fetch_all_news → Claude → trade gates   │
@@ -329,7 +329,7 @@ the entire gap with zero confirmation ("gap-and-crap"). Instead:
 1. **Scan** (from 08:00 ET): score pre-market news with the same classifier
    and the same trade gates; survivors go to the `premarket_candidates`
    watchlist.
-2. **Confirm at the open** (after the 5-min opening block, within 30 min of
+2. **Confirm at the open** (after the 5-min opening block, within 45 min of
    the open):
    - **Gap gate**: current price vs prev close must be within
      [`MIN_GAP_PCT`=1%, `MAX_GAP_PCT`=20%]. Below: the market doesn't believe
@@ -337,7 +337,7 @@ the entire gap with zero confirmation ("gap-and-crap"). Instead:
    - **Full standard confirmation** (§4): post-open momentum and RVOL must
      show buyers following through *after* the auction.
 3. Survivors execute through the **same risk gates and buy path** as RTH
-   signals. Candidates expire at open+30min or end of day, every outcome
+   signals. Candidates expire at open+45min or end of day, every outcome
    recorded on the row (`status`, `eval_note`).
 
 **Known failure mode — data-storm starvation of the eval window (2026-06-18).**
@@ -406,8 +406,8 @@ which tracks tickers we *traded*, not tickers we couldn't price.
 
 **Premarket no-coverage expiry (v17.4, 2026-06-29):** The RTH no-quote
 blackout had no counterpart in the pre-market evaluator. Tickers with zero
-Finnhub/Twelvedata coverage retried every minute for the full 30-min eval
-window — ~600–900 wasted API calls per session. A per-candidate strike counter
+Finnhub/Twelvedata coverage retried every minute for the full eval window
+— ~600–900 wasted API calls per session. A per-candidate strike counter
 (`_no_quote_strikes`, module-level dict) in `_apply_confirmation()` now expires
 a candidate after `_NO_QUOTE_EXPIRE_AFTER=3` consecutive `conf=None` returns
 rather than letting it exhaust the window. The threshold absorbs 1–2 transient
@@ -422,6 +422,23 @@ close unavailable" for the first 5 minutes after the open — observed 2026-06-2
 all 40 candidates mis-logged even for liquid names like AMGN/PFE. Behavior was
 correct (candidates stayed pending), but the log message was misleading. Fixed
 by moving the opening_block guard above the `gap_pct is None` check.
+
+**Premarket eval window extended 30→45 min (v17.5, 2026-06-30):** Empirical
+analysis of 2026-06-30 (33 candidates) showed 12 expired via "eval window closed"
+despite having Twelvedata coverage. Root cause: candidates added between 09:20–09:29
+ET clear the opening block at 09:35 but then compete with RTH news_cycle for 55
+Twelvedata tokens/minute. A 30-min window gave those candidates only 25 min of
+real evaluation time. Extended `_EVAL_WINDOW_MINUTES` from 30 to 45; candidates
+now have until 10:15 ET which comfortably covers the gap-and-go edge window while
+staying well before the midday regime change.
+
+**Empirical ruling on `partnership` as TRADEABLE_CATALYST (2026-06-30):** Forward
+returns from 60-day history (233 positive partnership signals, `already_moved=0`)
+show avg_5m = +0.010%, median = 0.000%, only 3 of 233 moved >1% in 5 minutes. The
+`partnership` catalyst class correctly remains excluded from `TRADEABLE_CATALYSTS`;
+the magnitude gate (`MIN_CATALYST_MAGNITUDE`) alone is insufficient because high-
+magnitude partnerships (e.g. a major NVIDIA AI tie-up) are rare exceptions whereas
+most partnership news produces no intraday price action at all.
 
 ---
 
