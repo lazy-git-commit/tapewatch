@@ -34,10 +34,7 @@ What we do instead (the professional version):
      through the exact same risk gates and buy path as regular-hours signals.
 
 Candidates expire at open+_EVAL_WINDOW_MINUTES and at the end of the day
-they were created. 45 min covers the full gap-and-go window: candidates
-added late in pre-market (09:20–09:29 ET) clear the opening block at 09:35
-but then compete with RTH news_cycle for Twelvedata token-bucket credits,
-so 30 min was not enough to guarantee evaluation for all of them.
+they were created.
 """
 
 import logging
@@ -66,7 +63,7 @@ _LONDON = pytz.timezone("Europe/London")
 # Candidates are only evaluated during the first N minutes after the open.
 # Past that, the gap-and-go edge is gone — late entries on morning news are
 # exactly the "buying the top" failure v13 eliminated intraday.
-_EVAL_WINDOW_MINUTES = 45
+_EVAL_WINDOW_MINUTES = 30
 
 # Pre-market articles can be up to this old when scanned. The scanner runs
 # every minute, so 5 min gives comfortable overlap without re-scoring stale
@@ -87,12 +84,22 @@ _EVAL_MAX_WORKERS = 8
 # 60s news-cycle interval so the scanner always completes a full pass per minute.
 _EVAL_CYCLE_BUDGET_SECONDS = 30.0
 
-# Per-candidate strike counter for consecutive no-data cycles.
+# Per-candidate strike counter for consecutive no-data cycles (conf=None).
 # After this many consecutive conf=None returns the ticker has no
 # Finnhub/Twelvedata coverage — expire it rather than retrying all window.
 # The threshold absorbs 1-2 transient token-bucket misses (those resolve fast).
 _no_quote_strikes: dict[int, int] = {}
 _NO_QUOTE_EXPIRE_AFTER = 3
+
+# Per-candidate strike counter for consecutive prev-close-unavailable cycles.
+# Finnhub returns pc=0 for some tickers; Twelvedata's daily bar can take 1-2
+# minutes to roll at 09:30 ET. Both produce gap_pct=None. Without a bound,
+# a candidate retries silently for the full 30-min window and expires as
+# "eval window closed" — indistinguishable in the log from a genuine timeout.
+# After _GAP_PCT_EXPIRE_AFTER strikes, expire with an explicit reason instead.
+# 5 cycles = 5 minutes; genuine transient cases (TD bar delay) resolve in 1-2.
+_gap_pct_strikes: dict[int, int] = {}
+_GAP_PCT_EXPIRE_AFTER = 5
 
 
 def _now_et() -> datetime:
@@ -270,12 +277,34 @@ def _apply_confirmation(
     # ── Gap gate: vs previous close, gap included ────────────────────────────
     gap_pct = conf.day_change_pct
     if gap_pct is None:
-        # Genuine prev-close miss (both Finnhub pc=0 and Twelvedata daily bar
-        # unavailable). Transient at open; resolved once TD's daily bar rolls.
+        # Finnhub returns pc=0 for some tickers; Twelvedata's daily bar can
+        # take 1-2 minutes to roll at open. Both produce gap_pct=None. Bounded
+        # by _GAP_PCT_EXPIRE_AFTER so the candidate doesn't retry silently for
+        # the full 30-min window (observed 2026-06-30: 12 candidates expired
+        # as "eval window closed" solely because of persistent gap_pct=None).
+        strikes = _gap_pct_strikes.get(cand_id, 0) + 1
+        _gap_pct_strikes[cand_id] = strikes
+        if strikes >= _GAP_PCT_EXPIRE_AFTER:
+            _gap_pct_strikes.pop(cand_id, None)
+            update_premarket_candidate(
+                cand_id, "expired",
+                f"prev_close: no previous close after {_GAP_PCT_EXPIRE_AFTER} consecutive retries",
+            )
+            logger.info(
+                "Pre-market eval [%s]: prev close unavailable after %d retries — expiring "
+                "(Finnhub pc=0 and Twelvedata daily bar not yet available)",
+                ticker, _GAP_PCT_EXPIRE_AFTER,
+            )
+            return None
         logger.info(
-            "Pre-market eval [%s]: prev close unavailable — retrying next cycle", ticker
+            "Pre-market eval [%s]: prev close unavailable (attempt %d/%d) — retrying next cycle",
+            ticker, strikes, _GAP_PCT_EXPIRE_AFTER,
         )
         return None
+
+    # Successful prev-close retrieval resets the strike counter.
+    _gap_pct_strikes.pop(cand_id, None)
+
     if gap_pct < cfg.min_gap_pct:
         update_premarket_candidate(
             cand_id, "rejected",
@@ -292,7 +321,7 @@ def _apply_confirmation(
     # ── Standard confirmation: post-open follow-through required ──────────────
     if not conf.is_confirmed:
         # opening_block already handled above; all remaining rejections are final.
-        # Re-evaluating every cycle for 45 min would cost ~90 Twelvedata credits
+        # Re-evaluating every cycle for 30 min would cost ~60 Twelvedata credits
         # per candidate, and a candidate that fails post-block is gap-and-crap.
         update_premarket_candidate(cand_id, "rejected", f"{conf.reason_code}: {conf.reason}")
         return None

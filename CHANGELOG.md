@@ -7,22 +7,29 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
-## v17.5 — 2026-06-30 (premarket eval window 30→45 min)
+## v17.5 — 2026-06-30 (premarket prev-close strike counter)
 
-### Premarket eval window extended (`premarket/scanner.py`)
-`_EVAL_WINDOW_MINUTES` raised from 30 to 45. Empirical finding from 2026-06-30
-post-mortem: 12 of 33 premarket candidates expired as "eval window closed" despite
-having Twelvedata coverage. Root cause: candidates added between 09:20–09:29 ET
-clear the opening block at 09:35 but then compete with RTH news_cycle for 55
-Twelvedata tokens/minute, leaving only 25 minutes of actual evaluation time. The
-45-minute window gives those candidates until 10:15 ET, comfortably covering the
-gap-and-go momentum edge without reaching the midday regime change.
+### Premarket prev-close strike counter (`premarket/scanner.py`)
+Post-mortem of 2026-06-30 (33 candidates, 12 expired as "eval window closed"):
+root cause was `gap_pct=None` having no retry bound. When Finnhub returns `pc=0`
+and Twelvedata's daily bar hasn't rolled at 09:30 yet, every evaluation cycle
+returns `gap_pct=None` and the candidate retries silently until the 30-min window
+closes. Added `_gap_pct_strikes` dict + `_GAP_PCT_EXPIRE_AFTER=5`: after 5
+consecutive `gap_pct=None` cycles a candidate expires as `"prev_close: no previous
+close after 5 consecutive retries"` rather than as the uninformative "eval window
+closed." The eval window stays at 30 min — with both strike counters active, all
+candidates should resolve within 10 minutes of the opening block lifting, well
+within the gap-and-go momentum window. (A prior commit in this session had
+incorrectly extended the window to 45 min — that was a symptom fix, not a root fix.)
+
+Note: `news_cycle` already runs `evaluate_premarket_candidates()` before fetching
+RTH news within the same sequential job — there is no cross-job token contention,
+and no scheduling change is needed.
 
 ### Algorithm docs: `partnership` empirically ruled out as TRADEABLE_CATALYST
 60-day forward-return analysis (233 positive partnership signals, `already_moved=0`):
 avg_5m = +0.010%, median = 0.000%, only 3 of 233 moved >1% in 5 minutes. The
-catalyst class correctly remains excluded; it was initially considered as a candidate
-expansion but the data confirms the current exclusion is correct.
+catalyst class correctly remains excluded.
 
 ---
 
