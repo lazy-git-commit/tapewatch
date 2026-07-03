@@ -46,7 +46,10 @@ import yfinance as yf
 
 _ET = pytz.timezone("America/New_York")
 
-from storage.database import get_scores_missing_returns, update_forward_returns
+from storage.database import (
+    get_scores_missing_returns, update_forward_returns,
+    reset_contaminated_forward_returns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,18 +95,88 @@ def _forward_return(bars: pd.DataFrame, ts: datetime, minutes: int) -> float | N
     return (p1 - p0) / p0 * 100
 
 
-def compute_forward_returns(batch_limit: int = 500) -> int:
+def _bars_and_anchor(
+    symbol: str, published: datetime
+) -> tuple[pd.DataFrame | None, datetime | None]:
+    """
+    Return (session_bars, anchor_ts) for one article: the 1-min bars of the
+    session in which its forward returns should be measured, and the timestamp
+    to measure FROM.
+
+      - Published during RTH        → that session's bars, anchored at publish.
+      - Published pre-market        → that session's bars, anchored at the OPEN.
+      - Published after the close   → the NEXT session's bars, anchored at its
+                                      open (scans up to 4 calendar days ahead to
+                                      cross weekends/holidays).
+
+    The clamp-to-open is the critical part: yfinance serves RTH bars only, so
+    measuring a 07:30 ET article "from publish time" resolves BOTH endpoints of
+    the return window to the same 09:30 bar and records an exact 0.0. Before
+    this fix that silently zeroed ~39% of the table — precisely the pre-market
+    earnings/FDA/M&A block the strategy most needs to measure.
+    """
+    for offset in range(0, 4):
+        day = published.astimezone(_ET).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) + timedelta(days=offset)
+        bars = _get_intraday_bars(symbol, day)
+        if bars is None or bars.empty:
+            continue
+        if bars.index[-1] <= published:
+            # Article published at/after this session's last bar (after-hours)
+            # — its tradeable reaction is the NEXT session.
+            continue
+        anchor = max(published, bars.index[0])
+        return bars, anchor
+    return None, None
+
+
+def compute_forward_returns(batch_limit: int = 500, max_batches: int = 25) -> int:
     """
     Fill forward returns for all scored articles that don't have them yet.
     Returns the number of rows updated. Articles whose price data isn't
     available (delisted, OTC, too recent for yfinance) are marked computed
     with NULL returns so they aren't retried forever.
-    """
-    rows = get_scores_missing_returns(limit=batch_limit)
-    if not rows:
-        logger.info("Forward returns: nothing to compute")
-        return 0
 
+    Runs in batches until the backlog is drained (up to max_batches). A single
+    500-row pass was structurally insufficient: ~1,000 articles are scored per
+    day, so the backlog grew ~500 rows/day and new rows were computed ever
+    later — eventually only after they had aged past yfinance's ~30-day 1-min
+    history window, at which point every return came back NULL. (Observed
+    2026-07-03: 8,000-row backlog, 58% of the table uncomputed.)
+    """
+    # One-time repair of rows poisoned by the pre-fix anchoring bug (exact-zero
+    # returns on out-of-session articles). Self-limiting: it only touches rows
+    # computed before the fix's deploy date, and recomputed rows get a fresh
+    # returns_computed_at that no longer matches.
+    try:
+        n_reset = reset_contaminated_forward_returns()
+        if n_reset:
+            logger.warning(
+                "Forward returns: reset %d rows contaminated by the pre-fix "
+                "anchoring bug (exact-zero returns) — recomputing with open-anchoring",
+                n_reset,
+            )
+    except Exception as exc:
+        logger.error("Forward returns: contamination repair failed: %s", exc)
+
+    total_updated = 0
+    for _ in range(max_batches):
+        rows = get_scores_missing_returns(limit=batch_limit)
+        if not rows:
+            break
+        batch_updated = _compute_batch(rows)
+        total_updated += batch_updated
+        if batch_updated == 0:
+            # Everything left is <65 min old (still maturing) — stop for tonight.
+            break
+    if total_updated == 0:
+        logger.info("Forward returns: nothing to compute")
+    return total_updated
+
+
+def _compute_batch(rows: list[dict]) -> int:
+    """Process one batch of pending rows; returns the number updated."""
     updated = 0
     for row in rows:
         symbol = str(row["ticker"]).split("_")[0]  # AAPL_US_EQ → AAPL
@@ -123,18 +196,15 @@ def compute_forward_returns(batch_limit: int = 500) -> int:
         if (datetime.now(timezone.utc) - published).total_seconds() < 65 * 60:
             continue
 
-        # Use the ET calendar date — NYSE bars are indexed on the ET session,
-        # so an article at 20:15 UTC (15:15 ET) must fetch the ET date's bars.
-        et_date = published.astimezone(_ET).replace(hour=0, minute=0, second=0, microsecond=0)
-        bars = _get_intraday_bars(symbol, et_date)
-        if bars is None:
+        bars, anchor = _bars_and_anchor(symbol, published)
+        if bars is None or anchor is None:
             update_forward_returns(row["id"], None, None, None)
             updated += 1
             continue
 
-        r5 = _forward_return(bars, published, 5)
-        r15 = _forward_return(bars, published, 15)
-        r60 = _forward_return(bars, published, 60)
+        r5 = _forward_return(bars, anchor, 5)
+        r15 = _forward_return(bars, anchor, 15)
+        r60 = _forward_return(bars, anchor, 60)
         update_forward_returns(row["id"], r5, r15, r60)
         updated += 1
 

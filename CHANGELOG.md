@@ -7,6 +7,73 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v18 — 2026-07-03 (eval-loop integrity + execution/capture fixes)
+
+Full-code + production-data audit prompted by the ongoing zero-trade run
+(no trades since 2026-06-10). Verdict: the entry gates were mostly making
+locally-correct calls, but three structural defects were (a) silently
+destroying the strategy's ability to MEASURE its own edge and (b) leaking
+confirmed signals at the capture and execution layers.
+
+### Forward-return anchoring bug (`analysis/forward_returns.py`) — CRITICAL
+Articles published outside RTH had both endpoints of every return window
+resolve to the same first 09:30 bar (yfinance serves RTH bars only), so the
+job recorded an EXACT 0.0 for 5/15/60-min returns. 2,241 of 5,721 computed
+rows (39%) were poisoned — and the damage concentrates on the pre-market
+earnings/FDA/M&A block, the strategy's highest-edge window. Every calibration
+decision made from this table (incl. the v17.5 partnership ruling, whose
+`median = 0.000%` is this bug's fingerprint) needs re-validation.
+Fix: `_bars_and_anchor()` clamps the measurement anchor to the session open
+for pre-market articles and rolls after-hours articles to the NEXT session's
+open (up to 4 calendar days, crossing weekends). A one-time, self-limiting
+repair (`reset_contaminated_forward_returns()`) nulls the poisoned rows so
+the nightly job recomputes them; rows older than yfinance's ~30-day 1-min
+history resolve to NULL and stop participating.
+
+### Forward-return backlog death spiral (`analysis/forward_returns.py`)
+The nightly job processed max 500 rows (oldest-first) while ~1,000 articles
+are scored per day — the backlog grew ~500 rows/day (8,000 rows / 58% of the
+table uncomputed by 2026-07-03), and new rows were computed ever later,
+heading for permanent NULL once past yfinance's 30-day window.
+Fix: the job now loops in 500-row batches (up to 25/night) until the backlog
+is drained, stopping early when only still-maturing (<65 min old) rows remain.
+
+### Precision-retry hardening (`trading/executor.py`)
+The `quantity-precision-mismatch` retry parsed the allowed precision as
+`detail.split()[-1]` — any wording variation aborted the retry — and used
+`round()`, which can round UP past the cash/ADV budget just computed.
+Production lost 6 fully-confirmed entries to this failure class
+(RCAT/ONDS/CELZ/VOYG/VERU/BCDA, 2026-05-28→06-05); all-time, 17 of 25
+approved signals died at `buy_failed` vs 8 executed. Fix: the allowed
+precision is now the last integer anywhere in the detail (fallback: whole
+shares), and the quantity is FLOORED to it, never rounded up.
+
+### News-capture leak (`news/fetcher.py`, `main.py`)
+The RTH freshness cutoff (1 min) silently and permanently dropped every
+article the Benzinga feed indexed >60s after its publish timestamp, and every
+article that landed while a news cycle overran its 60s interval (buy fills
+block the cycle up to 30s polling for fill data). These articles were never
+scored, never recorded — invisible loss of exactly the fast-breaking
+catalysts the strategy targets. Fix: freshness widened to 3 min with a
+session-scoped scored-article dedup set, so Claude still scores each article
+exactly once (a failed Claude batch leaves its articles eligible for retry).
+RTH Benzinga lookback widened 2 → 5 min to match. The price-confirmation
+gates remain the arbiter of whether a 2-3-min-old move is still live.
+
+### Audit findings recorded, no action yet (needs clean eval data)
+- Clean RTH-only forward returns (n≈100/class) show unconditioned positive
+  news is NEGATIVE-EV intraday at our latency (avg60 −0.2%…−1.6% across all
+  catalyst classes) — do NOT loosen catalyst/confidence gates on volume
+  grounds; the edge, if present, is premarket/at-open + confirmation.
+- Claude confidence shows NO positive monotonic relationship with forward
+  returns on clean data (0.8+ bucket performs worst). Re-examine the
+  confidence gate once the recomputed table has a few weeks of clean data.
+- Realized stops average −2.6% (ex-GOAI) on a −2% trigger: ~0.5-1% of poll
+  latency + fees. Structural to polled stops on T212; acceptable while
+  position sizes are small, revisit if sizing grows.
+
+---
+
 ## v17.5 — 2026-06-30 (premarket prev-close strike counter)
 
 ### Premarket prev-close strike counter (`premarket/scanner.py`)

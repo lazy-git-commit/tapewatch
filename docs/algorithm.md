@@ -97,9 +97,10 @@ trades, forward returns on all classified articles, and costed replay.
 | Filter | Rule | Why |
 |---|---|---|
 | Crypto | `X:`-prefixed tickers stripped | Not equities; Finnhub/T212 can't trade them |
-| Freshness | older than 60s dropped (RTH) | We poll every 60s; older news was seen or missed. Acting late buys reversals (GOOG re-index incident, v8) |
+| Freshness | older than 3 min dropped (RTH; was 60s pre-v18) | The old 60s cutoff permanently lost every article the Benzinga feed indexed >60s after its publish timestamp, and every article landing while a cycle overran 60s (buy fills block up to 30s). 3 min captures those; the momentum/RVOL/VWAP gates decide whether the move is still live. Acting late still buys reversals — that judgement now lives in the price gates, not the fetch cutoff |
 | Blocklist | `BLOCKLIST` env tickers dropped | Manual permanent exclusions |
 | Dedup | `(article_id, ticker)` already in DB | Never re-score the same pair |
+| Scored-once | `_scored_articles` session set (v18) | With the 3-min freshness window an article appears in ~3 consecutive fetches; this guarantees exactly one Claude scoring per article per session (failed batches stay eligible for retry) |
 | Roundup | >3 tickers tagged → skip | Market digests have no per-stock catalyst (v11) |
 | Analyst action | headline matches `_ANALYST_ACTION_RE` → skip | `analyst_action` is never in `TRADEABLE_CATALYSTS`. A regex on the raw headline is far cheaper than a Claude call. Catches "reiterates buy", "price target", "upgrades to overweight", "initiates coverage" etc. Added v17.4. |
 
@@ -505,6 +506,18 @@ loudly.
 Every Claude classification is stored; nightly at 22:30 UTC the job fills in
 what the market actually did 5/15/60 minutes after each article (yfinance —
 retrospective, so delay is irrelevant and no Twelvedata credits are spent).
+
+**Anchoring (v18):** returns are measured from `max(publish_time, session
+open)`. yfinance serves RTH bars only, so measuring a pre-market article "from
+publish time" resolves both window endpoints to the same 09:30 bar and records
+an exact 0.0 — this poisoned 39% of the table before 2026-07-03, concentrated
+on the pre-market earnings/FDA/M&A block. After-hours articles roll to the
+NEXT session's open. Any historical analysis run before the v18 recompute
+(including the v17.5 partnership ruling) must be re-validated: a suspicious
+`median = 0.000` is this bug's fingerprint. The job drains its FULL backlog
+nightly (batched, up to 12,500 rows) — the old single 500-row pass fell
+~500 rows/day behind and was quietly heading for permanent-NULL territory
+once rows aged past yfinance's ~30-day 1-min history window.
 
 This converts prompt engineering from guesswork into measurement:
 

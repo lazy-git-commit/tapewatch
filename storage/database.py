@@ -588,6 +588,42 @@ def get_scores_missing_returns(limit: int = 500) -> list[dict]:
             return [dict(r) for r in cur.fetchall()]
 
 
+# Deploy date of the forward-return open-anchoring fix. Rows computed BEFORE
+# this date by the old publish-time anchoring recorded exact-zero returns for
+# every out-of-session article (both window endpoints resolved to the same
+# first RTH bar). returns_computed_at is ISO text, so comparing against this
+# date prefix is lexicographically correct.
+_FWD_RETURN_FIX_DEPLOYED = "2026-07-03"
+
+
+def reset_contaminated_forward_returns(cutoff: str = _FWD_RETURN_FIX_DEPLOYED) -> int:
+    """
+    One-time repair for the pre-fix anchoring bug: null out returns for rows
+    whose 5/15/60-min forward returns are ALL exactly 0.0 and were computed
+    before the fix deployed, so the nightly job recomputes them with the
+    corrected open-anchoring. Genuine all-zero rows are vanishingly rare (a
+    stock printing identical closes across all three windows) and recomputing
+    them is harmless. Self-limiting: recomputed rows carry a fresh
+    returns_computed_at past the cutoff and never match again; rows already
+    older than yfinance's ~30-day 1-min window resolve to NULL and are marked
+    computed, ending their participation.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE sentiment_scores
+                   SET fwd_return_5m = NULL, fwd_return_15m = NULL,
+                       fwd_return_60m = NULL, returns_computed_at = NULL
+                   WHERE returns_computed_at IS NOT NULL
+                     AND returns_computed_at < %s
+                     AND fwd_return_5m = 0
+                     AND fwd_return_15m = 0
+                     AND fwd_return_60m = 0""",
+                (cutoff,),
+            )
+            return cur.rowcount
+
+
 def update_forward_returns(score_id: int, r5: float | None, r15: float | None, r60: float | None) -> None:
     """Fill in the 5/15/60-min forward returns for one scored article."""
     with get_conn() as conn:

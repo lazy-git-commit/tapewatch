@@ -431,7 +431,10 @@ def news_cycle() -> None:
     # ── 3. Fresh signals from Benzinga ────────────────────────────────────────
     retry_items = _drain_retry_queue()
     try:
-        news_items = fetch_all_news(lookback_minutes=2)
+        # Lookback 5 min > the 3-min freshness window: articles the Benzinga
+        # feed indexes late (or that land while a cycle overruns) still get
+        # fetched; the fetcher's session dedup keeps Claude costs flat.
+        news_items = fetch_all_news(lookback_minutes=5)
     except Exception as exc:
         logger.error("news_cycle: fetch_all_news raised unexpectedly: %s", exc, exc_info=True)
         news_items = []

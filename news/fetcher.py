@@ -53,6 +53,35 @@ _BASE_URL = "https://api.massive.com/benzinga/v2/news"
 _TIMEOUT = 10
 _claude = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
 
+# ── Scored-article dedup (session-scoped, reset daily) ───────────────────────
+# Articles that Claude has ALREADY scored this session. This is what lets the
+# freshness window be wider than the poll cadence without re-scoring the same
+# article every cycle: is_article_seen() only covers articles that reached the
+# price-check stage (news_signals rows), so neutrals/gated positives were only
+# kept out of Claude by the 1-minute freshness cutoff. That razor-thin cutoff
+# silently dropped every article the Benzinga feed indexed >60s after its
+# publish timestamp, and every article that landed while a cycle overran its
+# 60s interval (buy fills block the cycle up to 30s) — real catalysts lost
+# with no trace. Only articles that were successfully scored are added, so a
+# failed Claude batch is naturally refetched and retried next cycle.
+_scored_articles: dict = {"date": None, "ids": set()}
+
+
+def _already_scored(article_id: str) -> bool:
+    today = datetime.now(timezone.utc).date()
+    if _scored_articles["date"] != today:
+        _scored_articles["date"] = today
+        _scored_articles["ids"] = set()
+    return article_id in _scored_articles["ids"]
+
+
+def _mark_scored(article_ids) -> None:
+    today = datetime.now(timezone.utc).date()
+    if _scored_articles["date"] != today:
+        _scored_articles["date"] = today
+        _scored_articles["ids"] = set()
+    _scored_articles["ids"].update(article_ids)
+
 # Analyst rating events are never tradeable (catalyst_type=analyst_action is not
 # in TRADEABLE_CATALYSTS). Catching them by headline regex before the Claude call
 # avoids spending tokens on articles code gates will always reject. The pattern
@@ -519,7 +548,7 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
 
 def fetch_all_news(
     lookback_minutes: int = 5,
-    max_age_minutes: float = 1.0,
+    max_age_minutes: float = 3.0,
     seen_checker: Callable[[str, str], bool] = is_article_seen,
 ) -> list[NewsItem]:
     """
@@ -529,10 +558,14 @@ def fetch_all_news(
 
     Parameters:
       lookback_minutes — Benzinga query window.
-      max_age_minutes  — drop articles older than this. RTH cycles use the
-                         default 1 min (poll cadence); the pre-market scanner
-                         passes a larger window since it accumulates a
-                         watchlist rather than trading immediately.
+      max_age_minutes  — drop articles older than this. Default 3 min: wide
+                         enough to survive Benzinga feed-indexing latency and
+                         an overrunning news cycle (both silently killed
+                         catalysts under the old 1-min cutoff), while the
+                         _scored_articles session dedup prevents re-scoring.
+                         Anything genuinely 3 min old is also still inside the
+                         momentum gates' judgement window — the price
+                         confirmation decides whether the move is still live.
       seen_checker     — dedup predicate (article_id, ticker) → bool. RTH uses
                          the news_signals table; the pre-market scanner passes
                          its own candidate-table check.
@@ -557,6 +590,11 @@ def fetch_all_news(
         if article_id in seen_ids:
             continue
         seen_ids.add(article_id)
+
+        # Already scored by Claude this session (wider freshness window means
+        # the same article appears in several consecutive fetches).
+        if _already_scored(article_id):
+            continue
 
         raw_tickers = [
             t for t in (article.get("tickers") or [])
@@ -629,6 +667,9 @@ def fetch_all_news(
         for article, _, article_id in eligible
     ]
     scores = _batch_score_sentiment(to_score)
+    # Only successfully-scored ids enter the dedup set — a failed batch (Claude
+    # outage/cooldown) leaves its articles eligible for refetch next cycle.
+    _mark_scored(scores.keys())
 
     # ── Step 2b: persist EVERY score for the eval loop ────────────────────────
     # This is the feedback loop: without recording neutrals/negatives there is

@@ -1267,3 +1267,147 @@ class TestTwelvedataCreditGuard:
         result = td._get_time_series("AAPL", "1min", 1, fast=True)
         assert result is not None
         mock_get.assert_called_once()
+
+
+# ── Forward-return anchoring (analysis/forward_returns.py) ────────────────────
+
+class TestForwardReturnAnchoring:
+    """
+    The eval-loop fix: forward returns for out-of-session articles must be
+    measured from the session OPEN, not from publish time. Pre-fix, a
+    pre-market article had both window endpoints resolve to the same first
+    RTH bar → exact 0.0 recorded for 39% of the table.
+    """
+
+    def _session_bars(self, day: str = "2026-07-01"):
+        import pandas as pd
+        # 1-min RTH session 13:30–20:00 UTC, price ramps 100 → 139 linearly
+        idx = pd.date_range(f"{day} 13:30", f"{day} 20:00", freq="1min", tz="UTC")
+        closes = [100 + i * 0.1 for i in range(len(idx))]
+        return pd.DataFrame({"Close": closes}, index=idx)
+
+    def test_premarket_article_anchors_at_open(self):
+        from analysis.forward_returns import _bars_and_anchor, _forward_return
+        bars = self._session_bars()
+        published = datetime(2026, 7, 1, 11, 0, tzinfo=timezone.utc)  # pre-market
+        with patch("analysis.forward_returns._get_intraday_bars", return_value=bars):
+            got_bars, anchor = _bars_and_anchor("ACME", published)
+        assert anchor == bars.index[0]  # clamped to the open
+        r60 = _forward_return(got_bars, anchor, 60)
+        assert r60 == pytest.approx(6.0, abs=0.1)  # 100 → 106 over 60 bars
+
+    def test_rth_article_anchors_at_publish(self):
+        from analysis.forward_returns import _bars_and_anchor
+        bars = self._session_bars()
+        published = datetime(2026, 7, 1, 15, 0, tzinfo=timezone.utc)  # mid-session
+        with patch("analysis.forward_returns._get_intraday_bars", return_value=bars):
+            _, anchor = _bars_and_anchor("ACME", published)
+        assert anchor == published
+
+    def test_after_hours_article_uses_next_session(self):
+        from analysis.forward_returns import _bars_and_anchor
+        day1 = self._session_bars("2026-07-01")
+        day2 = self._session_bars("2026-07-02")
+        published = datetime(2026, 7, 1, 21, 30, tzinfo=timezone.utc)  # after close
+
+        def fake_bars(symbol, day):
+            return {1: day1, 2: day2}.get(day.day)
+
+        with patch("analysis.forward_returns._get_intraday_bars", side_effect=fake_bars):
+            got_bars, anchor = _bars_and_anchor("ACME", published)
+        assert anchor == day2.index[0]  # next session's open
+        assert got_bars.index[0].day == 2
+
+    def test_no_data_returns_none(self):
+        from analysis.forward_returns import _bars_and_anchor
+        published = datetime(2026, 7, 1, 11, 0, tzinfo=timezone.utc)
+        with patch("analysis.forward_returns._get_intraday_bars", return_value=None):
+            bars, anchor = _bars_and_anchor("ACME", published)
+        assert bars is None and anchor is None
+
+
+# ── Precision-retry robustness (trading/executor.py) ─────────────────────────
+
+class TestPrecisionRetryRobustness:
+    """The retry must survive T212's varying detail wording and never round UP."""
+
+    def _mock_cash(self):
+        return {"total": 5000.0, "free": 5000.0, "invested": 0.0}
+
+    def _precision_error(self, detail: str) -> Exception:
+        body = (
+            f'{{"type":"/api-errors/quantity-precision-mismatch",'
+            f'"title":"Error while placing the order","status":400,'
+            f'"detail":"{detail}","traceId":"abc"}}'
+        )
+        return Exception(f"HTTP 400 - {body}")
+
+    @patch("trading.executor.get_gbp_usd_rate", return_value=1.25)
+    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._post")
+    @patch("trading.executor._get")
+    def test_verbose_detail_wording_parsed(self, mock_get, mock_post, _fill, _fx):
+        from trading.executor import buy
+        mock_get.return_value = self._mock_cash()
+        mock_post.side_effect = [
+            self._precision_error("Quantity precision mismatch. Max allowed precision: 1."),
+            {"id": "77"},
+        ]
+        result = buy("ACME_US_EQ", price=3.17)
+        assert result.success is True
+        qty = mock_post.call_args[0][1]["quantity"]
+        assert qty == round(qty, 1)
+
+    @patch("trading.executor.get_gbp_usd_rate", return_value=1.25)
+    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._post")
+    @patch("trading.executor._get")
+    def test_unparseable_detail_falls_back_to_whole_shares(self, mock_get, mock_post, _fill, _fx):
+        from trading.executor import buy
+        mock_get.return_value = self._mock_cash()
+        mock_post.side_effect = [
+            self._precision_error("quantity precision mismatch"),  # no number at all
+            {"id": "78"},
+        ]
+        result = buy("ACME_US_EQ", price=3.17)
+        assert result.success is True
+        qty = mock_post.call_args[0][1]["quantity"]
+        assert qty == int(qty)  # whole shares
+
+    @patch("trading.executor.get_gbp_usd_rate", return_value=1.25)
+    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._post")
+    @patch("trading.executor._get")
+    def test_quantity_floored_not_rounded(self, mock_get, mock_post, _fill, _fx):
+        from trading.executor import buy, calculate_quantity
+        mock_get.return_value = self._mock_cash()
+        original_qty, _ = calculate_quantity("ACME_US_EQ", 3.17)
+        mock_post.side_effect = [
+            self._precision_error("invalid quantity precision 0"),
+            {"id": "79"},
+        ]
+        result = buy("ACME_US_EQ", price=3.17)
+        assert result.success is True
+        qty = mock_post.call_args[0][1]["quantity"]
+        assert qty <= original_qty  # floored — never exceeds the sized budget
+        assert qty == int(qty)
+
+
+# ── Scored-article session dedup (news/fetcher.py) ────────────────────────────
+
+class TestScoredArticleDedup:
+    """The wider freshness window must not re-score articles through Claude."""
+
+    def test_marked_article_is_skipped(self):
+        import news.fetcher as f
+        f._scored_articles = {"date": None, "ids": set()}
+        assert f._already_scored("a1") is False
+        f._mark_scored(["a1", "a2"])
+        assert f._already_scored("a1") is True
+        assert f._already_scored("a3") is False
+
+    def test_resets_on_new_day(self):
+        import news.fetcher as f
+        from datetime import date
+        f._scored_articles = {"date": date(2020, 1, 1), "ids": {"a1"}}
+        assert f._already_scored("a1") is False  # stale day → set was reset

@@ -522,14 +522,38 @@ def buy(ticker: str, price: float, avg_dollar_volume: float | None = None) -> Or
     except Exception as exc:
         exc_str = str(exc)
         # T212 rejects orders when our quantity has more decimal places than the
-        # instrument allows. The error says "invalid quantity precision N" where N
-        # is the maximum allowed. Retry once with the correct rounding.
+        # instrument allows. The error detail carries the maximum allowed
+        # precision. Retry once with the quantity FLOORED to that precision:
+        #   - floored, not rounded — rounding half-up can exceed the cash/ADV
+        #     budget the sizing just computed (73.995 → 74 shares we can't afford);
+        #   - the allowed precision is extracted as the last integer anywhere in
+        #     the detail string rather than `detail.split()[-1]`, because T212's
+        #     wording varies ("invalid quantity precision 2" vs "…precision: 2.")
+        #     and a parse failure here used to abort the retry entirely —
+        #     production lost 6 fully-confirmed entries to this class of failure
+        #     (RCAT/ONDS/CELZ/VOYG/VERU/BCDA, 2026-05-28→06-05). If no integer is
+        #     found, fall back to whole shares (precision 0) — every instrument
+        #     accepts integer quantities.
         if "quantity-precision-mismatch" in exc_str:
             import json as _json
+            import math as _math
+            import re as _re
             try:
-                body = exc_str.split(" - ", 1)[1]
-                allowed = int(_json.loads(body)["detail"].split()[-1])
-                quantity = round(quantity, allowed)
+                allowed: int | None = None
+                try:
+                    body = exc_str.split(" - ", 1)[1]
+                    detail = str(_json.loads(body).get("detail", ""))
+                    nums = _re.findall(r"\d+", detail)
+                    if nums:
+                        allowed = int(nums[-1])
+                except Exception:
+                    allowed = None
+                if allowed is None or not (0 <= allowed <= 4):
+                    allowed = 0
+                scale = 10 ** allowed
+                # +1e-9 guards against float representation error flooring
+                # 73.46 → 73.45; quantities carry at most 4dp by construction.
+                quantity = _math.floor(quantity * scale + 1e-9) / scale
                 if quantity <= 0:
                     return OrderResult(
                         success=False, ticker=ticker, quantity=quantity,
