@@ -1411,3 +1411,43 @@ class TestScoredArticleDedup:
         from datetime import date
         f._scored_articles = {"date": date(2020, 1, 1), "ids": {"a1"}}
         assert f._already_scored("a1") is False  # stale day → set was reset
+
+
+class TestPremarketCandidateToNewsItem:
+    """
+    Regression for the 2026-06-11→07-06 zero-trade drought. catalyst_magnitude
+    became a REQUIRED NewsItem field in v15.8, but main._candidate_to_news_item
+    never supplied it, so converting an APPROVED premarket candidate raised
+    TypeError — caught in news_cycle, aborting the whole premarket exec loop.
+    Every gap-and-go entry silently died at the execution boundary for ~4 weeks.
+    """
+
+    def _row(self, **overrides):
+        row = {
+            "id": 353,
+            "article_id": "bz-123",
+            "ticker": "PIRS_US_EQ",
+            "headline": "Palvella Submits First Module Of Rolling NDA",
+            "catalyst_type": "fda_approval",
+            "confidence": 0.75,
+            "published_at": "2026-06-29T12:30:00+01:00",
+            "created_at": "2026-06-29T12:30:00+01:00",
+            "status": "pending",
+            "catalyst_magnitude": 4,
+        }
+        row.update(overrides)
+        return row
+
+    def test_converts_without_raising_and_preserves_magnitude(self):
+        import main
+        item = main._candidate_to_news_item(self._row())
+        assert item.ticker == "PIRS_US_EQ"
+        assert item.sentiment == "positive"
+        assert item.catalyst_magnitude == 4  # the field that used to be missing
+
+    def test_legacy_row_without_magnitude_defaults_to_noise(self):
+        # Rows written before v15.8 have NULL catalyst_magnitude. Conversion must
+        # still succeed (never crash the exec loop) — default to 1 (noise).
+        import main
+        item = main._candidate_to_news_item(self._row(catalyst_magnitude=None))
+        assert item.catalyst_magnitude == 1

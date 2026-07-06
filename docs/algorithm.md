@@ -441,6 +441,35 @@ cycles = 5 minutes; genuine transient cases (TD bar delay at 09:30) resolve in
 1–2 cycles. The eval window remains 30 min — with both strike counters in place,
 all candidates resolve within 10 minutes of the opening block lifting.
 
+**Premarket execution-boundary crash — the real drought root cause (v19,
+2026-07-06).** The single most costly bug in the system's history, and the actual
+reason for the 2026-06-11 → 07-06 drought (16 consecutive zero-trade sessions,
+last trade 2026-06-10). It was masked by all the *upstream* premarket fixes above:
+those genuinely improved the funnel, so candidates finally started reaching
+`APPROVED` (e.g. 2026-06-29: PIRS +8.82%, MEG +10.17%, CYBN +7.64%, ERJ +1.51% —
+clean gap-and-go setups), yet **still no trade fired.** Root cause found by tracing
+one approval through to execution: `catalyst_magnitude` became a **required**
+positional field on `NewsItem` in v15.8 (`018ae7c`), but `main._candidate_to_news_item()`
+— which reconstructs a `NewsItem` from a `premarket_candidates` row so the approved
+candidate can go through `_execute_entry` — was never updated to supply it. Every
+premarket approval therefore raised `TypeError: NewsItem.__init__() missing 1
+required positional argument: 'catalyst_magnitude'` at line 416. The exception was
+swallowed by the broad `try/except` around the premarket loop in `news_cycle`
+(logged as `ERROR __main__ — Pre-market candidate evaluation failed: ...`), which
+**aborted the entire premarket execution loop** — so the log then read the benign
+`No positive signals this cycle.` The RTH path was unaffected (it builds `NewsItem`
+in `news/fetcher.py`, which does pass the field). Two lessons: (1) a required
+dataclass field added in one place must be grep'd across *all* construction sites
+(`NewsItem(` had exactly two — the fetcher and this converter); (2) a broad
+`try/except` around an execution loop turned a hard crash into a silent no-op that
+survived four weeks and four separate "premarket zero-trade" post-mortems. Fixed
+by passing `catalyst_magnitude=int(cand.get("catalyst_magnitude") or 1)` through
+(the value is already stored on every candidate row since v15.8; the `or 1` is a
+can't-crash fallback for pre-v15.8 legacy rows). Regression test:
+`TestPremarketCandidateToNewsItem`. Verified against the deployed `NewsItem`
+contract on the VM: the old signature reproduces the exact `TypeError`, the fixed
+converter builds a valid item.
+
 **Empirical ruling on `partnership` as TRADEABLE_CATALYST (2026-06-30):** Forward
 returns from 60-day history (233 positive partnership signals, `already_moved=0`)
 show avg_5m = +0.010%, median = 0.000%, only 3 of 233 moved >1% in 5 minutes. The

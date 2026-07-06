@@ -352,6 +352,12 @@ def _candidate_to_news_item(cand: dict) -> NewsItem:
         confidence=float(cand.get("confidence") or 0.7),
         catalyst_type=cand.get("catalyst_type") or "other",
         already_moved=False,
+        # Required NewsItem field since v15.8. Omitting it raised TypeError in
+        # every premarket-approval execution (main.news_cycle caught it, aborting
+        # the whole loop) — the root cause of the 2026-06-11→07-06 zero-trade
+        # drought. Stored on the candidate row at scan time; default 1 (noise)
+        # only as a can't-crash fallback for legacy rows written before v15.8.
+        catalyst_magnitude=int(cand.get("catalyst_magnitude") or 1),
     )
 
 
