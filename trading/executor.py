@@ -16,7 +16,7 @@ import base64
 import logging
 import time
 import requests
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from config.settings import cfg
 from market.twelvedata_bars import get_gbp_usd_rate
 
@@ -302,11 +302,6 @@ def _fetch_cash() -> dict | None:
 def get_portfolio_value() -> float | None:
     data = _fetch_cash()
     return float(data["total"]) if data else None
-
-
-def get_available_cash() -> float | None:
-    data = _fetch_cash()
-    return float(data["free"]) if data else None
 
 
 def get_account_summary() -> tuple[float, float] | None:

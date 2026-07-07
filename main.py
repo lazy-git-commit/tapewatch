@@ -123,6 +123,18 @@ def _queue_retry(item: NewsItem) -> None:
         )
 
 
+def _note_price_data_ok(ticker: str) -> None:
+    """
+    Reset the no-quote strike counter after ANY successful price check.
+
+    Without this, the strikes were cumulative-per-session, not consecutive:
+    two unrelated transient data misses hours apart (e.g. a token-bucket
+    minute-limit skip at 14:00 and a Twelvedata blip at 19:00) would
+    permanently blacklist a ticker that has perfectly good coverage.
+    """
+    _no_quote_ticker_strikes.pop(ticker, None)
+
+
 def _drain_retry_queue() -> list[NewsItem]:
     """Pop all unexpired retry entries; expired ones are dropped with a log."""
     now = datetime.now(timezone.utc)
@@ -460,7 +472,7 @@ def news_cycle() -> None:
     # one line per cycle. On 2026-06-15, 25 gate-passing positives produced 0
     # trades and it took a manual DB dig to see WHY each one dropped. This
     # surfaces the leak in the logs (and is cheap — just ints).
-    funnel = {"evaluated": 0, "already_seen": 0, "cooldown": 0,
+    funnel = {"evaluated": 0, "already_seen": 0, "blackout": 0, "cooldown": 0,
               "no_price_data": 0, "rejected": 0, "opened": 0}
 
     for item in all_items:
@@ -481,7 +493,7 @@ def news_cycle() -> None:
         # Session no-quote blackout: ticker has no Finnhub/Twelvedata coverage —
         # price-check will always return None; suppress to avoid looping all day.
         if item.ticker in _no_quote_blackout:
-            funnel["already_seen"] += 1
+            funnel["blackout"] += 1
             logger.debug("Skipping %s — session no-quote blackout", item.ticker)
             continue
 
@@ -508,6 +520,9 @@ def news_cycle() -> None:
             _queue_retry(item)
             continue
 
+        # Price data answered — strikes must be CONSECUTIVE to blacklist.
+        _note_price_data_ok(item.ticker)
+
         opened = _execute_entry(item, confirmation, fetched_at)
         funnel["opened" if opened else "rejected"] += 1
 
@@ -521,10 +536,11 @@ def news_cycle() -> None:
     # One-line funnel summary whenever anything was evaluated.
     if funnel["evaluated"]:
         logger.info(
-            "Signal funnel: %d evaluated → %d seen, %d cooldown, %d no-data, "
-            "%d rejected, %d OPENED",
-            funnel["evaluated"], funnel["already_seen"], funnel["cooldown"],
-            funnel["no_price_data"], funnel["rejected"], funnel["opened"],
+            "Signal funnel: %d evaluated → %d seen, %d blackout, %d cooldown, "
+            "%d no-data, %d rejected, %d OPENED",
+            funnel["evaluated"], funnel["already_seen"], funnel["blackout"],
+            funnel["cooldown"], funnel["no_price_data"], funnel["rejected"],
+            funnel["opened"],
         )
 
     elapsed_ms = (datetime.now(pytz.timezone("Europe/London")) - cycle_start).total_seconds() * 1000

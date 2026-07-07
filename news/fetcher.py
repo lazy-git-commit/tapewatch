@@ -366,6 +366,42 @@ class NewsItem:
     catalyst_magnitude: int  # 1–5: expected move size relative to market cap
 
 
+# ── Benzinga availability tracking ───────────────────────────────────────────
+# Benzinga is the LAST external dependency with no outage marker: Twelvedata
+# exhaustion and Claude outages both emit system_events, but a dead news feed
+# (expired key, API down) produces zero signals — indistinguishable in every
+# dashboard from a quiet news day until the zero-trade tripwire fires days
+# later. After this many CONSECUTIVE failed fetches (~10 min at the 1-min
+# cadence) we emit one system_event (DB-deduped to one row/day) and shout.
+_BENZINGA_OUTAGE_THRESHOLD = 10
+_benzinga_consecutive_failures = 0
+
+
+def _note_benzinga_failure() -> None:
+    global _benzinga_consecutive_failures
+    _benzinga_consecutive_failures += 1
+    if _benzinga_consecutive_failures == _BENZINGA_OUTAGE_THRESHOLD:
+        logger.error(
+            "Benzinga feed has failed %d consecutive fetches — NO news signals "
+            "are flowing (RTH and pre-market both blind). Check the "
+            "MASSIVE_BENZINGA_API_KEY / massive.com status.",
+            _BENZINGA_OUTAGE_THRESHOLD,
+        )
+        try:
+            from storage.database import record_system_event
+            record_system_event(
+                "benzinga_outage",
+                f"{_BENZINGA_OUTAGE_THRESHOLD} consecutive failed news fetches",
+            )
+        except Exception as exc:
+            logger.debug("Could not record benzinga_outage system_event: %s", exc)
+
+
+def _note_benzinga_ok() -> None:
+    global _benzinga_consecutive_failures
+    _benzinga_consecutive_failures = 0
+
+
 def _fetch(lookback_minutes: int) -> list[dict]:
     """GET from Benzinga via massive.com and return raw article dicts."""
     since = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
@@ -386,19 +422,24 @@ def _fetch(lookback_minutes: int) -> list[dict]:
                 "Benzinga API HTTP %d — %s",
                 resp.status_code, resp.text[:200],
             )
+            _note_benzinga_failure()
             return []
         data = resp.json()
         articles = data.get("results", data.get("articles", []))
         logger.debug("Benzinga: fetched %d raw articles (lookback=%d min)", len(articles), lookback_minutes)
+        _note_benzinga_ok()
         return articles
     except requests.exceptions.Timeout:
         logger.warning("Benzinga API timeout after %ds — skipping cycle", _TIMEOUT)
+        _note_benzinga_failure()
         return []
     except requests.RequestException as exc:
         logger.warning("Benzinga API request failed: %s", exc)
+        _note_benzinga_failure()
         return []
     except Exception as exc:
         logger.error("Benzinga API unexpected error: %s", exc, exc_info=True)
+        _note_benzinga_failure()
         return []
 
 
@@ -616,6 +657,17 @@ def fetch_all_news(
         except (ValueError, AttributeError):
             pass
 
+        # Roundup filter: >3 tickers = market digest, no per-stock catalyst.
+        # Checked BEFORE the per-ticker dedup below — it only needs the raw
+        # tag count, and skipping first saves a DB round-trip per ticker on
+        # every digest article.
+        if len(raw_tickers) > 3:
+            logger.debug(
+                "Skipping roundup article %s — %d tickers (max 3): %s",
+                article_id, len(raw_tickers), article.get("title", "")[:60],
+            )
+            continue
+
         # Build T212 tickers and filter blocklist + already-seen pairs.
         # resolve_t212_ticker returns None for non-US/foreign listings — those
         # are dropped here (the `t212 is not None` guard must come first, before
@@ -629,14 +681,6 @@ def fetch_all_news(
             and not seen_checker(article_id, t212)
         ]
         if not eligible_tickers:
-            continue
-
-        # Roundup filter: >3 tickers = market digest, no per-stock catalyst.
-        if len(raw_tickers) > 3:
-            logger.debug(
-                "Skipping roundup article %s — %d tickers (max 3): %s",
-                article_id, len(raw_tickers), article.get("title", "")[:60],
-            )
             continue
 
         # Analyst action pre-filter: these always produce catalyst_type=analyst_action,

@@ -102,6 +102,15 @@ _gap_pct_strikes: dict[int, int] = {}
 _GAP_PCT_EXPIRE_AFTER = 5
 
 
+def _clear_strikes(cand_id: int) -> None:
+    """Drop both per-candidate strike counters once a candidate reaches ANY
+    terminal status (traded/rejected/expired/approved). Entries left behind
+    by candidates that expired via _live_candidates (or were rejected before
+    striking out) otherwise accumulate for the life of the process."""
+    _no_quote_strikes.pop(cand_id, None)
+    _gap_pct_strikes.pop(cand_id, None)
+
+
 def _now_et() -> datetime:
     return datetime.now(_ET)
 
@@ -205,12 +214,14 @@ def _live_candidates(pending: list[dict], minutes_open: float) -> list[dict]:
             created_day = None
         if created_day != today_london:
             update_premarket_candidate(cand["id"], "expired", f"stale: created {created_day}")
+            _clear_strikes(cand["id"])
             continue
         if minutes_open > _EVAL_WINDOW_MINUTES:
             update_premarket_candidate(
                 cand["id"], "expired",
                 f"eval window closed ({minutes_open:.0f} min after open)",
             )
+            _clear_strikes(cand["id"])
             continue
         live.append(cand)
     return live
@@ -241,7 +252,7 @@ def _apply_confirmation(
         strikes = _no_quote_strikes.get(cand_id, 0) + 1
         _no_quote_strikes[cand_id] = strikes
         if strikes >= _NO_QUOTE_EXPIRE_AFTER:
-            _no_quote_strikes.pop(cand_id, None)
+            _clear_strikes(cand_id)
             update_premarket_candidate(
                 cand_id, "expired",
                 f"no_coverage: no quote after {_NO_QUOTE_EXPIRE_AFTER} consecutive retries",
@@ -285,7 +296,7 @@ def _apply_confirmation(
         strikes = _gap_pct_strikes.get(cand_id, 0) + 1
         _gap_pct_strikes[cand_id] = strikes
         if strikes >= _GAP_PCT_EXPIRE_AFTER:
-            _gap_pct_strikes.pop(cand_id, None)
+            _clear_strikes(cand_id)
             update_premarket_candidate(
                 cand_id, "expired",
                 f"prev_close: no previous close after {_GAP_PCT_EXPIRE_AFTER} consecutive retries",
@@ -306,12 +317,14 @@ def _apply_confirmation(
     _gap_pct_strikes.pop(cand_id, None)
 
     if gap_pct < cfg.min_gap_pct:
+        _clear_strikes(cand_id)
         update_premarket_candidate(
             cand_id, "rejected",
             f"gap {gap_pct:+.2f}% < {cfg.min_gap_pct}% — market doesn't believe the catalyst",
         )
         return None
     if gap_pct > cfg.max_gap_pct:
+        _clear_strikes(cand_id)
         update_premarket_candidate(
             cand_id, "rejected",
             f"gap {gap_pct:+.2f}% > {cfg.max_gap_pct}% — move exhausted pre-open",
@@ -323,9 +336,11 @@ def _apply_confirmation(
         # opening_block already handled above; all remaining rejections are final.
         # Re-evaluating every cycle for 30 min would cost ~60 Twelvedata credits
         # per candidate, and a candidate that fails post-block is gap-and-crap.
+        _clear_strikes(cand_id)
         update_premarket_candidate(cand_id, "rejected", f"{conf.reason_code}: {conf.reason}")
         return None
 
+    _clear_strikes(cand_id)
     logger.info(
         "Pre-market candidate APPROVED: [%s] gap=%+.2f%% %s — %s",
         ticker, gap_pct, conf.reason, cand["headline"][:60],

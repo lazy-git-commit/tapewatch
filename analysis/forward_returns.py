@@ -54,6 +54,10 @@ from storage.database import (
 logger = logging.getLogger(__name__)
 
 # Per-ticker-day intraday cache so N articles on the same stock cost one fetch.
+# Cleared at the start of every compute_forward_returns() run: the cache only
+# exists to dedup WITHIN one nightly run. Left uncleared it grows by hundreds
+# of 1-min-bar DataFrames per night, forever, inside the long-running service
+# process (yesterday's bars are also stale for a still-maturing article).
 _bars_cache: dict[str, pd.DataFrame | None] = {}
 
 
@@ -145,6 +149,8 @@ def compute_forward_returns(batch_limit: int = 500, max_batches: int = 25) -> in
     history window, at which point every return came back NULL. (Observed
     2026-07-03: 8,000-row backlog, 58% of the table uncomputed.)
     """
+    _bars_cache.clear()  # per-run cache — see its definition
+
     # One-time repair of rows poisoned by the pre-fix anchoring bug (exact-zero
     # returns on out-of-session articles). Self-limiting: it only touches rows
     # computed before the fix's deploy date, and recomputed rows get a fresh

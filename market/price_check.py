@@ -59,7 +59,7 @@ import logging
 import requests
 import pandas as pd
 import pandas_market_calendars as mcal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from dataclasses import dataclass
 import pytz
 from config.settings import cfg
@@ -138,25 +138,6 @@ def compute_rvol(today_volume: int, avg_daily_volume: int, minutes_since_open: f
     return today_volume / expected if expected > 0 else 0.0
 
 
-def next_market_open() -> datetime:
-    """
-    Return the next NYSE market open as a UTC-aware datetime.
-    If called during market hours, returns today's open (already passed).
-    Skips weekends.
-    """
-    now_et = datetime.now(_ET)
-    candidate = now_et.replace(hour=_MARKET_OPEN[0], minute=_MARKET_OPEN[1], second=0, microsecond=0)
-
-    if candidate > now_et and now_et.weekday() < 5:
-        return candidate.astimezone(timezone.utc)
-
-    candidate += timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-
-    return candidate.astimezone(timezone.utc)
-
-
 def _to_yf_ticker(t212_ticker: str) -> str:
     """Strip Trading 212 suffix to get a Finnhub/Twelvedata-compatible ticker."""
     return t212_ticker.split("_")[0]
@@ -168,9 +149,9 @@ def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
       1. Finnhub /quote  — primary (fastest, generous rate limit)
       2. Twelvedata /quote — fallback when Finnhub has no coverage
 
-    `fast` (default False) propagates to the Twelvedata fallback/backfill so
-    time-boxed callers (the pre-market eval window) never block on retry
-    backoff — see get_twelvedata_quote(). RTH callers keep full retries.
+    `fast` (default False) propagates to BOTH sources so time-boxed callers
+    (the pre-market eval window) never block on retry backoff — one attempt
+    per source, no sleeps. RTH callers keep full retries.
 
     Finnhub's free tier silently omits many small caps and recent IPOs
     (observed 2026-06-15: CUPR/ELAN/WBD/INBX/SAIL all returned no Finnhub
@@ -190,7 +171,7 @@ def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
     than abandoning Finnhub's (otherwise good) real-time price. This is a cheap
     one-credit call only on the names that need it.
     """
-    quote = get_finnhub_quote(symbol)
+    quote = get_finnhub_quote(symbol, fast=fast)
     if quote is not None:
         if not (float(quote.get("pc") or 0) > 0):
             td = get_twelvedata_quote(symbol, fast=fast)

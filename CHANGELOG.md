@@ -7,6 +7,98 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v19.1 — 2026-07-07 (full-system audit: data-budget leaks, premarket latency, observability)
+
+Comprehensive whole-system review. No entry/exit thresholds changed; every
+item below is a correctness, resource, or observability fix.
+
+### FX rate call bypassed both Twelvedata budget gates (`market/twelvedata_bars.py`)
+`get_gbp_usd_rate()` (called by position sizing at every buy) hit the /price
+endpoint with NO `credits_exhausted()` check, NO `_claim_minute_token()`, and
+NO `_record_credit_use()` — the one unmetered leak left in the credit budget,
+and an uncounted call against the 55/min bucket. Now runs behind the same two
+gates as every bar/quote call; when gated it serves the cached/fallback rate
+(graceful — a stale rate is within the sizing safety margin).
+
+### Finnhub had no fast mode — premarket "no backoff" contract broken (`market/finnhub_bars.py`)
+The 2026-06-23 fix made every **Twelvedata** call single-attempt inside the
+premarket eval pool, but the PRIMARY quote source still ran 3 attempts × 5s
+timeout + backoff sleeps ≈ up to ~17s of a pool thread's time inside the 30s
+wall-clock budget — the exact starvation class that produced the 2026-06-18
+zero-trade day, just on the other API. `get_finnhub_quote(fast=True)` now
+makes exactly one attempt with no sleeps; `get_quote_with_fallback` propagates
+`fast` to both sources.
+
+### Session no-quote blackout was cumulative, not consecutive (`main.py`)
+`_no_quote_ticker_strikes` never reset on a successful price check, so two
+unrelated transient misses hours apart (a token-bucket skip at 14:00, a
+Twelvedata blip at 19:00) permanently blacklisted a ticker with perfectly
+good coverage for the rest of the session. Any successful confirmation now
+resets the ticker's strike count (`_note_price_data_ok`), making the
+documented "consecutive" semantics real.
+
+### Benzinga outage was the last silent external dependency (`news/fetcher.py`)
+Twelvedata exhaustion and Claude outages emit system_events; a dead news feed
+(expired key, API down) produced zero signals — indistinguishable on every
+dashboard from a quiet news day until the zero-trade tripwire fired days
+later. After 10 consecutive failed fetches (~10 min), one `benzinga_outage`
+system_event is recorded (DB-deduped per day) and an ERROR logged.
+
+### Fresh-database `init_db()` crash (`storage/database.py`)
+The `ALTER TABLE sentiment_scores/premarket_candidates ADD COLUMN
+catalyst_magnitude` migrations ran BEFORE those tables' `CREATE TABLE`
+statements — fine on production (tables exist), UndefinedTable crash on any
+fresh database (new dev env, disaster recovery). Migrations moved after their
+CREATEs.
+
+### Nightly bars cache grew forever (`analysis/forward_returns.py`)
+`_bars_cache` (per-ticker-day 1-min DataFrames) was module-level and never
+cleared: every nightly run added hundreds of DataFrames that lived for the
+life of the service process. Now cleared at the start of each run — the cache
+only exists to dedup fetches within one run.
+
+### Premarket strike counters leaked (`premarket/scanner.py`)
+`_no_quote_strikes`/`_gap_pct_strikes` entries survived candidates that
+reached a terminal status via a different path (window expiry, gap reject,
+final confirmation reject). All terminal verdicts now clear both counters
+(`_clear_strikes`).
+
+### Observability & cleanup
+- **Grafana**: "Portfolio Value Over Time" cast `snapshot_at::timestamp`,
+  silently dropping the timezone offset (1-hour shift all summer); now
+  `::timestamptz` like every other panel. Added two panels the v18 backlog
+  death-spiral had no dashboard signal for: **Fwd-Returns Backlog** (rows
+  uncomputed) and **Fwd-Returns Job (hours ago)** heartbeat.
+- Funnel log line now counts blackout skips separately instead of folding
+  them into `already_seen`.
+- Roundup articles (>3 tickers) are skipped before the per-ticker DB dedup
+  queries instead of after them.
+- Removed dead code: `next_market_open()` (price_check), `get_available_cash()`
+  (executor), unused imports. `datetime.utcnow()` → `datetime.now(timezone.utc)`
+  in reporting (deprecated in Python 3.12).
+
+## v19 — 2026-07-06 (premarket execution-boundary crash — the real drought root cause)
+
+`catalyst_magnitude` became a required `NewsItem` field in v15.8 (018ae7c),
+but `main._candidate_to_news_item()` — which rebuilds a NewsItem from a
+`premarket_candidates` row so an APPROVED candidate can reach
+`_execute_entry` — was never updated to supply it. Every premarket approval
+raised `TypeError: NewsItem.__init__() missing 1 required positional
+argument`, caught by the broad try/except around the premarket loop in
+`news_cycle`, which aborted the entire loop **before any buy**.
+
+This was the true cause of the 2026-06-11 → 07-06 drought (16 consecutive
+zero-trade sessions; last trade 2026-06-10). It was masked by four upstream
+premarket fixes (v16/v17.1/v17.4/v17.5) that each repaired a genuine
+starvation problem — and thereby pushed MORE candidates to APPROVED, straight
+into the crash. The RTH path was unaffected (fetcher.py constructs NewsItem
+with the field).
+
+Fix: pass `catalyst_magnitude=int(cand.get("catalyst_magnitude") or 1)`
+(stored on every candidate row since v15.8; `or 1` is a can't-crash fallback
+for legacy rows). Regression tests pin the conversion. Full incident writeup
+in docs/algorithm.md.
+
 ## v18 — 2026-07-03 (eval-loop integrity + execution/capture fixes)
 
 Full-code + production-data audit prompted by the ongoing zero-trade run

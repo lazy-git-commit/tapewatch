@@ -7,7 +7,7 @@ Or call generate_report() programmatically.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from config.settings import cfg
 from storage.database import get_conn
 
@@ -36,7 +36,7 @@ def generate_report() -> str:
     lines.append("=" * 60)
     lines.append("  MOMENTUM TRADER — PERFORMANCE REPORT")
     lines.append(f"  Mode:      {cfg.trading_mode.upper()}")
-    lines.append(f"  Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append(f"  Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     lines.append("=" * 60)
 
     # ── Open positions ────────────────────────────────────────────────────────

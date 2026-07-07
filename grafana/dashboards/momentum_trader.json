@@ -222,7 +222,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT snapshot_at::timestamp AS time, total_value FROM portfolio_snapshots ORDER BY snapshot_at ASC",
+          "rawSql": "SELECT snapshot_at::timestamptz AS time, total_value FROM portfolio_snapshots ORDER BY snapshot_at ASC",
           "format": "time_series",
           "refId": "A"
         }
@@ -745,6 +745,117 @@
       "targets": [
         {
           "rawSql": "SELECT ROUND(EXTRACT(EPOCH FROM (NOW() - last_beat_at::timestamptz)) / 60) AS minutes_stale FROM heartbeat WHERE job = 'premarket_scan'",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Fwd-Returns Backlog (rows uncomputed)",
+      "description": "sentiment_scores rows still waiting for forward returns. The v18 death spiral hit 8,000 rows / 58% of the table before anyone noticed — this makes the backlog a first-class number. Some hundreds pending is normal (today's still-maturing articles); thousands means the nightly job is failing or losing the race.",
+      "type": "stat",
+      "gridPos": {
+        "x": 16,
+        "y": 30,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1500
+              },
+              {
+                "color": "red",
+                "value": 4000
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COUNT(*) AS backlog FROM sentiment_scores WHERE returns_computed_at IS NULL",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "Fwd-Returns Job (hours ago)",
+      "description": "Hours since the nightly forward-returns job last ran. It runs at 22:30 UTC on weekdays, so <30h is green; >54h means at least one weekday run was missed and the eval loop is going stale.",
+      "type": "stat",
+      "gridPos": {
+        "x": 16,
+        "y": 34,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 54
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT ROUND(EXTRACT(EPOCH FROM (NOW() - last_beat_at::timestamptz)) / 3600) AS hours_stale FROM heartbeat WHERE job = 'forward_returns'",
           "format": "table",
           "refId": "A"
         }

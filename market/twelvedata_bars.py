@@ -223,11 +223,29 @@ _FX_CACHE_TTL = 60.0
 _FX_FALLBACK = 1.27
 
 
+def _fx_stale_or_fallback() -> float:
+    """Last-known rate if we ever had one, else the static fallback."""
+    return _FX_CACHE["rate"] if _FX_CACHE["rate"] is not None else _FX_FALLBACK
+
+
 def get_gbp_usd_rate() -> float:
-    """Return the live GBP/USD rate, cached for 60 s. Falls back to 1.27."""
+    """Return the live GBP/USD rate, cached for 60 s. Falls back to 1.27.
+
+    The /price call costs 1 Twelvedata credit like every other endpoint, so it
+    runs behind the SAME two gates as the bar/quote calls (it used to bypass
+    both, making FX the one unmetered leak in the credit budget and an extra
+    unaccounted call against the 55/min bucket). Degradation is graceful
+    either way: a stale rate (≤60s+ old) is within the sizing safety margin.
+    """
     now = time.monotonic()
     if _FX_CACHE["rate"] is not None and now - _FX_CACHE["ts"] < _FX_CACHE_TTL:
         return _FX_CACHE["rate"]
+    if credits_exhausted() or not _claim_minute_token():
+        # Serve stale/fallback and push ts forward so we re-check at most once
+        # per TTL window instead of on every sizing call.
+        _FX_CACHE["ts"] = now
+        return _fx_stale_or_fallback()
+    _record_credit_use()
     try:
         resp = requests.get(
             f"{_BASE_URL}/price",
@@ -247,7 +265,7 @@ def get_gbp_usd_rate() -> float:
         # Update ts even on failure so we throttle to one retry per TTL window
         # instead of hammering the dead endpoint on every call during an outage.
         _FX_CACHE["ts"] = now
-        return _FX_CACHE["rate"] if _FX_CACHE["rate"] is not None else _FX_FALLBACK
+        return _fx_stale_or_fallback()
 
 
 def _get_time_series(

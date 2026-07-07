@@ -386,6 +386,15 @@ service was up the whole time, all four heartbeats green, news scoring healthy
   pre-market eval is now *fully* no-retry — a single slow ticker can no longer
   blow the 30s budget. VWAP (the 4th/last credit) degrades to "confirm on
   momentum + RVOL only" on a fast miss, matching a genuine data gap.
+  **v19.1 closed the last gap in this contract:** `get_finnhub_quote()` — the
+  PRIMARY quote source, called before any Twelvedata fallback — had no fast
+  mode at all, so a slow/down Finnhub could still hold a premarket pool thread
+  for ~17s (3×5s timeouts + backoff sleeps). It now takes `fast=` too (one
+  attempt, no sleeps), propagated by `get_quote_with_fallback`.
+  **Also v19.1:** `get_gbp_usd_rate()` (position sizing FX) used to bypass
+  both the credit meter and the minute token bucket entirely — the one
+  unmetered Twelvedata call in the system. It now runs behind the same two
+  gates and serves the cached/fallback rate when gated.
 - The pre-market eval phase short-circuits when credits are exhausted (no thread
   pool spun up, candidates left pending for next cycle / window expiry).
 
@@ -399,11 +408,15 @@ the "unavailable" sentinel rather than sending HTTP requests that would 429.
 **Session no-quote blackout (v17.1, 2026-06-24):** A separate class of
 permanent-retry loop was found: tickers with zero Finnhub/Twelvedata coverage
 (e.g. EGGF, OXAC on 2026-06-24) were parked in the retry queue every cycle for
-hours — each re-fetch consuming credits and log noise. After 2 failed retries
-(`_NO_QUOTE_BLACKOUT_RETRIES`) a ticker is added to `_no_quote_blackout` and
-suppressed for the rest of the session. Strikes reset on service restart (next
-day). This is distinct from the 24h per-ticker cooldown (`main.py::COOLDOWN_HOURS`),
-which tracks tickers we *traded*, not tickers we couldn't price.
+hours — each re-fetch consuming credits and log noise. After 2 **consecutive**
+failed retries (`_NO_QUOTE_BLACKOUT_RETRIES`) a ticker is added to
+`_no_quote_blackout` and suppressed for the rest of the session. Strikes reset
+on service restart (next day) **and on any successful price check for that
+ticker** (v19.1 — before that, strikes were effectively cumulative-per-session:
+two unrelated transient misses hours apart blacklisted a ticker with perfectly
+good coverage). This is distinct from the 24h per-ticker cooldown
+(`main.py::COOLDOWN_HOURS`), which tracks tickers we *traded*, not tickers we
+couldn't price.
 
 **Premarket no-coverage expiry (v17.4, 2026-06-29):** The RTH no-quote
 blackout had no counterpart in the pre-market evaluator. Tickers with zero
@@ -484,7 +497,8 @@ most partnership news produces no intraday price action at all.
 
 | Failure | Behaviour |
 |---|---|
-| Finnhub quote down | 3 retries (1s/2s/4s); position monitor falls back to Twelvedata bar close |
+| Finnhub quote down | 3 retries (1s/2s/4s) RTH; `fast=` single-attempt inside the time-boxed pre-market eval (v19.1); position monitor falls back to Twelvedata bar close |
+| Benzinga feed down | per-cycle WARNING; after 10 **consecutive** failed fetches (~10 min) one `benzinga_outage` `system_events` row + ERROR (v19.1 — previously a dead feed looked identical to a quiet news day) |
 | Twelvedata down | 3 retries (1.5s/3s/6s + 429-aware) RTH; `fast=` no-retry inside the time-boxed pre-market eval; signal parked in the **retry queue** (5-min TTL) — previously "will retry next cycle" was a lie because the freshness filter dropped the aged article (SPCX, Jun 12) |
 | Twelvedata daily backstop hit | **v17: hard gate** — `credits_exhausted()` short-circuits every call *before* HTTP once past 49,900 (Grow plan: soft cap 50,000 − 100 headroom; was Basic: 780 = 800 − 20). System stops trading (no bar data = no confirmation = fail-closed) but keeps scoring news; logged once/day + `system_events` row. Backstop is a safety ceiling — the Grow plan has no hard daily cap. |
 | Twelvedata per-minute limit | **v17.1: token bucket** — `_claim_minute_token()` blocks the call and returns `None` if the 55-call/minute budget is spent (was Basic: 8/min burst caused systematic 429 storms at market open with 35 pre-market candidates). No HTTP, no backoff. |
@@ -512,8 +526,8 @@ degraded-but-up system is visible. One row per `(event_type, event_day)`,
 de-duped atomically by a UNIQUE index + `ON CONFLICT DO NOTHING` (safe under the
 8-worker pre-market pool). Critical types:
 `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`,
-`zero_trade_session`; warning: `claude_outage`. Grafana alert query (fires on
-any critical event today):
+`zero_trade_session`; warning: `claude_outage`, `benzinga_outage` (v19.1 —
+these can self-heal). Grafana alert query (fires on any critical event today):
 
 ```sql
 SELECT event_type, detail, created_at FROM system_events

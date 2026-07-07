@@ -23,7 +23,7 @@ _RETRIES = 3
 _BASE_BACKOFF = 1.0  # seconds
 
 
-def get_finnhub_quote(symbol: str) -> dict | None:
+def get_finnhub_quote(symbol: str, fast: bool = False) -> dict | None:
     """
     Fetch current quote from Finnhub REST API with exponential-backoff retries.
 
@@ -33,9 +33,19 @@ def get_finnhub_quote(symbol: str) -> dict | None:
 
     A zero 'c' value means Finnhub has no data for the symbol — returned as None
     so callers don't treat $0 as a valid price.
+
+    `fast` (default False) is for time-boxed callers — the pre-market eval
+    window. In fast mode there is exactly ONE attempt and NO sleeps: a
+    timeout/5xx returns None immediately and the next cycle is the retry.
+    Without this, the premarket path's "no retry backoff" contract held for
+    every Twelvedata call but not for the PRIMARY quote source: a slow/down
+    Finnhub could hold a pool thread for ~17s (3×5s timeouts + 1+2s sleeps)
+    inside the 30s eval budget — the same starvation class fixed for
+    Twelvedata on 2026-06-23.
     """
+    attempts = 1 if fast else _RETRIES
     last_exc: Exception | None = None
-    for attempt in range(1, _RETRIES + 1):
+    for attempt in range(1, attempts + 1):
         try:
             resp = requests.get(
                 _QUOTE_URL,
@@ -49,12 +59,18 @@ def get_finnhub_quote(symbol: str) -> dict | None:
                     resp.status_code, symbol, resp.text[:120],
                 )
                 return None
-            # Server errors (5xx) are transient — retry
+            # Server errors (5xx) are transient — retry (fast mode: give up now)
             if resp.status_code >= 500:
+                if fast:
+                    logger.warning(
+                        "Finnhub quote HTTP %d for %s — fast mode, skipping (retry next cycle)",
+                        resp.status_code, symbol,
+                    )
+                    return None
                 wait = _BASE_BACKOFF * (2 ** (attempt - 1))
                 logger.warning(
                     "Finnhub quote HTTP %d for %s (attempt %d/%d) — retrying in %.1fs",
-                    resp.status_code, symbol, attempt, _RETRIES, wait,
+                    resp.status_code, symbol, attempt, attempts, wait,
                 )
                 time.sleep(wait)
                 continue
@@ -70,30 +86,27 @@ def get_finnhub_quote(symbol: str) -> dict | None:
             )
             return data
         except requests.exceptions.Timeout:
-            wait = _BASE_BACKOFF * (2 ** (attempt - 1))
             logger.warning(
-                "Finnhub quote timeout for %s (attempt %d/%d) — retrying in %.1fs",
-                symbol, attempt, _RETRIES, wait,
+                "Finnhub quote timeout for %s (attempt %d/%d)", symbol, attempt, attempts,
             )
             last_exc = Exception(f"timeout on attempt {attempt}")
         except requests.exceptions.ConnectionError as exc:
-            wait = _BASE_BACKOFF * (2 ** (attempt - 1))
             logger.warning(
-                "Finnhub connection error for %s (attempt %d/%d): %s — retrying in %.1fs",
-                symbol, attempt, _RETRIES, exc, wait,
+                "Finnhub connection error for %s (attempt %d/%d): %s",
+                symbol, attempt, attempts, exc,
             )
             last_exc = exc
         except Exception as exc:
             logger.warning(
                 "Finnhub quote unexpected error for %s (attempt %d/%d): %s",
-                symbol, attempt, _RETRIES, exc,
+                symbol, attempt, attempts, exc,
             )
             last_exc = exc
             break  # Non-network errors (e.g. JSON decode) won't self-heal
-        if attempt < _RETRIES:
+        if attempt < attempts:
             time.sleep(_BASE_BACKOFF * (2 ** (attempt - 1)))
     logger.error(
-        "Finnhub: all %d attempts failed for %s — last error: %s",
-        _RETRIES, symbol, last_exc,
+        "Finnhub: all %d attempt(s) failed for %s — last error: %s",
+        attempts, symbol, last_exc,
     )
     return None

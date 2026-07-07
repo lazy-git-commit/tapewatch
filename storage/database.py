@@ -148,16 +148,11 @@ def init_db() -> None:
                 ADD COLUMN IF NOT EXISTS catalyst_type TEXT
             """)
             # catalyst_magnitude: 1–5 relative-to-market-cap impact score.
+            # (The matching sentiment_scores / premarket_candidates migrations
+            # live AFTER those tables' CREATE statements below — an ALTER that
+            # runs before its CREATE crashes init_db on a fresh database.)
             cur.execute("""
                 ALTER TABLE news_signals
-                ADD COLUMN IF NOT EXISTS catalyst_magnitude INTEGER
-            """)
-            cur.execute("""
-                ALTER TABLE sentiment_scores
-                ADD COLUMN IF NOT EXISTS catalyst_magnitude INTEGER
-            """)
-            cur.execute("""
-                ALTER TABLE premarket_candidates
                 ADD COLUMN IF NOT EXISTS catalyst_magnitude INTEGER
             """)
             # Eval-loop table: EVERY Claude classification (positive, neutral,
@@ -181,6 +176,10 @@ def init_db() -> None:
                     returns_computed_at TEXT
                 )
             """)
+            cur.execute("""
+                ALTER TABLE sentiment_scores
+                ADD COLUMN IF NOT EXISTS catalyst_magnitude INTEGER
+            """)
             # Pre-market watchlist: news scored before the open, evaluated at
             # open + open_block with gap/momentum confirmation. status:
             # pending → traded | rejected | expired.
@@ -197,6 +196,10 @@ def init_db() -> None:
                     status        TEXT    NOT NULL DEFAULT 'pending',
                     eval_note     TEXT
                 )
+            """)
+            cur.execute("""
+                ALTER TABLE premarket_candidates
+                ADD COLUMN IF NOT EXISTS catalyst_magnitude INTEGER
             """)
             # Liveness heartbeat: one row per job, updated every cycle.
             # Grafana alerts when last_beat_at goes stale (see docs/algorithm.md).

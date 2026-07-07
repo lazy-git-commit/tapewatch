@@ -1451,3 +1451,193 @@ class TestPremarketCandidateToNewsItem:
         import main
         item = main._candidate_to_news_item(self._row(catalyst_magnitude=None))
         assert item.catalyst_magnitude == 1
+
+
+class TestFinnhubFastMode:
+    """market/finnhub_bars.py: fast=True makes exactly ONE attempt, no sleeps.
+
+    The premarket eval pool's "no retry backoff" contract covered every
+    Twelvedata call but not the PRIMARY quote source — a slow Finnhub could
+    hold a pool thread ~17s inside the 30s eval budget (same starvation class
+    as the 2026-06-23 Twelvedata incident).
+    """
+
+    @patch("market.finnhub_bars.time.sleep")
+    @patch("market.finnhub_bars.requests.get")
+    def test_fast_single_attempt_on_timeout(self, mock_get, mock_sleep):
+        import requests as _rq
+        from market.finnhub_bars import get_finnhub_quote
+        mock_get.side_effect = _rq.exceptions.Timeout()
+        assert get_finnhub_quote("AAPL", fast=True) is None
+        assert mock_get.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("market.finnhub_bars.time.sleep")
+    @patch("market.finnhub_bars.requests.get")
+    def test_default_retries_three_times(self, mock_get, mock_sleep):
+        import requests as _rq
+        from market.finnhub_bars import get_finnhub_quote
+        mock_get.side_effect = _rq.exceptions.Timeout()
+        assert get_finnhub_quote("AAPL") is None
+        assert mock_get.call_count == 3
+
+    @patch("market.finnhub_bars.time.sleep")
+    @patch("market.finnhub_bars.requests.get")
+    def test_fast_no_retry_on_5xx(self, mock_get, mock_sleep):
+        from market.finnhub_bars import get_finnhub_quote
+        resp = MagicMock(); resp.status_code = 503
+        mock_get.return_value = resp
+        assert get_finnhub_quote("AAPL", fast=True) is None
+        assert mock_get.call_count == 1
+        mock_sleep.assert_not_called()
+
+
+class TestFxRateCreditGuard:
+    """get_gbp_usd_rate runs behind the SAME credit/rate gates as bar calls.
+
+    It used to bypass both: every /price call was invisible to the daily
+    credit meter AND uncounted against the 55/min token bucket.
+    """
+
+    def setup_method(self):
+        import time as _time
+        import market.twelvedata_bars as td
+        td._credit_meter = {"date": None, "used": 0}
+        td._meter_latches = {"date": None, "warned": False,
+                             "exhausted_logged": False, "exhausted_emitted": False}
+        td._bucket_tokens = float(td._PER_MINUTE_LIMIT)
+        td._bucket_last_refill = _time.monotonic()
+        td._FX_CACHE["rate"] = None
+        td._FX_CACHE["ts"] = 0.0
+
+    teardown_method = setup_method
+
+    @patch("market.twelvedata_bars.requests.get")
+    def test_no_token_serves_fallback_without_http(self, mock_get):
+        import time as _time
+        import market.twelvedata_bars as td
+        td._bucket_tokens = 0.0
+        td._bucket_last_refill = _time.monotonic()  # no elapsed-time refill
+        assert td.get_gbp_usd_rate() == td._FX_FALLBACK
+        mock_get.assert_not_called()
+
+    @patch("market.twelvedata_bars._emit_credit_exhausted_event")
+    @patch("market.twelvedata_bars.requests.get")
+    def test_exhausted_serves_fallback_without_http(self, mock_get, _emit):
+        from datetime import datetime, timezone
+        import market.twelvedata_bars as td
+        td._credit_meter = {"date": datetime.now(timezone.utc).date(),
+                            "used": td._DAILY_CREDIT_SOFT_CAP}
+        assert td.get_gbp_usd_rate() == td._FX_FALLBACK
+        mock_get.assert_not_called()
+
+    @patch("market.twelvedata_bars.requests.get")
+    def test_successful_fetch_is_metered(self, mock_get):
+        import market.twelvedata_bars as td
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"price": "1.3050"}
+        mock_get.return_value = resp
+        assert td.get_gbp_usd_rate() == 1.3050
+        assert td.get_credits_used_today() == 1  # the call now counts
+
+
+class TestNoQuoteStrikeReset:
+    """main.py session blackout: strikes must be CONSECUTIVE, not cumulative.
+
+    Before the fix, two unrelated transient data misses hours apart would
+    permanently blacklist a ticker with perfectly good coverage.
+    """
+
+    def setup_method(self):
+        import main
+        main._retry_queue.clear()
+        main._no_quote_ticker_strikes.clear()
+        main._no_quote_blackout.clear()
+
+    teardown_method = setup_method
+
+    def _item(self, ticker="ABC_US_EQ"):
+        import pytz as _pytz
+        from news.fetcher import NewsItem
+        return NewsItem(
+            article_id="a1", ticker=ticker, headline="h", body="", source="s",
+            published_at=datetime.now(_pytz.utc), sentiment="positive",
+            confidence=0.8, catalyst_type="fda_approval", already_moved=False,
+            catalyst_magnitude=3,
+        )
+
+    def test_two_consecutive_misses_blacklist(self):
+        import main
+        main._queue_retry(self._item())
+        main._queue_retry(self._item())
+        assert "ABC_US_EQ" in main._no_quote_blackout
+
+    def test_success_between_misses_prevents_blacklist(self):
+        import main
+        main._queue_retry(self._item())
+        main._note_price_data_ok("ABC_US_EQ")  # a quote answered in between
+        main._queue_retry(self._item())
+        assert "ABC_US_EQ" not in main._no_quote_blackout
+
+
+class TestPremarketStrikeCleanup:
+    """scanner strike dicts are dropped on EVERY terminal verdict (no leak)."""
+
+    def setup_method(self):
+        import premarket.scanner as sc
+        sc._no_quote_strikes.clear()
+        sc._gap_pct_strikes.clear()
+
+    teardown_method = setup_method
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_gap_reject_clears_both_counters(self, mock_upd):
+        import premarket.scanner as sc
+        sc._no_quote_strikes[7] = 1
+        sc._gap_pct_strikes[7] = 2
+        conf = _mk_conf(day_change_pct=0.2)  # below MIN_GAP_PCT → rejected
+        assert sc._apply_confirmation({"id": 7, "ticker": "A"}, conf) is None
+        assert 7 not in sc._no_quote_strikes
+        assert 7 not in sc._gap_pct_strikes
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_window_expiry_clears_counters(self, mock_upd):
+        import premarket.scanner as sc
+        sc._no_quote_strikes[9] = 2
+        cand = {"id": 9, "ticker": "B",
+                "created_at": datetime.now(timezone.utc).isoformat()}
+        live = sc._live_candidates([cand], minutes_open=sc._EVAL_WINDOW_MINUTES + 1)
+        assert live == []
+        assert 9 not in sc._no_quote_strikes
+
+
+class TestBenzingaOutageEvent:
+    """news/fetcher.py: sustained feed failure emits ONE system_event.
+
+    Benzinga was the last external dependency with no outage marker — a dead
+    feed looks exactly like a quiet news day on every dashboard.
+    """
+
+    def setup_method(self):
+        import news.fetcher as f
+        f._benzinga_consecutive_failures = 0
+
+    teardown_method = setup_method
+
+    @patch("storage.database.record_system_event")
+    def test_event_fires_once_at_threshold(self, mock_evt):
+        import news.fetcher as f
+        for _ in range(f._BENZINGA_OUTAGE_THRESHOLD + 5):
+            f._note_benzinga_failure()
+        assert mock_evt.call_count == 1  # only at the exact threshold crossing
+        assert mock_evt.call_args.args[0] == "benzinga_outage"
+
+    @patch("storage.database.record_system_event")
+    def test_success_resets_counter(self, mock_evt):
+        import news.fetcher as f
+        for _ in range(f._BENZINGA_OUTAGE_THRESHOLD - 1):
+            f._note_benzinga_failure()
+        f._note_benzinga_ok()
+        f._note_benzinga_failure()  # 1 of 10 again, not 10 of 10
+        mock_evt.assert_not_called()
