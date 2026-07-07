@@ -157,12 +157,30 @@ and strips Benzinga's collision-disambiguation digit (`INBX1` → `INBX`,
 `SAIL1` → `SAIL`). On 2026-06-15 these uncleaned tags reached the price check,
 got no Finnhub quote, and burned 30-minute pre-market eval windows.
 
+**Symbol identity round-trip (v19.2):** the REVERSE direction was also lossy.
+Market-data lookups derived the exchange symbol by stripping `_US_EQ` off the
+T212 code — but T212 re-uses historic symbols by appending a digit to its own
+code (Firefly Aerospace: exchange symbol `FLY`, T212 code `FLY1_US_EQ`), so
+the derived `FLY1` had no data coverage anywhere and both FLY candidates on
+2026-07-07 expired unpriced. `build_symbol_map()` now also builds the inverse
+map; `t212_to_symbol()` resolves the exact exchange symbol (suffix-strip only
+as fallback before the map is built). All price checks — entry, premarket
+eval, and the position monitor — go through it.
+
 **Quote fallback (v15):** Finnhub's free tier silently omits many small caps and
 recent IPOs — exactly the catalysts this strategy targets (2026-06-15:
 CUPR/ELAN/WBD/INBX/SAIL all had no Finnhub quote, all priced fine on
 Twelvedata). `get_quote_with_fallback()` tries Finnhub, then Twelvedata
 `/quote`; both return the same `c`/`o`/`pc` keys so callers are source-agnostic.
 Only when BOTH miss is a signal deemed unpriceable.
+
+**Quote staleness (v19.2):** a quote older than 20 minutes (its own `t`
+timestamp) is treated as **no coverage**, not a price. On 2026-07-07 Finnhub
+served GLASF at $12.50 all afternoon while the market traded ~$11.53: the
+frozen print manufactured the +2% "momentum" that confirmed the entry, made a
+losing position look +6% up, and priced every exit limit above the real book
+(459 consecutive unfilled sells). Quotes without a timestamp fail open — only
+positive evidence of staleness rejects.
 
 **Market-open detection (v15.5):** `is_market_open()` uses
 `_NYSE.open_at_time(sched, now_utc)` rather than a manual `market_open <=
@@ -197,10 +215,19 @@ Checks run cheapest-first; each rejection records a `reason_code`:
 | 4 | `dead_cat` | < −3% vs **prev close** | Prev close (not open) so gap-downs count: a stock down 25% overnight but flat since open is still a falling knife |
 | 5 | `extended_move` | > +25% vs **prev close** | Closes the v13 hole: stock up 80% on the day but flat in the last 5 min passed the 5-min ceiling |
 | 6 | `illiquid` | 20-day ADV × price < **$5M** | **ADV-based on purpose**: spike-day volume explodes and would pass exactly the halt patterns this blocks. Exit slippage depends on the NORMAL book (GOAI: $390k ADV → −18.99% stop fill) |
-| 7 | `low_momentum` | < +0.2% over ~5 min (v15: dead-tape noise floor only) | Just rejects "the catalyst moved nothing"; VWAP does the real work (step 10) |
+| 7 | `low_momentum` | < +0.2% over ~5 min (v15: dead-tape noise floor only) | Just rejects "the catalyst moved nothing"; VWAP does the real work (step 10). Moves below −0.2% log as "tape moving against the signal" (same code) |
 | 8 | `high_momentum` | > +15% over ~5 min | Post-halt spike — halt articles publish AFTER the 30–120% pop. Runs before VWAP to save a credit |
-| 9 | `low_volume` / `high_volume` | RVOL outside [1.5, 20] | See RVOL section |
+| 9 | `low_volume` / `high_volume` | RVOL outside [1.5, 20] | See RVOL section (v19.2: daily-bar lag rescued with session minute bars; the "skip when the daily bar hasn't rolled" bypass is gone) |
 | 10 | `below_vwap` | price < session VWAP (− small tol) | v15: size-neutral accumulation test — see below |
+| 11 | `insufficient_data` | no volume measurement AND no VWAP | v19.2: three individually-reasonable fallbacks (open-price baseline, RVOL deferred, VWAP skipped) could stack into approving on a bare stale quote — how GLASF traded. At least one participation measure must positively exist |
+
+**Transient vs terminal (v19.2):** `low_volume` and `low_momentum` describe
+the tape AT THIS MINUTE, not the instrument — signals are scored within ~3 min
+of publication, often before participation can exist (VERA's FDA approval was
+rejected on RVOL 0.71 measured the minute the news broke). RTH signals
+rejected with these two codes park in a re-eval queue and re-confirm every
+cycle for 15 minutes; premarket candidates stay pending until the eval window
+closes. Everything else is terminal on first sight.
 
 ### Momentum confirmation: why VWAP, not a fixed % (v15)
 
@@ -256,6 +283,19 @@ ratio was a different filter at every hour of the day. RVOL ≈ 1.0 always means
 "a normal day so far". The 20× ceiling is the halt-pattern signature
 (parabolic participation on micro-caps).
 
+**Daily-bar lag rescue (v19.2):** `today_volume` comes from Twelvedata's daily
+bar, whose volume field trails the live session by several minutes — worst at
+the open, exactly when the gap-and-go eval runs. On 2026-07-07 ZTS read RVOL
+0.07 and AGIO 0.40 minutes after gapping up on real catalysts (AGIO: +11.1%
+gap, FDA catalyst, $44M ADV — a false rejection). When the daily bar is
+missing or reads below `MIN_RVOL`, the gate pulls today's 1-min bars
+(`get_session_volume_and_vwap`, 1 credit, only spent when the gate would
+otherwise fail), takes **max(daily, minute-sum)** — the rescue can only add
+measured participation, never hide it, so the `max_rvol` halt ceiling keeps
+its bite — and re-computes. The same bars are reused for the VWAP gate (no
+second credit). A zero measurement now counts as a measurement: GLASF traded
+on rvol=0.0 through the old "daily bar hasn't rolled → skip the band" bypass.
+
 ### Momentum baseline honesty
 
 Bars are selected **by timestamp**, not array index: thin stocks skip minutes,
@@ -297,7 +337,7 @@ filled +3.13%; GOAI "stop_loss" filled −18.99%). v14 restructures execution:
 | Exit | Mechanism | Latency |
 |---|---|---|
 | **Take profit** | **Resting LIMIT sell placed at buy time** (`tp_order_id` on the trade). The exchange fills it the moment price touches target | zero |
-| **Stop loss** | Polled every 20s (was 60s); sells via **bounded limit** at trigger × (1 − 1%) — caps slippage at ~1% instead of chasing a collapsing bid. Unfilled → cancel → retry next cycle at current price | ≤ 20s |
+| **Stop loss** | Polled every 20s (was 60s); sells via **bounded limit** at trigger × (1 − 1%) — caps slippage at ~1% instead of chasing a collapsing bid. Unfilled → cancel → retry next cycle at current price. **v19.2: after 3 consecutive unfilled limit attempts the next attempt is a MARKET order** (+ one-per-day `exit_stuck` system_event) — GLASF sat for 5h14m behind 459 limit retries priced off a frozen quote | ≤ 20s |
 | **Time stop** | 60 min after entry, polled; needs no price feed (fires even in a data outage) | ≤ 20s |
 | **EOD flatten** | ALL positions force-closed 10 min before the close with a market sell, regardless of P&L. Stops don't work overnight; one gap erases a month | — |
 
@@ -483,6 +523,21 @@ can't-crash fallback for pre-v15.8 legacy rows). Regression test:
 contract on the VM: the old signature reproduces the exact `TypeError`, the fixed
 converter builds a valid item.
 
+**Premarket eval verdicts restructured (v19.2, 2026-07-07):** post-mortem of
+the first executable session found two verdict bugs in `_apply_confirmation()`:
+(1) **masked terminal rejections** — `penny_stock`/`wide_spread` fire before
+prev_close is computed, so `day_change_pct=None`; the flow fell into the
+prev-close strike counter and, after 5 wasted eval cycles re-checking a
+terminally rejected stock, recorded "no previous close after 5 retries" (PLUG,
+$2.65, was a penny reject every single cycle — its row blames a data problem
+that never existed). Any non-transient rejection now records its REAL reason
+immediately. (2) **premature terminal rejections** — `low_volume`/
+`low_momentum` measure the tape at this minute; AGIO (+11.1% gap, FDA
+catalyst) was terminally rejected at minute 5 on a lagged RVOL of 0.40 and
+never got a second look. These two codes now leave the candidate PENDING
+(re-evaluated every cycle until the eval window closes). The RTH pipeline got
+the equivalent fix as a 15-minute re-eval queue in `main.py` (see §4).
+
 **Empirical ruling on `partnership` as TRADEABLE_CATALYST (2026-06-30):** Forward
 returns from 60-day history (233 positive partnership signals, `already_moved=0`)
 show avg_5m = +0.010%, median = 0.000%, only 3 of 233 moved >1% in 5 minutes. The
@@ -505,6 +560,8 @@ most partnership news produces no intraday price action at all.
 | Claude outage / overload (529/500/network) | typed-exception handled: fail-closed (no scores → no trades) + short cooldown (`_CLAUDE_OUTAGE_COOLDOWN_SECONDS`, 120s) so we don't hammer a struggling API; auto-resumes; `system_events` row (`claude_outage`) |
 | Claude out-of-credits / billing (403 `billing_error`) or auth (401) | does **not** self-heal — CRITICAL log + long cooldown (`_CLAUDE_BILLING_COOLDOWN_SECONDS`, 30 min) + `system_events` (`claude_billing_error`/`claude_auth_error`) so the journal shows what actually broke |
 | Both feeds down with open position | TP/SL skipped that cycle; time stop still fires (needs no price) |
+| Quote frozen / stale (source up, data dead) | **v19.2:** quote `t` older than 20 min → treated as no coverage (falls to next source / fail-closed). A frozen print is not a price (GLASF: entry, P&L, and every exit limit priced off a $12.50 quote that never moved) |
+| Exit limit sells never fill | **v19.2: escalation** — after 3 consecutive unfilled limit attempts for one trade, the next attempt is a market order; one-per-day `exit_stuck` `system_events` row (warning). Execution certainty over slippage control once the bounded path has demonstrably failed |
 | DB down | 3 retries on OperationalError; eval-loop writes never block the trading path |
 | T212 symbol map 429 at startup | retries with 30s backoff + daily 08:00 UTC rebuild (a single startup 429 used to poison the whole session) |
 | Service crash | systemd `Restart=always` + deploy-time config validation + post-restart health check + **heartbeat table** (below) |
@@ -527,7 +584,8 @@ de-duped atomically by a UNIQUE index + `ON CONFLICT DO NOTHING` (safe under the
 8-worker pre-market pool). Critical types:
 `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`,
 `zero_trade_session`; warning: `claude_outage`, `benzinga_outage` (v19.1 —
-these can self-heal). Grafana alert query (fires on any critical event today):
+these can self-heal), `exit_stuck` (v19.2 — a position's limit exits failed
+repeatedly and the monitor escalated to a market order). Grafana alert query (fires on any critical event today):
 
 ```sql
 SELECT event_type, detail, created_at FROM system_events
@@ -605,6 +663,13 @@ same VWAP confirmation (computed from intraday bars via `_session_vwap_at()`).
 If the two ever diverge, the backtest is testing a strategy you don't run, which
 is worse than no backtest. Any change to a price-check gate must be made in both
 places in the same commit.
+
+One deliberate exception (v19.2): the *data-availability* behaviours — quote
+staleness, the RVOL daily-bar-lag rescue, `insufficient_data`, and the
+transient re-eval queue — have no backtest counterpart, because retrospective
+bars are always present and current. They alter WHICH data feeds a gate, not
+the gate's threshold or order, so `TestBacktestParity` still holds; but a
+backtest can never reproduce a stale-quote entry or a lag-rescued RVOL.
 
 ---
 

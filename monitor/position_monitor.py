@@ -40,6 +40,7 @@ from trading.executor import (
 )
 from storage.database import (
     get_open_trades, close_trade, set_tp_order_id, touch_heartbeat,
+    record_system_event,
 )
 from config.settings import cfg
 
@@ -47,6 +48,37 @@ logger = logging.getLogger(__name__)
 
 
 _LONDON = pytz.timezone("Europe/London")
+
+# ── Stuck-exit escalation ─────────────────────────────────────────────────────
+# Bounded-slippage limit sells protect against thin-book collapses (the GOAI
+# −19% market fill), but an unfilled limit that is retried forever is the
+# OPPOSITE failure: on 2026-07-07 GLASF's exit limit was priced off a frozen
+# quote sitting above the real market, and the monitor placed-and-cancelled
+# 459 consecutive limit sells over 5h14m while the position sat unmanaged.
+# After this many consecutive failed limit attempts for the SAME trade, the
+# next attempt goes straight to a market order — execution certainty now beats
+# slippage control, exactly like the EOD flatten. The counter resets on any
+# successful sell or when the position closes.
+_SELL_ESCALATE_AFTER = 3
+_sell_fail_counts: dict[int, int] = {}  # trade_id → consecutive failed sell attempts
+
+
+def _note_sell_failed(trade_id: int, ticker: str) -> bool:
+    """Record a failed sell attempt; True when the next attempt must escalate."""
+    fails = _sell_fail_counts.get(trade_id, 0) + 1
+    _sell_fail_counts[trade_id] = fails
+    if fails == _SELL_ESCALATE_AFTER:
+        logger.error(
+            "Exit STUCK [%s] trade=%d: %d consecutive limit sells unfilled — "
+            "escalating to MARKET order next attempt",
+            ticker, trade_id, fails,
+        )
+        record_system_event(
+            "exit_stuck",
+            f"{ticker} trade={trade_id}: {fails} consecutive limit sells "
+            f"unfilled — escalated to market order",
+        )
+    return fails >= _SELL_ESCALATE_AFTER
 
 
 def _parse_utc(iso_str: str) -> datetime:
@@ -429,8 +461,14 @@ def monitor_positions() -> None:
         # EOD flatten must use a market order — execution certainty beats
         # slippage control at the close. Pass force_market=True explicitly so
         # the routing doesn't rely on the "eod_flatten" string literal alone.
+        # Stuck-exit escalation: after _SELL_ESCALATE_AFTER consecutive
+        # unfilled limit attempts, this trade also goes market (see top of file).
+        escalate = _sell_fail_counts.get(trade_id, 0) >= _SELL_ESCALATE_AFTER
         try:
-            result = sell(ticker, quantity, sell_price, reason, force_market=(reason == "eod_flatten"))
+            result = sell(
+                ticker, quantity, sell_price, reason,
+                force_market=(reason == "eod_flatten" or escalate),
+            )
         except Exception as exc:
             logger.error(
                 "monitor_positions: sell() raised exception for trade %d (%s): %s",
@@ -439,6 +477,7 @@ def monitor_positions() -> None:
             continue
 
         if result.success:
+            _sell_fail_counts.pop(trade_id, None)
             try:
                 close_trade(
                     trade_id, result.price, reason,
@@ -455,8 +494,11 @@ def monitor_positions() -> None:
                 )
         else:
             # Unfilled bounded-limit sells land here by design — the next
-            # cycle (20s) retries at the then-current price.
+            # cycle (20s) retries at the then-current price, and repeated
+            # failures escalate to a market order via _note_sell_failed.
+            will_escalate = _note_sell_failed(trade_id, ticker)
             logger.error(
-                "Sell not completed for trade %d (%s): %s — will retry next cycle",
+                "Sell not completed for trade %d (%s): %s — will retry next cycle%s",
                 trade_id, ticker, result.error,
+                " AS MARKET ORDER" if will_escalate else "",
             )

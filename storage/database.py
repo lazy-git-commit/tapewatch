@@ -299,6 +299,21 @@ def set_rejection_reason(signal_id: int, reason: str, code: str | None = None) -
             )
 
 
+def clear_rejection(signal_id: int) -> None:
+    """
+    Remove a signal's recorded rejection — used when a transiently-rejected
+    signal (low_volume/low_momentum) passes confirmation on a later re-check
+    and proceeds to trade. Leaving the stale rejection in place would make the
+    analytics count a traded signal as a rejected one.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE news_signals SET rejection_reason = NULL, rejection_code = NULL WHERE id = %s",
+                (signal_id,),
+            )
+
+
 # ── Trades ────────────────────────────────────────────────────────────────────
 
 def open_trade(

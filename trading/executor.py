@@ -30,6 +30,9 @@ _T212_LIVE = "https://live.trading212.com/api/v0"
 # so "SUNE_US_EQ" 404s while the instrument lives as "JCS_US_EQ".
 # Built once at startup from the instruments metadata endpoint.
 _symbol_to_t212: dict[str, str] = {}
+# Inverse of the above (T212 code → exchange shortName), rebuilt together with
+# it. Used by t212_to_symbol() so price checks query the real exchange symbol.
+_t212_to_symbol: dict[str, str] = {}
 
 
 def _base_url() -> str:
@@ -90,6 +93,14 @@ def build_symbol_map(retries: int = 3) -> bool:
                 if ticker and short and inst.get("currencyCode") == "USD":
                     mapping[short.upper()] = ticker
             _symbol_to_t212 = mapping
+            # Inverse map: T212 code → exchange shortName. Market-data lookups
+            # (Finnhub/Twelvedata) need the EXCHANGE symbol; deriving it by
+            # stripping "_US_EQ" is lossy whenever T212's code differs from the
+            # shortName (observed 2026-07-07: Firefly Aerospace is shortName
+            # "FLY" but T212 code "FLY1_US_EQ" — the derived "FLY1" had no data
+            # coverage anywhere, so a $13M-NASA-contract signal expired unpriced).
+            global _t212_to_symbol
+            _t212_to_symbol = {v: k for k, v in mapping.items()}
             logger.info("T212 symbol map built: %d USD instruments", len(mapping))
             return True
         except Exception as exc:
@@ -180,6 +191,23 @@ def resolve_t212_ticker(exchange_symbol: str) -> str | None:
     if cleaned is None:
         return None
     return _symbol_to_t212.get(cleaned, f"{cleaned}_US_EQ")
+
+
+def t212_to_symbol(t212_ticker: str) -> str:
+    """
+    Convert a T212 instrument code back to the exchange symbol that market-data
+    APIs (Finnhub/Twelvedata) understand.
+
+    Prefers the inverse of the instrument map (exact, handles re-used symbols
+    like FLY → FLY1_US_EQ and cruft codes like AVAV__US_EQ); falls back to
+    stripping everything from the first underscore, which is correct for the
+    common AAPL_US_EQ shape and the best available guess before the map is
+    built.
+    """
+    mapped = _t212_to_symbol.get(t212_ticker)
+    if mapped:
+        return mapped
+    return t212_ticker.split("_")[0]
 
 
 def _get(path: str) -> dict:
@@ -578,6 +606,20 @@ def buy(ticker: str, price: float, avg_dollar_volume: float | None = None) -> Or
         fill = _fetch_fill(order_id)
         filled_price, net_gbp, fx_rate, fees_gbp = _parse_fill(fill)
         actual_price = filled_price if filled_price is not None else price
+        # Fill-vs-signal sanity check. A large gap means the quote that
+        # confirmed the signal did not reflect the real market (stale/OTC
+        # print) — the momentum that justified the entry may be fictional.
+        # Observed 2026-07-07: GLASF confirmed at $12.50, filled at $11.79
+        # (−5.7%); the quote then stayed frozen at $12.50 all afternoon.
+        if filled_price is not None and price > 0:
+            slippage_pct = (filled_price - price) / price * 100
+            if abs(slippage_pct) > 3.0:
+                logger.warning(
+                    "BUY [%s] filled %.2f%% away from signal price ($%.4f vs "
+                    "$%.4f) — quote likely stale or book very thin; position "
+                    "risk is NOT what the signal implied",
+                    ticker, slippage_pct, filled_price, price,
+                )
         logger.info(
             "BUY executed: %s × %.4f @ $%.4f | net=£%.2f fx=%.4f fees=£%.2f | order_id=%s",
             ticker, quantity, actual_price,

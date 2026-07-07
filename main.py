@@ -43,8 +43,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 from config.settings import cfg
 from storage.database import (
     init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded,
-    is_article_seen, set_rejection_reason, set_tp_order_id, touch_heartbeat,
-    count_open_trades, count_trades_today, get_today_realized_pnl,
+    is_article_seen, set_rejection_reason, clear_rejection, set_tp_order_id,
+    touch_heartbeat, count_open_trades, count_trades_today, get_today_realized_pnl,
     update_premarket_candidate, save_snapshot,
     trading_days_since_last_trade, record_system_event,
 )
@@ -81,6 +81,23 @@ logger = logging.getLogger(__name__)
 # stale by definition.
 _RETRY_TTL_MINUTES = 5
 _retry_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"item", "expires_at"}
+
+# ── Transient-rejection re-evaluation queue ───────────────────────────────────
+# Signals are scored within ~3 minutes of publication — often FASTER than the
+# market can express participation. Cumulative-session RVOL barely moves in the
+# first minutes after a midday catalyst (the denominator is the whole quiet
+# morning), and the 5-min momentum window can read flat before buyers arrive.
+# Observed 2026-07-07: VERA (FDA approval, 95% confidence, magnitude 5 — the
+# strongest signal of the day) was terminally rejected on RVOL 0.71 measured
+# THE MINUTE the news broke; CSCO/BTU/TEVA/RPRX died the same way on flat tape.
+# A gate that demands confirmation which can only exist minutes later must
+# re-check, not kill. Signals rejected with a TRANSIENT code are parked here
+# (their news_signals row keeps the rejection) and re-confirmed each cycle for
+# _REEVAL_TTL_MINUTES; if participation arrives, the trade proceeds and the
+# row's rejection is cleared. If not, the final rejection stands.
+_TRANSIENT_REJECT_CODES = frozenset({"low_volume", "low_momentum"})
+_REEVAL_TTL_MINUTES = 15
+_reeval_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"item", "signal_id", "expires_at"}
 
 # ── Session-level no-quote blackout ──────────────────────────────────────────
 # Tickers with no coverage on Finnhub or Twelvedata (e.g. OTC/special-purpose
@@ -149,6 +166,97 @@ def _drain_retry_queue() -> list[NewsItem]:
             continue
         items.append(entry["item"])
     return items
+
+
+def _queue_reeval(item: NewsItem, signal_id: int) -> None:
+    """Park a transiently-rejected signal for periodic re-confirmation."""
+    key = (item.article_id, item.ticker)
+    if key in _reeval_queue:
+        return  # already waiting — keep the original expiry
+    _reeval_queue[key] = {
+        "item": item,
+        "signal_id": signal_id,
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=_REEVAL_TTL_MINUTES),
+    }
+    logger.info(
+        "Signal [%s] parked for re-evaluation (transient rejection) — "
+        "re-checking every cycle for up to %d min",
+        item.ticker, _REEVAL_TTL_MINUTES,
+    )
+
+
+def _process_reeval_queue() -> int:
+    """
+    Re-confirm every parked transiently-rejected signal. Returns positions opened.
+
+    Outcomes per entry:
+      confirmed        → clear the row's rejection, enter the trade, unpark.
+      transient again  → keep waiting (row keeps its latest rejection).
+      terminal reject  → record the new reason, unpark.
+      data outage      → keep waiting (bounded by expiry).
+      expired          → drop; the last recorded rejection stands.
+    """
+    now = datetime.now(timezone.utc)
+    opened_count = 0
+    for key in list(_reeval_queue.keys()):
+        entry = _reeval_queue[key]
+        item: NewsItem = entry["item"]
+        if entry["expires_at"] < now:
+            _reeval_queue.pop(key)
+            logger.info(
+                "Re-eval window closed for [%s] — participation never arrived; "
+                "final rejection stands",
+                item.ticker,
+            )
+            continue
+
+        gates_ok, gate_reason = _risk_gates_pass()
+        if not gates_ok:
+            logger.info("Re-eval paused: %s", gate_reason)
+            break
+
+        if was_recently_traded(item.ticker):
+            _reeval_queue.pop(key)
+            logger.info("Re-eval dropped for [%s] — ticker traded since parking", item.ticker)
+            continue
+
+        try:
+            conf = confirm_price_signal(item.ticker)
+        except Exception as exc:
+            logger.error("Re-eval confirm raised for %s: %s", item.ticker, exc, exc_info=True)
+            continue
+        if conf is None:
+            continue  # data miss this cycle — expiry bounds the wait
+
+        if conf.is_confirmed:
+            _reeval_queue.pop(key)
+            try:
+                clear_rejection(entry["signal_id"])
+            except Exception as exc:
+                logger.warning("clear_rejection failed for signal %d: %s", entry["signal_id"], exc)
+            logger.info(
+                "Re-eval CONFIRMED [%s] — participation arrived within the window: %s",
+                item.ticker, conf.reason,
+            )
+            if _enter_confirmed(item, conf, entry["signal_id"]):
+                opened_count += 1
+            continue
+
+        try:
+            set_rejection_reason(entry["signal_id"], conf.reason, conf.reason_code)
+        except Exception as exc:
+            logger.warning("set_rejection_reason failed for signal %d: %s", entry["signal_id"], exc)
+        if conf.reason_code not in _TRANSIENT_REJECT_CODES:
+            _reeval_queue.pop(key)
+            logger.info(
+                "Re-eval terminal rejection [%s] code=%s: %s",
+                item.ticker, conf.reason_code, conf.reason,
+            )
+        else:
+            logger.debug(
+                "Re-eval still transient [%s] code=%s — waiting", item.ticker, conf.reason_code,
+            )
+    return opened_count
 
 
 # ── Portfolio-level risk gates ────────────────────────────────────────────────
@@ -230,8 +338,17 @@ def _execute_entry(item: NewsItem, confirmation: PriceConfirmation, fetched_at: 
             set_rejection_reason(signal_id, confirmation.reason, confirmation.reason_code)
         except Exception as exc:
             logger.warning("set_rejection_reason failed for signal %d: %s", signal_id, exc)
+        # Transient tape states (participation not arrived yet) get re-checked
+        # for the next _REEVAL_TTL_MINUTES rather than dying at first sight.
+        if confirmation.reason_code in _TRANSIENT_REJECT_CODES:
+            _queue_reeval(item, signal_id)
         return False
 
+    return _enter_confirmed(item, confirmation, signal_id)
+
+
+def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id: int) -> bool:
+    """Buy + resting TP + trade record for an already-confirmed, saved signal."""
     logger.info(
         "Signal approved [%s] @ $%.4f — %s",
         item.ticker, confirmation.current_price, confirmation.reason,
@@ -445,8 +562,16 @@ def news_cycle() -> None:
     except Exception as exc:
         logger.error("Pre-market candidate evaluation failed: %s", exc, exc_info=True)
 
-    # ── 2. Retry queue (already-scored signals that hit a data outage) ───────
-    # ── 3. Fresh signals from Benzinga ────────────────────────────────────────
+    # ── 2. Re-eval queue (transient tape rejections awaiting participation) ──
+    reeval_opened = _process_reeval_queue()
+    if reeval_opened:
+        gates_ok, gate_reason = _risk_gates_pass()
+        if not gates_ok:
+            logger.warning("Risk gate tripped after re-eval entries: %s", gate_reason)
+            return
+
+    # ── 3. Retry queue (already-scored signals that hit a data outage) ───────
+    # ── 4. Fresh signals from Benzinga ────────────────────────────────────────
     retry_items = _drain_retry_queue()
     try:
         # Lookback 5 min > the 3-min freshness window: articles the Benzinga

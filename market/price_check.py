@@ -56,6 +56,7 @@ cheapest checks first so we fail fast and spend fewer API credits):
 """
 
 import logging
+import time
 import requests
 import pandas as pd
 import pandas_market_calendars as mcal
@@ -65,8 +66,10 @@ import pytz
 from config.settings import cfg
 from market.finnhub_bars import get_finnhub_quote
 from market.twelvedata_bars import (
-    get_momentum_baseline, get_volume_stats, get_twelvedata_quote, get_session_vwap,
+    get_momentum_baseline, get_volume_stats, get_twelvedata_quote,
+    get_session_volume_and_vwap,
 )
+from trading.executor import t212_to_symbol
 
 _NYSE = mcal.get_calendar("NYSE")
 
@@ -139,8 +142,17 @@ def compute_rvol(today_volume: int, avg_daily_volume: int, minutes_since_open: f
 
 
 def _to_yf_ticker(t212_ticker: str) -> str:
-    """Strip Trading 212 suffix to get a Finnhub/Twelvedata-compatible ticker."""
-    return t212_ticker.split("_")[0]
+    """
+    Convert a T212 code to the exchange symbol Finnhub/Twelvedata understand.
+
+    Delegates to the instrument map's inverse (trading.executor.t212_to_symbol):
+    T212 re-uses historical symbols by appending a digit to its own code
+    (Firefly Aerospace: exchange symbol "FLY", T212 code "FLY1_US_EQ"), so the
+    old suffix-strip derivation produced symbols no data API knows — those
+    signals could never be priced and silently expired (observed 2026-07-07:
+    two FLY candidates on a $13M NASA contract died as "no coverage").
+    """
+    return t212_to_symbol(t212_ticker)
 
 
 def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
@@ -172,6 +184,8 @@ def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
     one-credit call only on the names that need it.
     """
     quote = get_finnhub_quote(symbol, fast=fast)
+    if quote is not None and _quote_is_stale(symbol, quote, "Finnhub"):
+        quote = None  # fall through to Twelvedata exactly as if uncovered
     if quote is not None:
         if not (float(quote.get("pc") or 0) > 0):
             td = get_twelvedata_quote(symbol, fast=fast)
@@ -184,7 +198,47 @@ def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
                 quote["pc"] = td_pc
         return quote
     logger.info("Quote [%s]: no Finnhub coverage — trying Twelvedata fallback", symbol)
-    return get_twelvedata_quote(symbol, fast=fast)
+    td_quote = get_twelvedata_quote(symbol, fast=fast)
+    if td_quote is not None and _quote_is_stale(symbol, td_quote, "Twelvedata"):
+        return None
+    return td_quote
+
+
+# Maximum age of a quote's own data timestamp before we refuse to treat it as
+# a live price. 20 minutes is far outside any liquid name's trade gap during
+# RTH, but tolerates thin-but-real tapes just after the opening block.
+# Why this exists (2026-07-07, GLASF): Finnhub served a $12.50 last-print all
+# afternoon while the real market traded ~$11.50. The frozen quote (a)
+# manufactured +2% "momentum" that confirmed the entry, (b) made the monitor
+# believe a losing position was +6% up, and (c) priced every exit limit above
+# the real book — 459 consecutive unfilled sells until the EOD market flatten.
+# A quote that hasn't updated in 20 minutes is not a price, it's a memory.
+_QUOTE_MAX_AGE_SECONDS = 20 * 60
+
+
+def _quote_is_stale(symbol: str, quote: dict, source: str) -> bool:
+    """True when the quote carries a data timestamp older than the max age.
+
+    Quotes without a usable timestamp are NOT treated as stale (fail-open on
+    missing metadata — the other gates still apply); the check only fires on
+    positive evidence of staleness.
+    """
+    ts = quote.get("t")
+    if not ts:
+        return False
+    try:
+        age = time.time() - float(ts)
+    except (TypeError, ValueError):
+        return False
+    if age > _QUOTE_MAX_AGE_SECONDS:
+        logger.warning(
+            "Quote [%s]: %s quote is %.0f min old (last update %s) — treating "
+            "as no coverage, not a live price",
+            symbol, source, age / 60,
+            datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S"),
+        )
+        return True
+    return False
 
 
 def minutes_until_close() -> float | None:
@@ -295,7 +349,7 @@ class PriceConfirmation:
     reason: str
     # approved | opening_block | penny_stock | wide_spread | dead_cat |
     # extended_move | illiquid | low_momentum | high_momentum |
-    # low_volume | high_volume | below_vwap | no_price_data
+    # low_volume | high_volume | below_vwap | insufficient_data | no_price_data
     reason_code: str
     vwap: float | None = None       # session VWAP at confirmation (v15)
 
@@ -514,12 +568,23 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         # a catalyst that produced literally no move. The "is it being
         # accumulated?" judgement is VWAP's job, not a fixed % threshold's.
         if recent_move_pct < cfg.min_price_move_pct:
-            return _reject(
-                base, "low_momentum",
-                f"Dead tape: {recent_move_pct:+.2f}% over last "
-                f"~{cfg.momentum_lookback_minutes} min (need +{cfg.min_price_move_pct}% to "
-                f"confirm the catalyst moved the stock at all)",
-            )
+            # Same gate, two distinct market states worth telling apart in the
+            # logs: flat tape (catalyst ignored so far — retriable) vs tape
+            # actively moving AGAINST the signal (observed 2026-07-07: DOCN
+            # −8.14% logged as "dead tape", which buried what actually happened).
+            if recent_move_pct < -cfg.min_price_move_pct:
+                detail = (
+                    f"Tape moving against the signal: {recent_move_pct:+.2f}% over last "
+                    f"~{cfg.momentum_lookback_minutes} min — sellers in control despite "
+                    f"the positive catalyst"
+                )
+            else:
+                detail = (
+                    f"Dead tape: {recent_move_pct:+.2f}% over last "
+                    f"~{cfg.momentum_lookback_minutes} min (need +{cfg.min_price_move_pct}% to "
+                    f"confirm the catalyst moved the stock at all)"
+                )
+            return _reject(base, "low_momentum", detail)
 
         # ── 8. Momentum ceiling ──────────────────────────────────────────────
         # Runs BEFORE the VWAP call so a post-halt spike (which is also far
@@ -534,23 +599,59 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             )
 
         # ── 9. RVOL band ─────────────────────────────────────────────────────
-        # Skip when today_volume is unavailable (daily bar hasn't rolled at the
-        # very open) or when avg_daily_volume is zero (RVOL meaningless). The
-        # liquidity filter (step 6) still applied — this is a participation
-        # check, not a liquidity check.
-        if today_volume is not None and avg_daily_volume and avg_daily_volume > 0:
-            if rvol < cfg.min_rvol:
-                return _reject(
-                    base, "low_volume",
-                    f"RVOL {rvol:.2f} below {cfg.min_rvol} — price move lacks real "
-                    f"participation (time-normalized vs 20-day avg)",
+        # today_volume comes from Twelvedata's DAILY bar, whose volume field
+        # trails the live session by several minutes — worst at the open, which
+        # is exactly when the gap-and-go eval runs (observed 2026-07-07: ZTS
+        # read RVOL 0.07 and AGIO 0.40 minutes after gapping up on real
+        # catalysts; both were false rejections). When the daily bar is missing
+        # or reads below the floor, RESCUE with today's minute bars (1 extra
+        # credit, only spent when the gate would otherwise fail): their volume
+        # is current. max() of the two sources — the rescue can only add
+        # measured participation, never hide it, so the max_rvol halt-pattern
+        # ceiling keeps its protective bite.
+        session_volume: int | None = None
+        session_vwap: float | None = None
+        session_last: float | None = None
+        session_bars_fetched = False
+
+        if avg_daily_volume and avg_daily_volume > 0:
+            if today_volume is None or rvol < cfg.min_rvol:
+                session_volume, session_vwap, session_last = (
+                    get_session_volume_and_vwap(symbol, fast=fast)
                 )
-            if rvol > cfg.max_rvol:
-                return _reject(
-                    base, "high_volume",
-                    f"RVOL {rvol:.1f} above {cfg.max_rvol} — parabolic volume is the "
-                    f"halt-pattern signature, not a tradeable catalyst",
-                )
+                session_bars_fetched = True
+                if session_volume is not None and session_volume > (today_volume or 0):
+                    rescued = compute_rvol(
+                        session_volume, avg_daily_volume, minutes_since_open
+                    )
+                    if rescued > rvol:
+                        logger.info(
+                            "Price check [%s]: RVOL rescued from session minute bars "
+                            "— daily-bar volume %s → session volume %d (RVOL %.2f → %.2f)",
+                            symbol, today_volume, session_volume, rvol, rescued,
+                        )
+                        rvol = rescued
+                        current_volume = session_volume
+                        base.update(current_volume=session_volume, rvol=rvol)
+
+            # Enforce the band whenever ANY volume measurement exists. (The old
+            # "skip when the daily bar hasn't rolled" bypass meant the tickers
+            # with the WORST data got a free pass on the participation gate —
+            # GLASF traded on RVOL 0.0 while liquid names were being rejected.)
+            volume_measured = today_volume is not None or session_volume is not None
+            if volume_measured:
+                if rvol < cfg.min_rvol:
+                    return _reject(
+                        base, "low_volume",
+                        f"RVOL {rvol:.2f} below {cfg.min_rvol} — price move lacks real "
+                        f"participation (time-normalized vs 20-day avg)",
+                    )
+                if rvol > cfg.max_rvol:
+                    return _reject(
+                        base, "high_volume",
+                        f"RVOL {rvol:.1f} above {cfg.max_rvol} — parabolic volume is the "
+                        f"halt-pattern signature, not a tradeable catalyst",
+                    )
 
         # ── 10. VWAP confirmation (size-neutral accumulation test) ───────────
         # LAST gate, because get_session_vwap() spends an extra Twelvedata
@@ -562,6 +663,7 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         # rejecting a fading gap-up (below VWAP regardless of % change).
         # Research basis: PEAD literature + VWAP-reclaim practitioner playbooks
         # (citations in docs/algorithm.md).
+        vwap_passed = False
         if cfg.require_vwap_confirmation:
             # fast= keeps the pre-market eval window inside its wall-clock budget:
             # a fast miss returns (None, None), which falls through to the
@@ -569,7 +671,12 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             # degradation as a genuine VWAP data gap. This also makes VWAP the
             # cheapest credit to lose under budget pressure (it's the 4th/last
             # TD call), without weakening confirmation when data IS available.
-            vwap, vwap_last = get_session_vwap(symbol, fast=fast)
+            # If the RVOL rescue already pulled today's minute bars, reuse them
+            # (same series → same VWAP) instead of spending a second credit.
+            if session_bars_fetched:
+                vwap, vwap_last = session_vwap, session_last
+            else:
+                _sv, vwap, vwap_last = get_session_volume_and_vwap(symbol, fast=fast)
             if vwap is not None and vwap > 0:
                 base["vwap"] = vwap
                 # Accept at/above VWAP minus a small tolerance (handles a fresh
@@ -582,14 +689,32 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
                         f"(tol {cfg.vwap_tolerance_pct}%) — being distributed, not "
                         f"accumulated; gap-and-crap risk",
                     )
+                vwap_passed = True
             else:
-                # VWAP unavailable (no volume yet / data gap). Don't hard-fail:
-                # the momentum floor + RVOL already passed. Logged so it's
-                # visible when we confirm without VWAP.
+                # VWAP unavailable (no volume yet / data gap). Not necessarily
+                # fatal on its own — but see the degraded-data check below.
                 logger.info(
                     "Price check [%s]: VWAP unavailable — confirming on momentum + RVOL only",
                     symbol,
                 )
+
+        # ── Degraded-data floor: at least ONE participation gate must PASS ───
+        # Each fallback above is individually reasonable (daily bar not rolled →
+        # defer RVOL; no minute bars → skip VWAP; thin early tape → open-price
+        # momentum baseline). Their CONJUNCTION is not: with RVOL unmeasurable
+        # AND VWAP unavailable, "confirmation" has degraded to a single possibly
+        # stale quote. That is exactly how GLASF traded on 2026-07-07 — the one
+        # candidate with the worst data was the only one that passed, because
+        # bad data disabled the gates that would have stopped it. Require
+        # positive evidence of participation from at least one source.
+        volume_measured = today_volume is not None or session_volume is not None
+        if not volume_measured and not vwap_passed:
+            return _reject(
+                base, "insufficient_data",
+                "No volume measurement (daily bar not rolled, no session minute "
+                "bars) and no VWAP — cannot verify participation; refusing to "
+                "confirm on a bare quote",
+            )
 
         # ── All conditions met — signal confirmed ─────────────────────────────
         adv_str = f" | adv$={avg_dollar_volume:,.0f}" if avg_dollar_volume else ""

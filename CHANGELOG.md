@@ -7,6 +7,104 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v19.2 — 2026-07-07 (post-mortem of the first live session: GLASF stuck exit + four classes of missed trades)
+
+The first session where the pipeline could execute end-to-end (2026-07-07)
+produced exactly one trade — GLASF, the candidate with the WORST data of the
+day — which then sat stuck for 5h14m while the monitor placed and cancelled
+459 limit sells, until the EOD flatten market-sold it (−2.33%). Meanwhile the
+genuinely strong signals (VERA FDA approval 0.95/mag-5, AGIO +11.1% gap FDA
+catalyst, ZTS +3.35%, FLY $13M NASA contract ×2) all died on data artifacts or
+structurally-premature gates. Every mechanism is fixed below.
+
+### Stuck exits now escalate to a market order (`monitor/position_monitor.py`)
+Bounded-slippage limit sells protect against thin-book collapses (GOAI −19%),
+but an unfilled limit retried forever is the opposite failure: GLASF's exit
+limit was priced off a frozen quote sitting ABOVE the real market, so no
+retry could ever fill. After 3 consecutive failed limit attempts for the same
+trade, the next attempt goes straight to market (like the EOD flatten), and a
+one-per-day `exit_stuck` system_event (warning) is recorded. Counter resets on
+any successful sell.
+
+### Stale quotes are no longer live prices (`market/price_check.py`)
+Nothing checked a quote's own data timestamp. GLASF's Finnhub quote read
+$12.50 all afternoon while the market traded ~$11.53: it manufactured the
++2% "momentum" that confirmed the entry, made a losing position look +6% up,
+and priced every exit limit above the book. `get_quote_with_fallback` now
+treats a quote older than 20 minutes (`_QUOTE_MAX_AGE_SECONDS`) as no
+coverage — falls to the next source or fails closed. Twelvedata quotes now
+carry their `timestamp` through normalisation so both sources get the check.
+Missing timestamps fail open (only positive evidence of staleness rejects).
+
+### Degraded-data conjunction can no longer approve (`market/price_check.py`)
+Three individually-reasonable fallbacks — momentum baseline → today's open,
+RVOL deferred when the daily bar hasn't rolled, VWAP skipped when bars are
+missing — could all fire together, degrading "confirmation" to a bare (and in
+GLASF's case, stale) quote. The candidates with the worst data got the
+weakest checks. New `insufficient_data` rejection: at least ONE participation
+measure (a real volume reading or a passing VWAP) must positively exist.
+
+### At-open RVOL false-rejections rescued with session minute bars (`market/twelvedata_bars.py`, `market/price_check.py`)
+`today_volume` comes from Twelvedata's DAILY bar, whose volume field trails
+the session by minutes — worst at the open, exactly when the gap-and-go eval
+runs. ZTS read RVOL 0.07 and AGIO 0.40 minutes after gapping up on real
+catalysts; TTEK/CACI/ZTS/AGIO were all false-rejected on it. When the daily
+bar is missing or reads below `MIN_RVOL`, the gate now pulls today's 1-min
+bars (new `get_session_volume_and_vwap`, 1 credit, only spent when the gate
+would otherwise fail), takes max(daily, minute-sum) volume, and re-computes.
+The same bars are REUSED for the VWAP gate (no second credit). The old "skip
+RVOL when the daily bar hasn't rolled" bypass is gone — a zero measurement is
+now a measurement (GLASF traded on rvol=0.0 through that bypass).
+
+### Transient rejections get re-checked instead of dying at first sight (`main.py`, `premarket/scanner.py`)
+Signals are scored within ~3 min of publication — faster than the market can
+express participation. Cumulative-session RVOL barely moves in the first
+minutes after a midday catalyst, and the 5-min momentum window reads flat
+before buyers arrive: VERA (FDA approval, 0.95 confidence, magnitude 5 — the
+strongest signal of the day) was terminally rejected on RVOL 0.71 measured
+the minute the news broke; CSCO/BTU/TEVA/RPRX died the same way. Now:
+- RTH: signals rejected with `low_volume`/`low_momentum` park in a re-eval
+  queue and re-confirm every cycle for 15 min (`_REEVAL_TTL_MINUTES`); if
+  participation arrives they trade (row's rejection cleared via new
+  `clear_rejection()`), otherwise the final rejection stands.
+- Premarket: the same two codes now leave the candidate PENDING (retry every
+  cycle until the eval window closes) instead of a terminal rejection at
+  minute 5.
+
+### T212 code → exchange symbol derivation was lossy (`trading/executor.py`, `market/price_check.py`)
+Market-data lookups derived the symbol by stripping `_US_EQ` off the T212
+code. T212 re-uses historic symbols by appending a digit to ITS code —
+Firefly Aerospace is exchange symbol `FLY` but T212 code `FLY1_US_EQ` — so
+the derived `FLY1` had no Finnhub/Twelvedata coverage and both FLY candidates
+($13M NASA subcontract, 0.80 conf) expired unpriced. `build_symbol_map()` now
+also builds the inverse map; new `t212_to_symbol()` resolves the exact
+exchange symbol with suffix-strip as fallback.
+
+### Premarket terminal rejections no longer masked as data problems (`premarket/scanner.py`)
+`penny_stock`/`wide_spread` fire before prev_close is computed, so
+`day_change_pct=None`; the scanner fell into the "prev close unavailable"
+strike counter and — after 5 wasted eval cycles re-checking a terminally
+rejected stock — recorded a data-problem epitaph. PLUG ($2.65, penny reject
+every cycle) is recorded as "no previous close after 5 retries". Any
+non-transient rejection now records its REAL reason immediately.
+
+### Buy fill-slippage warning (`trading/executor.py`)
+GLASF confirmed at $12.50 and filled at $11.79 (−5.7%) with no comment. A
+fill >3% away from the signal price now logs a WARNING — the quote that
+confirmed the entry did not reflect the real market, so position risk is not
+what the signal implied.
+
+### Negative tape no longer logged as "dead tape" (`market/price_check.py`)
+DOCN fell −8.14% in 5 min and was rejected as "Dead tape: -8.14% (need
++0.2%...)". Same gate, distinct message: moves below −MIN_PRICE_MOVE_PCT now
+log "tape moving against the signal". (Code unchanged: `low_momentum`.)
+
+Tests: 139 passing (22 new — symbol inversion, quote staleness, RVOL rescue,
+insufficient_data, sell escalation, re-eval queue, session volume/VWAP,
+scanner transient/terminal verdicts).
+
+---
+
 ## v19.1 — 2026-07-07 (full-system audit: data-budget leaks, premarket latency, observability)
 
 Comprehensive whole-system review. No entry/exit thresholds changed; every

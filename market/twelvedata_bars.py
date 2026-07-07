@@ -492,6 +492,11 @@ def get_twelvedata_quote(symbol: str, fast: bool = False) -> dict | None:
                 "o": float(data["open"]) if data.get("open") else float(close),
                 "pc": float(data["previous_close"]) if data.get("previous_close") else None,
                 "av": int(float(data["average_volume"])) if data.get("average_volume") else None,
+                # Unix seconds of the quote's own data time — lets callers apply
+                # the same staleness test as Finnhub's "t" (see
+                # price_check._quote_is_stale; a frozen quote must not be
+                # treated as a live price).
+                "t": int(float(data["timestamp"])) if data.get("timestamp") else None,
             }
             logger.debug(
                 "Twelvedata /quote [%s]: c=%.4f o=%.4f pc=%s (Finnhub fallback)",
@@ -642,9 +647,32 @@ def get_session_vwap(symbol: str, fast: bool = False) -> tuple[float | None, flo
     accumulate only today's bars. Early in the session there are few bars, which
     is fine — VWAP is simply the average so far.
     """
+    _vol, vwap, last_price = get_session_volume_and_vwap(symbol, fast=fast)
+    return vwap, last_price
+
+
+def get_session_volume_and_vwap(
+    symbol: str, fast: bool = False
+) -> tuple[int | None, float | None, float | None]:
+    """
+    One 1-min-bars pull (1 credit) → (session_volume, vwap, last_price).
+
+    session_volume — Σ volume of today's minute bars. This is the RESCUE
+    source for RVOL when Twelvedata's daily bar hasn't rolled or lags at the
+    open (observed 2026-07-07: ZTS read RVOL 0.07 and AGIO 0.40 minutes after
+    gapping up on real catalysts — the daily bar's volume field trails the
+    session by several minutes, so every at-open evaluation read near-zero
+    participation). Minute bars ARE current. Note the caveat: minute-bar
+    volume can undercount the consolidated tape, so callers should take
+    max(daily_bar_volume, session_volume) — the rescue can only ever ADD
+    measured participation, never hide it.
+
+    Returns (None, None, None) if bar data is unavailable; session_volume=0
+    with vwap=None when bars exist but nothing traded today yet.
+    """
     values = _get_time_series(symbol, interval="1min", outputsize=390, fast=fast)
     if values is None or len(values) < 1:
-        return None, None
+        return None, None, None
 
     now_et_date = datetime.now(_ET).date()
     cum_pv = 0.0   # Σ typical_price × volume
@@ -671,11 +699,14 @@ def get_session_vwap(symbol: str, fast: bool = False) -> tuple[float | None, flo
 
     if cum_v <= 0 or last_price is None:
         # No volume yet (pre-open or dead tape) — VWAP undefined.
-        return None, last_price
+        return int(cum_v), None, last_price
 
     vwap = cum_pv / cum_v
-    logger.debug("Twelvedata VWAP [%s]: vwap=%.4f last=%.4f", symbol, vwap, last_price)
-    return vwap, last_price
+    logger.debug(
+        "Twelvedata session bars [%s]: vol=%d vwap=%.4f last=%.4f",
+        symbol, int(cum_v), vwap, last_price,
+    )
+    return int(cum_v), vwap, last_price
 
 
 def get_volume_stats(

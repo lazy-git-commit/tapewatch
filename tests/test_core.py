@@ -1047,12 +1047,45 @@ class TestApplyConfirmation:
         assert mock_upd.call_args.args[1] == "rejected"
 
     @patch("premarket.scanner.update_premarket_candidate")
-    def test_low_momentum_rejected_terminally(self, mock_upd):
+    def test_low_momentum_stays_pending_for_retry(self, mock_upd):
+        # v19.2: low_momentum/low_volume are TRANSIENT tape states — the
+        # candidate stays pending and re-evaluates until the window closes
+        # (AGIO 2026-07-07: killed at minute 5 on lagged RVOL, never re-checked).
         from premarket.scanner import _apply_confirmation
         conf = _mk_conf(day_change_pct=5.0, is_confirmed=False,
                         reason_code="low_momentum")
         assert _apply_confirmation({"id": 1, "ticker": "A"}, conf) is None
+        mock_upd.assert_not_called()  # no status write → pending
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_low_volume_stays_pending_for_retry(self, mock_upd):
+        from premarket.scanner import _apply_confirmation
+        conf = _mk_conf(day_change_pct=5.0, is_confirmed=False,
+                        reason_code="low_volume")
+        assert _apply_confirmation({"id": 1, "ticker": "A"}, conf) is None
+        mock_upd.assert_not_called()
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_penny_stock_rejected_with_real_reason(self, mock_upd):
+        # v19.2: terminal rejections that fire before prev_close is computed
+        # (penny_stock, wide_spread) must record their REAL reason immediately —
+        # not strike out as "prev close unavailable" (PLUG 2026-07-07: five
+        # wasted eval cycles, then a data-problem epitaph for a $2.65 stock).
+        from premarket.scanner import _apply_confirmation
+        conf = _mk_conf(day_change_pct=None, is_confirmed=False,
+                        reason_code="penny_stock")
+        assert _apply_confirmation({"id": 1, "ticker": "A"}, conf) is None
         assert mock_upd.call_args.args[1] == "rejected"
+        assert "penny_stock" in mock_upd.call_args.args[2]
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_extended_move_rejected_terminally(self, mock_upd):
+        from premarket.scanner import _apply_confirmation
+        conf = _mk_conf(day_change_pct=5.0, is_confirmed=False,
+                        reason_code="extended_move")
+        assert _apply_confirmation({"id": 1, "ticker": "A"}, conf) is None
+        assert mock_upd.call_args.args[1] == "rejected"
+        assert "extended_move" in mock_upd.call_args.args[2]
 
     @patch("premarket.scanner.update_premarket_candidate")
     def test_confirmed_in_band_approved(self, mock_upd):
@@ -1641,3 +1674,292 @@ class TestBenzingaOutageEvent:
         f._note_benzinga_ok()
         f._note_benzinga_failure()  # 1 of 10 again, not 10 of 10
         mock_evt.assert_not_called()
+
+
+# ── v19.2 tests: data-integrity + opportunity-capture fixes (2026-07-07) ──────
+
+
+class TestT212SymbolInversion:
+    """trading/executor.py::t212_to_symbol — exact inverse map with fallback."""
+
+    def setup_method(self):
+        import trading.executor as ex
+        self._saved = ex._t212_to_symbol
+        ex._t212_to_symbol = {"FLY1_US_EQ": "FLY", "AVAV__US_EQ": "AVAV"}
+
+    def teardown_method(self):
+        import trading.executor as ex
+        ex._t212_to_symbol = self._saved
+
+    def test_mapped_code_returns_exchange_symbol(self):
+        from trading.executor import t212_to_symbol
+        # T212 re-uses historic symbols with a digit suffix: exchange "FLY"
+        # lives as T212 code "FLY1_US_EQ". Suffix-stripping produced "FLY1",
+        # which no data API knows (2026-07-07: both FLY candidates expired).
+        assert t212_to_symbol("FLY1_US_EQ") == "FLY"
+        assert t212_to_symbol("AVAV__US_EQ") == "AVAV"
+
+    def test_unmapped_code_falls_back_to_suffix_strip(self):
+        from trading.executor import t212_to_symbol
+        assert t212_to_symbol("AAPL_US_EQ") == "AAPL"
+
+
+class TestQuoteStaleness:
+    """price_check quote staleness — a frozen quote is not a live price."""
+
+    def test_fresh_quote_not_stale(self):
+        import time as _t
+        from market.price_check import _quote_is_stale
+        assert _quote_is_stale("X", {"t": _t.time() - 60}, "Finnhub") is False
+
+    def test_old_quote_is_stale(self):
+        import time as _t
+        from market.price_check import _quote_is_stale
+        assert _quote_is_stale("X", {"t": _t.time() - 25 * 60}, "Finnhub") is True
+
+    def test_missing_timestamp_fails_open(self):
+        from market.price_check import _quote_is_stale
+        assert _quote_is_stale("X", {"c": 10.0}, "Finnhub") is False
+        assert _quote_is_stale("X", {"t": None}, "Finnhub") is False
+
+    @patch("market.price_check.get_twelvedata_quote", return_value=None)
+    @patch("market.price_check.get_finnhub_quote")
+    def test_stale_finnhub_falls_through_to_none(self, mock_fh, _td):
+        # GLASF 2026-07-07: Finnhub served a $12.50 print frozen since entry.
+        # A stale primary quote must be treated as NO coverage, not a price.
+        import time as _t
+        from market.price_check import get_quote_with_fallback
+        mock_fh.return_value = {"c": 12.50, "o": 12.25, "pc": 12.32,
+                                "t": _t.time() - 3600}
+        assert get_quote_with_fallback("GLASF") is None
+
+    @patch("market.price_check.get_twelvedata_quote", return_value=None)
+    @patch("market.price_check.get_finnhub_quote")
+    def test_fresh_finnhub_passes_through(self, mock_fh, _td):
+        import time as _t
+        from market.price_check import get_quote_with_fallback
+        mock_fh.return_value = {"c": 12.50, "o": 12.25, "pc": 12.32,
+                                "t": _t.time() - 30}
+        q = get_quote_with_fallback("ACME")
+        assert q is not None and q["c"] == 12.50
+
+
+def _confirm_with(monkey_now_et, quote, baseline, volume_stats, session):
+    """Run confirm_price_signal with all data dependencies mocked."""
+    import market.price_check as pc
+    fake_dt = MagicMock()
+    fake_dt.now.side_effect = lambda tz=None: monkey_now_et
+    with patch.object(pc, "datetime", fake_dt), \
+         patch.object(pc, "get_quote_with_fallback", return_value=quote), \
+         patch.object(pc, "get_momentum_baseline", return_value=baseline), \
+         patch.object(pc, "get_volume_stats", return_value=volume_stats), \
+         patch.object(pc, "get_session_volume_and_vwap",
+                      return_value=session) as mock_sess:
+        conf = pc.confirm_price_signal("ACME_US_EQ")
+    return conf, mock_sess
+
+
+class TestRvolRescueAndDegradedData:
+    """
+    v19.2 RVOL/VWAP data-integrity fixes:
+      - daily-bar volume lag is rescued with session minute bars (AGIO case)
+      - session bars fetched for the rescue are REUSED for VWAP (no 2nd credit)
+      - all-fallbacks-degraded no longer approves on a bare quote (GLASF case)
+    """
+
+    @staticmethod
+    def _now_et():
+        import pytz
+        et = pytz.timezone("America/New_York")
+        # 10:00 ET = 30 minutes after the open, outside the opening block.
+        return et.localize(datetime(2026, 7, 7, 10, 0, 0))
+
+    _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.0}
+    _BASELINE = (10.2, 10.5, 0.5)   # past, current bar, spread% → +2.94% move
+
+    def test_daily_bar_lag_rescued_by_session_volume(self):
+        # AGIO 2026-07-07: real catalyst, daily-bar RVOL read 0.40 → rejected.
+        # today_volume=5000 → rvol 0.03; session bars say 300k → rvol 1.88.
+        conf, mock_sess = _confirm_with(
+            self._now_et(), self._QUOTE, self._BASELINE,
+            (5_000, 1_000_000, 10_000_000.0, 10.0),
+            (300_000, 10.2, 10.5),
+        )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+        assert conf.rvol > 1.5
+        mock_sess.assert_called_once()  # rescue + VWAP share ONE bars pull
+
+    def test_unrolled_daily_bar_rescued(self):
+        conf, mock_sess = _confirm_with(
+            self._now_et(), self._QUOTE, self._BASELINE,
+            (None, 1_000_000, 10_000_000.0, 10.0),   # daily bar not rolled
+            (300_000, 10.2, 10.5),
+        )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+        mock_sess.assert_called_once()
+
+    def test_zero_session_volume_rejects_low_volume(self):
+        # GLASF case: no daily bar AND nothing traded per the minute bars.
+        # Old code skipped the RVOL band entirely and approved; now the zero
+        # measurement counts as a measurement and fails the participation gate.
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE, self._BASELINE,
+            (None, 1_000_000, 10_000_000.0, 10.0),
+            (0, None, None),
+        )
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "low_volume"
+
+    def test_no_volume_and_no_vwap_rejects_insufficient_data(self):
+        # All participation evidence unavailable → refuse to confirm on a
+        # bare quote instead of approving with every gate degraded away.
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE, self._BASELINE,
+            (None, 1_000_000, 10_000_000.0, 10.0),
+            (None, None, None),
+        )
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "insufficient_data"
+
+
+class TestSellEscalation:
+    """monitor: consecutive unfilled limit sells escalate to a market order."""
+
+    def setup_method(self):
+        import monitor.position_monitor as pm
+        pm._sell_fail_counts.clear()
+
+    teardown_method = setup_method
+
+    @patch("monitor.position_monitor.record_system_event")
+    def test_escalates_after_threshold(self, mock_evt):
+        import monitor.position_monitor as pm
+        assert pm._note_sell_failed(9, "GLASF_US_EQ") is False
+        assert pm._note_sell_failed(9, "GLASF_US_EQ") is False
+        assert pm._note_sell_failed(9, "GLASF_US_EQ") is True   # 3rd strike
+        assert pm._sell_fail_counts[9] == 3
+        mock_evt.assert_called_once()          # exit_stuck emitted at threshold
+        assert mock_evt.call_args.args[0] == "exit_stuck"
+        assert pm._note_sell_failed(9, "GLASF_US_EQ") is True   # stays escalated
+        mock_evt.assert_called_once()          # but the event fires only once
+
+    @patch("monitor.position_monitor.record_system_event")
+    def test_counters_are_per_trade(self, _evt):
+        import monitor.position_monitor as pm
+        pm._note_sell_failed(1, "A_US_EQ")
+        pm._note_sell_failed(2, "B_US_EQ")
+        assert pm._sell_fail_counts == {1: 1, 2: 1}
+
+
+class TestReevalQueue:
+    """main.py transient-rejection re-evaluation (VERA/CSCO class misses)."""
+
+    def _item(self, ticker="VERA_US_EQ"):
+        from news.fetcher import NewsItem
+        from datetime import timezone as _tz
+        return NewsItem(
+            article_id="a1", ticker=ticker, headline="h", body="", source="bz",
+            published_at=datetime.now(_tz.utc), sentiment="positive",
+            confidence=0.95, catalyst_type="fda_approval",
+            already_moved=False, catalyst_magnitude=5,
+        )
+
+    def setup_method(self):
+        import main
+        main._reeval_queue.clear()
+
+    teardown_method = setup_method
+
+    def test_transient_rejection_parks_signal(self):
+        import main
+        main._queue_reeval(self._item(), signal_id=42)
+        assert ("a1", "VERA_US_EQ") in main._reeval_queue
+        # Re-parking must not extend the expiry window.
+        first_expiry = main._reeval_queue[("a1", "VERA_US_EQ")]["expires_at"]
+        main._queue_reeval(self._item(), signal_id=42)
+        assert main._reeval_queue[("a1", "VERA_US_EQ")]["expires_at"] == first_expiry
+
+    @patch("main._enter_confirmed", return_value=True)
+    @patch("main.clear_rejection")
+    @patch("main.set_rejection_reason")
+    @patch("main.confirm_price_signal")
+    @patch("main.was_recently_traded", return_value=False)
+    @patch("main._risk_gates_pass", return_value=(True, ""))
+    def test_participation_arrives_then_trades(
+        self, _gates, _cooldown, mock_confirm, mock_set_rej, mock_clear, mock_enter
+    ):
+        import main
+        main._queue_reeval(self._item(), signal_id=42)
+
+        # Cycle 1: still low_volume → stays parked, row updated.
+        mock_confirm.return_value = _mk_conf(
+            reason_code="low_volume", is_confirmed=False)
+        assert main._process_reeval_queue() == 0
+        assert len(main._reeval_queue) == 1
+        mock_set_rej.assert_called_once()
+
+        # Cycle 2: volume arrived → confirmed, rejection cleared, trade entered.
+        mock_confirm.return_value = _mk_conf(reason_code="approved",
+                                             is_confirmed=True)
+        assert main._process_reeval_queue() == 1
+        assert len(main._reeval_queue) == 0
+        mock_clear.assert_called_once_with(42)
+        mock_enter.assert_called_once()
+
+    @patch("main._enter_confirmed", return_value=True)
+    @patch("main.set_rejection_reason")
+    @patch("main.confirm_price_signal")
+    @patch("main.was_recently_traded", return_value=False)
+    @patch("main._risk_gates_pass", return_value=(True, ""))
+    def test_terminal_rejection_unparks(
+        self, _gates, _cooldown, mock_confirm, mock_set_rej, mock_enter
+    ):
+        import main
+        main._queue_reeval(self._item(), signal_id=42)
+        mock_confirm.return_value = _mk_conf(
+            reason_code="extended_move", is_confirmed=False)
+        assert main._process_reeval_queue() == 0
+        assert len(main._reeval_queue) == 0     # terminal → dropped
+        mock_set_rej.assert_called_once()       # final reason recorded
+        mock_enter.assert_not_called()
+
+    @patch("main.confirm_price_signal")
+    @patch("main._risk_gates_pass", return_value=(True, ""))
+    def test_expired_entry_dropped_without_recheck(self, _gates, mock_confirm):
+        import main
+        from datetime import timezone as _tz
+        main._queue_reeval(self._item(), signal_id=42)
+        key = ("a1", "VERA_US_EQ")
+        main._reeval_queue[key]["expires_at"] = (
+            datetime.now(_tz.utc) - timedelta(minutes=1))
+        assert main._process_reeval_queue() == 0
+        assert len(main._reeval_queue) == 0
+        mock_confirm.assert_not_called()
+
+
+class TestSessionVolumeAndVwap:
+    """twelvedata get_session_volume_and_vwap — one pull, volume + VWAP."""
+
+    @patch("market.twelvedata_bars._get_time_series", return_value=None)
+    def test_no_bars_returns_all_none(self, _ts):
+        import market.twelvedata_bars as td
+        assert td.get_session_volume_and_vwap("ACME") == (None, None, None)
+
+    @patch("market.twelvedata_bars._get_time_series")
+    def test_sums_only_todays_volume(self, mock_ts):
+        import market.twelvedata_bars as td
+        import pytz as _pytz
+        et = _pytz.timezone("America/New_York")
+        today = datetime.now(et).strftime("%Y-%m-%d")
+        mock_ts.return_value = [
+            {"datetime": f"{today} 09:32:00", "high": "10.2", "low": "10.0",
+             "close": "10.1", "volume": "3000"},
+            {"datetime": f"{today} 09:31:00", "high": "10.1", "low": "9.9",
+             "close": "10.0", "volume": "2000"},
+            {"datetime": "2026-06-29 15:59:00", "high": "9.0", "low": "8.8",
+             "close": "8.9", "volume": "99999"},   # stale bar — excluded
+        ]
+        vol, vwap, last = td.get_session_volume_and_vwap("ACME")
+        assert vol == 5000
+        assert vwap is not None and 9.9 < vwap < 10.2
+        assert last == 10.1

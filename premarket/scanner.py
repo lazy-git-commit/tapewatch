@@ -101,6 +101,15 @@ _NO_QUOTE_EXPIRE_AFTER = 3
 _gap_pct_strikes: dict[int, int] = {}
 _GAP_PCT_EXPIRE_AFTER = 5
 
+# Rejection codes that describe the tape AT THIS MINUTE rather than a property
+# of the instrument or the day: participation can arrive a few minutes after
+# the news (RVOL), and a 5-min momentum window dips negative on the first
+# pullback of a genuine mover. Candidates rejected with these codes stay
+# pending and re-evaluate every cycle until the eval window closes. Everything
+# else (penny_stock, illiquid, dead_cat, extended_move, wide_spread,
+# high_momentum, high_volume, below_vwap, insufficient_data) is terminal.
+_TRANSIENT_REJECT_CODES = frozenset({"low_volume", "low_momentum"})
+
 
 def _clear_strikes(cand_id: int) -> None:
     """Drop both per-candidate strike counters once a candidate reaches ANY
@@ -280,10 +289,37 @@ def _apply_confirmation(
     # for the first 5 minutes after the open, including liquid names like AMGN/PFE.
     if not conf.is_confirmed and conf.reason_code == "opening_block":
         logger.debug(
-            "Pre-market eval [%s]: opening block active — re-evaluating after it lifts",
+            "Pre-market eval [%s]: still in opening block — retrying next cycle",
             ticker,
         )
         return None  # stays pending
+
+    # ── Transient rejections: participation hasn't arrived YET ────────────────
+    # RVOL and the momentum floor are measurements of the tape AT THIS MINUTE.
+    # At the open they routinely fail for 1-5 minutes on genuine movers (volume
+    # data lags, the first pullback dips the 5-min move negative) and then pass.
+    # Observed 2026-07-07: AGIO gapped +11.1% on an FDA catalyst with +3.79%
+    # follow-through and was terminally rejected at minute 5 on a lagged RVOL
+    # of 0.40 — it never got a second look. These stay PENDING and re-evaluate
+    # every cycle; the eval window in _live_candidates bounds the retries.
+    if not conf.is_confirmed and conf.reason_code in _TRANSIENT_REJECT_CODES:
+        logger.info(
+            "Pre-market eval [%s]: %s (%s) — transient, retrying next cycle",
+            ticker, conf.reason_code, conf.reason[:80],
+        )
+        return None  # stays pending
+
+    # ── Terminal rejections: record the REAL reason immediately ──────────────
+    # penny_stock and wide_spread fire before prev_close is computed, so
+    # day_change_pct is None. The old flow fell through to the gap_pct=None
+    # strike counter and (after 5 wasted eval cycles) recorded "prev close
+    # unavailable" — observed 2026-07-07: PLUG was a $2.65 penny-stock reject
+    # every single cycle but its row says "no previous close after 5 retries".
+    # A rejection that isn't transient is final regardless of the gap.
+    if not conf.is_confirmed:
+        _clear_strikes(cand_id)
+        update_premarket_candidate(cand_id, "rejected", f"{conf.reason_code}: {conf.reason}")
+        return None
 
     # ── Gap gate: vs previous close, gap included ────────────────────────────
     gap_pct = conf.day_change_pct
@@ -331,15 +367,8 @@ def _apply_confirmation(
         )
         return None
 
-    # ── Standard confirmation: post-open follow-through required ──────────────
-    if not conf.is_confirmed:
-        # opening_block already handled above; all remaining rejections are final.
-        # Re-evaluating every cycle for 30 min would cost ~60 Twelvedata credits
-        # per candidate, and a candidate that fails post-block is gap-and-crap.
-        _clear_strikes(cand_id)
-        update_premarket_candidate(cand_id, "rejected", f"{conf.reason_code}: {conf.reason}")
-        return None
-
+    # Confirmation itself passed (all rejection shapes — opening block,
+    # transient, terminal — returned above), and the gap is inside the band.
     _clear_strikes(cand_id)
     logger.info(
         "Pre-market candidate APPROVED: [%s] gap=%+.2f%% %s — %s",
