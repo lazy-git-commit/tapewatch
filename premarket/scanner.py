@@ -91,6 +91,17 @@ _EVAL_CYCLE_BUDGET_SECONDS = 30.0
 _no_quote_strikes: dict[int, int] = {}
 _NO_QUOTE_EXPIRE_AFTER = 3
 
+# Grace window where a no-quote miss doesn't burn a strike at all. Observed
+# 2026-07-08: in the first ~90s after the open, Twelvedata served a quote
+# timestamped exactly 24h old for ~19 different tickers simultaneously (its
+# own snapshot cache not yet rotated for the new session) while Finnhub's
+# quote was still genuinely carrying yesterday's close — both sources
+# correctly read as "no live coverage yet" for a systemic, predictable,
+# self-healing reason unrelated to any single ticker's real coverage. It
+# resolved within one cycle every time, but a free strike here preserves the
+# full 3-strike budget for tickers with a genuine, not-provider-wide outage.
+_OPEN_GRACE_MINUTES = 2.0
+
 # Per-candidate strike counter for consecutive prev-close-unavailable cycles.
 # Finnhub returns pc=0 for some tickers; Twelvedata's daily bar can take 1-2
 # minutes to roll at 09:30 ET. Both produce gap_pct=None. Without a bound,
@@ -202,15 +213,31 @@ def _minutes_since_open() -> float:
     return (now - open_).total_seconds() / 60
 
 
-def _live_candidates(pending: list[dict], minutes_open: float) -> list[dict]:
+def _live_candidates(
+    pending: list[dict], minutes_open: float
+) -> tuple[list[dict], list[dict]]:
     """
     Sequential, NO-I/O pre-pass: expire candidates that are stale (created on a
     prior day) or whose eval window has closed, and return the ones still
     worth price-checking. Runs before the (parallel, I/O-bound) confirm phase so
     we never spend a quote/credit on a candidate that's already expired.
+
+    Returns (live, graduated):
+      live      — still inside the 30-min gap-and-go window, worth a price
+                  check this cycle.
+      graduated — window closed while STILL PENDING (never confirmed, never
+                  terminally rejected — only transient low_volume/low_momentum
+                  misses). The gap-and-go edge (buying the open-auction
+                  reaction) is gone, but the underlying catalyst may still be
+                  developing; the caller hands these to the same standing
+                  re-evaluation queue regular-hours signals use, rather than
+                  discarding a still-live catalyst just because it missed a
+                  30-minute cutoff. Stale (prior-day) candidates are NOT
+                  graduated — they're just dead.
     """
     today_london = datetime.now(_LONDON).date()
     live: list[dict] = []
+    graduated: list[dict] = []
     for cand in pending:
         # created_at is stored as a London-offset ISO string; parse it back to a
         # London date so midnight-straddling comparisons are correct.
@@ -228,16 +255,18 @@ def _live_candidates(pending: list[dict], minutes_open: float) -> list[dict]:
         if minutes_open > _EVAL_WINDOW_MINUTES:
             update_premarket_candidate(
                 cand["id"], "expired",
-                f"eval window closed ({minutes_open:.0f} min after open)",
+                f"eval window closed ({minutes_open:.0f} min after open) — "
+                f"handed off to standard momentum re-check",
             )
             _clear_strikes(cand["id"])
+            graduated.append(cand)
             continue
         live.append(cand)
-    return live
+    return live, graduated
 
 
 def _apply_confirmation(
-    cand: dict, conf: PriceConfirmation | None
+    cand: dict, conf: PriceConfirmation | None, minutes_open: float = 999.0
 ) -> tuple[dict, PriceConfirmation] | None:
     """
     Turn one candidate's PriceConfirmation into a verdict: write a terminal
@@ -253,6 +282,13 @@ def _apply_confirmation(
     ticker = cand["ticker"]
 
     if conf is None:
+        if minutes_open < _OPEN_GRACE_MINUTES:
+            logger.info(
+                "Pre-market eval [%s]: price data unavailable (opening grace "
+                "period, %.1f min since open) — retrying next cycle, no strike",
+                ticker, minutes_open,
+            )
+            return None
         # Track consecutive no-data cycles. After _NO_QUOTE_EXPIRE_AFTER strikes
         # the ticker has no Finnhub/Twelvedata coverage — expire it immediately
         # rather than burning API credits for the full eval window.
@@ -377,12 +413,17 @@ def _apply_confirmation(
     return (cand, conf)
 
 
-def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
+def evaluate_premarket_candidates() -> tuple[list[tuple[dict, PriceConfirmation]], list[dict]]:
     """
-    At-open evaluation of the watchlist. Returns the candidates that passed
-    BOTH the gap gate and full price confirmation, paired with their
-    PriceConfirmation — main.py executes them through its standard risk
-    gates and buy path (this module never places orders itself).
+    At-open evaluation of the watchlist. Returns (approved, graduated):
+      approved  — passed BOTH the gap gate and full price confirmation, paired
+                  with their PriceConfirmation — main.py executes them through
+                  its standard risk gates and buy path (this module never
+                  places orders itself).
+      graduated — still-PENDING candidates whose 30-min gap-and-go window just
+                  closed (see _live_candidates) — main.py hands these to the
+                  standard regular-hours re-evaluation queue instead of
+                  discarding a catalyst that simply hasn't confirmed yet.
 
     Candidates are price-confirmed CONCURRENTLY (bounded thread pool + fast,
     no-retry quote path) under a hard wall-clock budget, so one slow or
@@ -395,7 +436,7 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
     """
     pending = get_pending_premarket_candidates()
     if not pending:
-        return []
+        return [], []
 
     # Budget guard: if Twelvedata credits are spent, every confirm_price_signal
     # would return None anyway (the bar calls short-circuit). Don't spin up the
@@ -408,12 +449,12 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
             "%d candidate(s) left pending (no trades until UTC midnight)",
             len(pending),
         )
-        return []
+        return [], []
 
     minutes_open = _minutes_since_open()
-    live = _live_candidates(pending, minutes_open)
+    live, graduated = _live_candidates(pending, minutes_open)
     if not live:
-        return []
+        return [], graduated
 
     # ── Parallel confirm phase ───────────────────────────────────────────────
     # Each confirm_price_signal does its own fast (single-attempt, no-backoff)
@@ -461,8 +502,8 @@ def evaluate_premarket_candidates() -> list[tuple[dict, PriceConfirmation]]:
     for cand in live:
         if cand["id"] not in confs:
             continue  # unresolved within budget — stays pending
-        result = _apply_confirmation(cand, confs[cand["id"]])
+        result = _apply_confirmation(cand, confs[cand["id"]], minutes_open)
         if result is not None:
             approved.append(result)
 
-    return approved
+    return approved, graduated

@@ -544,7 +544,8 @@ def news_cycle() -> None:
 
     # ── 1. Pre-market candidates (first 30 min after open only) ──────────────
     try:
-        for cand, conf in evaluate_premarket_candidates():
+        approved, graduated = evaluate_premarket_candidates()
+        for cand, conf in approved:
             if was_recently_traded(cand["ticker"]):
                 update_premarket_candidate(cand["id"], "rejected", "24h ticker cooldown")
                 continue
@@ -559,6 +560,34 @@ def news_cycle() -> None:
             if not gates_ok:
                 logger.warning("Risk gate tripped mid-cycle: %s", gate_reason)
                 return
+
+        # Candidates whose 30-min gap-and-go window closed still PENDING (never
+        # confirmed, never terminally rejected) are hand off to the same
+        # standing re-evaluation queue regular-hours signals use, rather than
+        # discarded. A synthetic transient PriceConfirmation routes them through
+        # the existing _execute_entry -> _queue_reeval path unchanged (see
+        # 2026-07-08 post-mortem: KGS/ARQT/AYA/URGN all drifted 1-3% higher
+        # over the rest of the session after their premarket window expired,
+        # with no mechanism to ever look at them again).
+        for cand in graduated:
+            if was_recently_traded(cand["ticker"]):
+                continue
+            item = _candidate_to_news_item(cand)
+            handoff_conf = PriceConfirmation(
+                ticker=item.ticker, symbol=cand["ticker"],
+                current_price=0.0, open_price=0.0, prev_close=None,
+                day_move_pct=0.0, day_change_pct=None, recent_move_pct=0.0,
+                current_volume=0, avg_volume=0, rvol=0.0,
+                avg_dollar_volume=None, spread_proxy_pct=None,
+                is_confirmed=False,
+                reason=(
+                    "Gap-and-go eval window closed without a confirmed move — "
+                    "handed off to standard momentum re-check for the rest of "
+                    "the session"
+                ),
+                reason_code="low_momentum",
+            )
+            _execute_entry(item, handoff_conf, fetched_at)
     except Exception as exc:
         logger.error("Pre-market candidate evaluation failed: %s", exc, exc_info=True)
 

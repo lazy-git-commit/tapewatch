@@ -7,6 +7,68 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v19.4 — 2026-07-08 (zero-trade post-mortem: pre-market RVOL miscalibration + candidate abandonment)
+
+Investigation of a genuinely quiet trading day (2026-07-08, zero trades) found
+that 12 of 19 pre-market candidates — including a live M&A bid, three FDA
+approvals, and a $308M contract win — never received a real gate verdict at
+all; they were retried every cycle for 30 minutes and simply expired. Root
+cause verified against real end-of-day volume/price data (not assumed): the
+system's own caution was directionally correct today (chasing the loudest
+signal, BZH, would have bought the top — checked its actual close), but the
+mechanism producing that caution was broken, and a handful of real, if
+modest, gains (KGS +2.7%, ARQT +3.0%, AYA +1.8%, URGN +0.7%) were left
+un-tracked. Three fixes:
+
+### Intraday volume curve recalibrated (`market/price_check.py`)
+`_VOLUME_CURVE` assumed 16% of a stock's daily volume trades by minute 30
+after the open (a big-cap, open-auction-flow shape). Measured directly
+against real 2026-07-08 volume for BZH/JNJ/CACI/ARQT, the true fraction by
+minute 30 ran 1–4% — a 4–14× mismatch that pinned RVOL near-zero for the
+entire pre-market eval window regardless of whether the stock was genuinely
+trading well (BZH finished the day at 4× normal volume and was still reading
+RVOL ~0.3 at minute 29). The 0–150 min anchors are now roughly 3× less
+aggressive, reconverging with the original curve by minute 150 where there is
+no contradicting evidence. A first-pass empirical fit from one day's data,
+flagged in-code for revisiting as more days accumulate.
+
+### Opening no-quote grace period (`premarket/scanner.py`)
+In the first ~90s after the open, Twelvedata served a quote timestamped
+exactly 24h old for ~19 tickers simultaneously (its own snapshot cache not
+yet rotated for the new session) while Finnhub's quote was still genuinely
+carrying yesterday's close — both correctly read as "no live coverage" for a
+systemic, predictable, self-healing reason unrelated to any ticker's real
+coverage. `_OPEN_GRACE_MINUTES = 2.0`: a no-quote miss in this window no
+longer burns one of the 3 no-coverage strikes, preserving the full retry
+budget for tickers with a genuine, not-provider-wide outage.
+
+### Pre-market candidates no longer die at the 30-min cutoff (`premarket/scanner.py`, `main.py`)
+A candidate still PENDING (never confirmed, never terminally rejected) when
+its 30-minute gap-and-go window closed was simply discarded forever, even
+though the underlying catalyst might still be developing — unlike
+regular-hours signals, which get unlimited re-checks via `_reeval_queue`.
+`_live_candidates` now returns `(live, graduated)`; `main.news_cycle` hands
+`graduated` candidates into the exact same standing re-evaluation queue
+regular-hours signals use (via a synthetic transient `PriceConfirmation`
+routed through the existing `_execute_entry` → `_queue_reeval` path), instead
+of a bespoke new mechanism. Stale (prior-day) candidates are not graduated —
+those are just dead.
+
+### Retracted during design (not implemented — verified as not a bug)
+Initially suspected the v19.2 RVOL rescue (`get_session_volume_and_vwap`)
+never firing today was gate-ordering dead code (it lives inside the RVOL gate,
+which runs after the momentum-floor gate). On inspection this doesn't change
+any outcome: momentum and RVOL are computed from independent data (price bars
+vs. volume bars), so a momentum-floor rejection is valid regardless of RVOL
+accuracy, and rescue only matters when RVOL is the deciding gate — which it
+still runs for correctly. Direct comparison of Twelvedata's daily-bar volume
+against minute-bar-summed volume for BZH/JNJ/CACI confirmed they converged
+today (nothing to rescue); the mechanism remains correct for a genuinely
+lagging-data day like 2026-07-07.
+
+Tests: 188 passing (7 new: grace-period strike suppression, graduated-handoff
+routing through `_live_candidates` and `main.news_cycle`).
+
 ## v19.3 — 2026-07-08 (adversarial hardening: garbage-input immunity at every integration seam)
 
 Chaos-tested every external boundary with hostile payloads (malformed JSON,

@@ -83,25 +83,40 @@ _MARKET_CLOSE = (16, 0)  # 16:00 ET
 # ── Intraday volume curve ─────────────────────────────────────────────────────
 # Equity volume is U-shaped: heavy at the open, dead at lunch, heavy at the
 # close. These anchor points give the typical cumulative fraction of a full
-# day's volume traded by each time of day (ET). Derived from the well-known
-# U-curve; linearly interpolated between anchors.
+# day's volume traded by each time of day (ET); linearly interpolated between
+# anchors.
 #
 # Why it matters: "today's volume >= 1.5× the 20-day FULL-DAY average" is
-# nearly impossible at 10:00 (only ~16% of a normal day has traded) and
-# trivially true at 15:45. Normalizing by this curve makes the RVOL floor and
-# ceiling mean the same thing all session long.
+# nearly impossible at 10:00 and trivially true at 15:45. Normalizing by this
+# curve makes the RVOL floor and ceiling mean the same thing all session long.
+#
+# The 0–150 min anchors were recalibrated 2026-07-08: the original curve
+# (textbook big-cap-open-auction shape: 16% traded by minute 30) assumed a
+# front-loaded ramp this system's actual catalyst population — small/mid-cap
+# names reacting to a news wire, not S&P 500 constituents with pre-positioned
+# open-auction flow — doesn't show. Measured directly against real volume on
+# 2026-07-08 (BZH, JNJ, CACI, ARQT — a mix of gap-and-go and quiet names): the
+# true fraction traded by minute 30 ran 1–4%, not 16%, a 4–14× mismatch that
+# pinned RVOL near-zero for the entire pre-market eval window regardless of
+# whether the stock was genuinely trading well (BZH finished the day at 4×
+# normal volume and was STILL reading RVOL ~0.3 at minute 29). The new anchors
+# are a conservative partial correction (roughly 3x less aggressive through
+# minute 90, reconverging with the original curve by minute 150 where there
+# is no contradicting evidence) — a first-pass empirical fit from a single
+# day's data, not a fully validated model. Revisit with more days of measured
+# today_volume-vs-avg_daily_volume data as it accumulates.
 _VOLUME_CURVE: list[tuple[float, float]] = [
     # (minutes since 09:30 open, cumulative fraction of typical daily volume)
     (0,    0.00),
-    (5,    0.05),
-    (15,   0.10),
-    (30,   0.16),
-    (60,   0.25),
-    (90,   0.32),
-    (150,  0.42),
-    (210,  0.50),
-    (270,  0.59),
-    (330,  0.71),
+    (5,    0.015),
+    (15,   0.03),
+    (30,   0.05),
+    (60,   0.11),
+    (90,   0.18),
+    (150,  0.30),
+    (210,  0.42),
+    (270,  0.55),
+    (330,  0.70),
     (360,  0.80),
     (380,  0.88),
     (390,  1.00),

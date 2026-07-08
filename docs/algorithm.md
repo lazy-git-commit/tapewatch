@@ -276,12 +276,26 @@ rvol = today's cumulative volume
        / (20-day ADV × expected fraction of a day's volume traded by now)
 ```
 
-The expected fraction follows the intraday U-curve (~16% by 10:00, 50% by
-13:00, 100% at close), linearly interpolated. Without this, "1.5× the full-day
-average" is nearly impossible at 10:00 and trivial at 15:45 — the old raw
-ratio was a different filter at every hour of the day. RVOL ≈ 1.0 always means
-"a normal day so far". The 20× ceiling is the halt-pattern signature
-(parabolic participation on micro-caps).
+The expected fraction follows the intraday U-curve (~5% by 10:00, 42% by
+13:00, 100% at close — recalibrated 2026-07-08, was ~16%/50%), linearly
+interpolated. Without this, "1.5× the full-day average" is nearly impossible
+at 10:00 and trivial at 15:45 — the old raw ratio was a different filter at
+every hour of the day. RVOL ≈ 1.0 always means "a normal day so far". The 20×
+ceiling is the halt-pattern signature (parabolic participation on micro-caps).
+
+**Curve recalibration (v19.4, 2026-07-08):** the original curve assumed a
+big-cap, open-auction-flow shape (16% traded by minute 30). Measured directly
+against real volume that day for BZH/JNJ/CACI/ARQT, the true fraction by
+minute 30 ran 1–4% — this system's catalyst population (small/mid-cap names
+reacting to a news wire) doesn't front-load volume the way index constituents
+do. The 4–14× mismatch pinned RVOL near-zero for the entire 30-min pre-market
+eval window regardless of real participation (BZH: 4× normal full-day volume,
+still read RVOL ~0.3 at minute 29) — the proximate cause of 12/19 pre-market
+candidates expiring unevaluated that day. The 0–150 min anchors are now ~3×
+less aggressive, reconverging with the original curve by minute 150 where
+there's no contradicting evidence. First-pass empirical fit from one day's
+data — revisit as more days of measured `today_volume`/`avg_daily_volume`
+accumulate.
 
 **Daily-bar lag rescue (v19.2):** `today_volume` comes from Twelvedata's daily
 bar, whose volume field trails the live session by several minutes — worst at
@@ -537,6 +551,40 @@ catalyst) was terminally rejected at minute 5 on a lagged RVOL of 0.40 and
 never got a second look. These two codes now leave the candidate PENDING
 (re-evaluated every cycle until the eval window closes). The RTH pipeline got
 the equivalent fix as a 15-minute re-eval queue in `main.py` (see §4).
+
+**Opening no-quote grace period (v19.4, 2026-07-08):** In the first ~90s after
+the open, Twelvedata served a quote timestamped exactly 24h old for ~19
+tickers simultaneously (its own snapshot cache not yet rotated for the new
+session) while Finnhub's quote was still genuinely carrying yesterday's close
+— both correctly read as "no live coverage" for a systemic, predictable,
+self-healing reason unrelated to any ticker's real coverage. It resolved
+within one retry every time, but was burning one of only 3 no-quote strikes
+across the board. `_OPEN_GRACE_MINUTES=2.0`: a `conf=None` miss inside this
+window no longer increments `_no_quote_strikes`, preserving the full budget
+for tickers with a genuine, not-provider-wide outage.
+
+**Pre-market candidates no longer die at the 30-min cutoff (v19.4,
+2026-07-08):** Post-mortem of a zero-trade day found 12/19 pre-market
+candidates — including a live M&A bid war and three FDA approvals — expired
+"eval window closed" having never been terminally rejected: they were still
+PENDING (only ever hit transient `low_volume`/`low_momentum`), and were simply
+discarded. Unlike RTH signals (unlimited re-checks via `_reeval_queue`,
+§4), a premarket candidate got exactly one 30-minute shot. Verified against
+real closing prices that several of that day's expired candidates (KGS +2.7%,
+ARQT +3.0%, AYA +1.8%, URGN +0.7%) drifted favorably over the rest of the
+session with no mechanism to ever look at them again. `_live_candidates` now
+returns `(live, graduated)` — `graduated` is still-PENDING candidates whose
+window just closed (stale prior-day candidates are excluded: those are just
+dead, not graduated). `main.news_cycle` hands each graduated candidate into
+the SAME standing RTH re-evaluation queue via a synthetic transient
+`PriceConfirmation` (`reason_code="low_momentum"`) routed through the
+existing `_execute_entry` → `_queue_reeval` path — no new persistence
+mechanism, reuse of the already-tested one. This deliberately does NOT relax
+the 30-minute gap-and-go window itself (buying a stale morning gap late is
+exactly the "buying the top" failure v13 eliminated); it only gives the
+underlying catalyst a second life as an ordinary (non-gap) momentum-
+confirmation signal, identical to how a fresh RTH headline about the same
+stock is already evaluated.
 
 **Empirical ruling on `partnership` as TRADEABLE_CATALYST (2026-06-30):** Forward
 returns from 60-day history (233 positive partnership signals, `already_moved=0`)

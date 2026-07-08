@@ -589,10 +589,15 @@ class TestRvol:
         assert compute_rvol(100_000, 0, 60) == 0.0
 
     def test_morning_volume_not_penalized(self):
-        from market.price_check import compute_rvol
-        # 25% of ADV traded by 10:30 is a NORMAL day (RVOL ≈ 1), not "low volume".
-        # The old full-day ratio would have called this 0.25× and rejected it.
-        rvol = compute_rvol(250_000, 1_000_000, 60)
+        from market.price_check import compute_rvol, _expected_volume_fraction
+        # Trading exactly the curve's expected fraction by 10:30 is a NORMAL
+        # day (RVOL ≈ 1), not "low volume" — whatever that fraction is
+        # calibrated to (2026-07-08: recalibrated from 0.25 to 0.11 at minute
+        # 60 against measured real volume; this test must track the curve,
+        # not a hardcoded snapshot of it).
+        avg = 1_000_000
+        cum = int(avg * _expected_volume_fraction(60))
+        rvol = compute_rvol(cum, avg, 60)
         assert rvol == pytest.approx(1.0, rel=1e-3)
 
 
@@ -977,13 +982,14 @@ class TestPremarketEvalConcurrency:
 
         mock_confirm.side_effect = side_effect
         t0 = _t.monotonic()
-        approved = evaluate_premarket_candidates()
+        approved, graduated = evaluate_premarket_candidates()
         elapsed = _t.monotonic() - t0
 
         # 6 confirms at 0.3s each = 1.8s serial; in parallel (pool of 8) the wall
         # time is ~one call. <1.0s proves they ran concurrently, not summed.
         assert elapsed < 1.0
         assert len(approved) == 6  # all confirmed
+        assert graduated == []  # well inside the 30-min eval window
 
     @patch("premarket.scanner._EVAL_CYCLE_BUDGET_SECONDS", 0.2)
     @patch("premarket.scanner.update_premarket_candidate")
@@ -1003,7 +1009,7 @@ class TestPremarketEvalConcurrency:
             return _mk_conf(reason_code="approved", day_change_pct=5.0)
 
         mock_confirm.side_effect = side_effect
-        approved = evaluate_premarket_candidates()
+        approved, _graduated = evaluate_premarket_candidates()
         # T0 resolves and is approved; T1 blows the budget → NOT given a verdict
         # (no status write) so it stays pending for the next cycle.
         approved_ids = {c["id"] for c, _ in approved}
@@ -1012,6 +1018,112 @@ class TestPremarketEvalConcurrency:
         # T1 must NOT have been written to any terminal status this cycle.
         written_ids = {call.args[0] for call in mock_upd.call_args_list}
         assert 1 not in written_ids
+
+
+class TestOpenGraceNoQuote:
+    """
+    v19.4: a no-quote miss in the first _OPEN_GRACE_MINUTES doesn't burn a
+    strike (2026-07-08: Twelvedata served a 24h-stale quote for ~19 tickers
+    simultaneously in the first ~90s after the open, a systemic provider-cache
+    glitch unrelated to any single ticker's real coverage).
+    """
+
+    def setup_method(self):
+        import premarket.scanner as sc
+        sc._no_quote_strikes.clear()
+
+    teardown_method = setup_method
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_no_quote_in_grace_window_does_not_strike(self, mock_upd):
+        import premarket.scanner as sc
+        assert sc._apply_confirmation({"id": 1, "ticker": "A"}, None, minutes_open=0.5) is None
+        assert 1 not in sc._no_quote_strikes
+        mock_upd.assert_not_called()
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_no_quote_after_grace_window_strikes_normally(self, mock_upd):
+        import premarket.scanner as sc
+        assert sc._apply_confirmation({"id": 1, "ticker": "A"}, None, minutes_open=5.0) is None
+        assert sc._no_quote_strikes[1] == 1
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_default_minutes_open_behaves_like_post_grace(self, mock_upd):
+        # Callers that don't pass minutes_open (all pre-existing test call
+        # sites) must keep striking normally, not silently get free retries.
+        import premarket.scanner as sc
+        assert sc._apply_confirmation({"id": 1, "ticker": "A"}, None) is None
+        assert sc._no_quote_strikes[1] == 1
+
+
+class TestPremarketGraduation:
+    """
+    v19.4: a premarket candidate that's still PENDING (never confirmed, never
+    terminally rejected) when the 30-min gap-and-go window closes is handed
+    off to the standard re-evaluation queue instead of being discarded outright
+    (2026-07-08: KGS/ARQT/AYA/URGN drifted 1-3% higher over the rest of the
+    session after their premarket window expired with no path back in).
+    """
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_pending_candidate_past_window_is_graduated_not_dropped(self, mock_upd):
+        import premarket.scanner as sc
+        cand = {"id": 1, "ticker": "A_US_EQ",
+                "created_at": datetime.now(timezone.utc).isoformat()}
+        live, graduated = sc._live_candidates([cand], minutes_open=sc._EVAL_WINDOW_MINUTES + 1)
+        assert live == []
+        assert graduated == [cand]
+        assert mock_upd.call_args.args[1] == "expired"
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_stale_prior_day_candidate_is_not_graduated(self, mock_upd):
+        import premarket.scanner as sc
+        from datetime import timedelta
+        cand = {"id": 2, "ticker": "B_US_EQ",
+                "created_at": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()}
+        live, graduated = sc._live_candidates([cand], minutes_open=sc._EVAL_WINDOW_MINUTES + 1)
+        assert live == []
+        assert graduated == []  # stale — just dead, not handed off
+
+    @patch("premarket.scanner.update_premarket_candidate")
+    def test_still_inside_window_is_neither_live_nor_graduated_wrongly(self, mock_upd):
+        import premarket.scanner as sc
+        cand = {"id": 3, "ticker": "C_US_EQ",
+                "created_at": datetime.now(timezone.utc).isoformat()}
+        live, graduated = sc._live_candidates([cand], minutes_open=5.0)
+        assert live == [cand]
+        assert graduated == []
+
+    @patch("main.was_recently_traded", return_value=False)
+    @patch("main._execute_entry")
+    @patch("main.evaluate_premarket_candidates")
+    @patch("main._risk_gates_pass", return_value=(True, ""))
+    @patch("main.is_too_late_to_buy", return_value=False)
+    @patch("main.is_market_open", return_value=True)
+    @patch("main.touch_heartbeat")
+    def test_news_cycle_hands_off_graduated_candidates(
+        self, _hb, _mo, _late, _gates, mock_eval, mock_exec, _traded
+    ):
+        # news_cycle must route graduated candidates through _execute_entry
+        # with an unconfirmed, transient-coded PriceConfirmation so they land
+        # in the standard re-eval queue (same mechanism regular-hours signals
+        # use), not just get logged and forgotten.
+        import main
+        cand = {"id": 5, "ticker": "D_US_EQ", "headline": "h",
+                "article_id": "art-5", "confidence": 0.8,
+                "catalyst_type": "fda_approval", "catalyst_magnitude": 3,
+                "published_at": datetime.now(timezone.utc).isoformat()}
+        mock_eval.return_value = ([], [cand])
+        mock_exec.return_value = False
+
+        with patch("main.fetch_all_news", return_value=[]):
+            main.news_cycle()
+
+        assert mock_exec.called
+        item_arg, conf_arg, _fetched_at = mock_exec.call_args.args
+        assert item_arg.ticker == "D_US_EQ"
+        assert conf_arg.is_confirmed is False
+        assert conf_arg.reason_code == "low_momentum"  # transient → re-eval queue
 
 
 class TestApplyConfirmation:
@@ -1640,8 +1752,9 @@ class TestPremarketStrikeCleanup:
         sc._no_quote_strikes[9] = 2
         cand = {"id": 9, "ticker": "B",
                 "created_at": datetime.now(timezone.utc).isoformat()}
-        live = sc._live_candidates([cand], minutes_open=sc._EVAL_WINDOW_MINUTES + 1)
+        live, graduated = sc._live_candidates([cand], minutes_open=sc._EVAL_WINDOW_MINUTES + 1)
         assert live == []
+        assert graduated == [cand]  # still-pending candidate handed off, not just dropped
         assert 9 not in sc._no_quote_strikes
 
 
