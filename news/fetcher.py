@@ -499,17 +499,46 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
         if classifications is None:
             logger.error("Batch sentiment: no tool_use block in Claude response")
             return {}
+        if not isinstance(classifications, list):
+            logger.error(
+                "Batch sentiment: classifications is %s, not a list — discarding",
+                type(classifications).__name__,
+            )
+            return {}
 
         results: dict[str, dict] = {}
         for r in classifications:
-            if "id" not in r:
+            # Per-record validation, fail-closed per record: one malformed
+            # entry (confidence="high", magnitude "big", a stray string in
+            # the list) must skip THAT article, not raise out of the loop
+            # and discard the whole batch. Out-of-range values are rejected
+            # rather than clamped — a confidence of 7 is more likely a
+            # mis-scaled 0-10 answer than a genuine 100%+, and guessing the
+            # scale on a trading signal is worse than not trading it.
+            try:
+                if not isinstance(r, dict) or "id" not in r:
+                    continue
+                confidence = float(r.get("confidence", 0.5))
+                magnitude = int(r.get("catalyst_magnitude", 1))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Batch sentiment: malformed classification skipped: %s",
+                    str(r)[:120],
+                )
+                continue
+            if not (0.0 <= confidence <= 1.0) or not (1 <= magnitude <= 5):
+                logger.warning(
+                    "Batch sentiment: out-of-range classification skipped "
+                    "(confidence=%s magnitude=%s): %s",
+                    confidence, magnitude, str(r)[:120],
+                )
                 continue
             results[str(r["id"])] = {
                 "sentiment": str(r.get("sentiment", "neutral")).lower(),
-                "confidence": float(r.get("confidence", 0.5)),
+                "confidence": confidence,
                 "catalyst_type": str(r.get("catalyst_type", "other")),
                 "already_moved": bool(r.get("already_moved", False)),
-                "catalyst_magnitude": int(r.get("catalyst_magnitude", 1)),
+                "catalyst_magnitude": magnitude,
             }
         if len(results) < len(articles):
             logger.warning(
@@ -627,7 +656,9 @@ def fetch_all_news(
     eligible: list[tuple[dict, list[str], str]] = []  # (article, tickers, article_id)
 
     for article in articles:
-        article_id = str(article.get("benzinga_id") or article.get("url", article.get("title", "")))
+        if not isinstance(article, dict):
+            continue  # a null/scalar slipped into the feed's article array
+        article_id = str(article.get("benzinga_id") or article.get("url") or article.get("title") or "")
         if article_id in seen_ids:
             continue
         seen_ids.add(article_id)
@@ -637,9 +668,16 @@ def fetch_all_news(
         if _already_scored(article_id):
             continue
 
+        # Type guards: one non-string entry in one article's ticker list (ints,
+        # nulls) would otherwise AttributeError here and kill the ENTIRE fetch
+        # cycle; a bare-string tickers field would iterate as characters —
+        # and single letters like "A" are real NYSE tickers.
+        tickers_field = article.get("tickers") or []
+        if not isinstance(tickers_field, (list, tuple)):
+            tickers_field = []
         raw_tickers = [
-            t for t in (article.get("tickers") or [])
-            if t and not t.startswith("X:")  # X:BTCUSD etc. are crypto pairs, not equities
+            t for t in tickers_field
+            if isinstance(t, str) and t and not t.startswith("X:")  # X:BTCUSD etc. are crypto pairs
         ]
         if not raw_tickers:
             continue
@@ -664,7 +702,7 @@ def fetch_all_news(
         if len(raw_tickers) > 3:
             logger.debug(
                 "Skipping roundup article %s — %d tickers (max 3): %s",
-                article_id, len(raw_tickers), article.get("title", "")[:60],
+                article_id, len(raw_tickers), (article.get("title") or "")[:60],
             )
             continue
 
@@ -688,7 +726,10 @@ def fetch_all_news(
         # far cheaper than a Claude API call, and the pattern is conservative enough
         # that false positives (a tradeable headline accidentally matching) are
         # essentially impossible for the specific phrases targeted.
-        headline_raw = article.get("title", "")
+        # `or ""` (not a .get default): the feed can send title with an
+        # explicit null value, and .get's default only covers a MISSING key —
+        # regex/slicing on None would crash the whole cycle.
+        headline_raw = article.get("title") or ""
         if _ANALYST_ACTION_RE.search(headline_raw):
             logger.debug(
                 "Skipping analyst action article (pre-Claude filter): %s", headline_raw[:80],
@@ -705,8 +746,8 @@ def fetch_all_news(
     to_score = [
         {
             "id": article_id,
-            "headline": html.unescape(article.get("title", "")),
-            "teaser": html.unescape(article.get("teaser") or article.get("body", "")[:200]),
+            "headline": html.unescape(article.get("title") or ""),
+            "teaser": html.unescape(article.get("teaser") or (article.get("body") or "")[:200]),
         }
         for article, _, article_id in eligible
     ]
@@ -728,7 +769,7 @@ def fetch_all_news(
             score_rows.append({
                 "article_id": article_id,
                 "ticker": ticker,
-                "headline": html.unescape(article.get("title", "")),
+                "headline": html.unescape(article.get("title") or ""),
                 "sentiment": s["sentiment"],
                 "confidence": s["confidence"],
                 "catalyst_type": s["catalyst_type"],
@@ -751,7 +792,7 @@ def fetch_all_news(
         if s is None or s["sentiment"] != "positive":
             continue
 
-        headline = html.unescape(article.get("title", ""))
+        headline = html.unescape(article.get("title") or "")
 
         # Gate 1: confidence threshold (1–10 scale, cfg.min_sentiment_confidence).
         # Previously this setting existed but was never enforced anywhere.
@@ -792,7 +833,7 @@ def fetch_all_news(
             )
             continue
 
-        teaser = html.unescape(article.get("teaser") or article.get("body", "")[:200])
+        teaser = html.unescape(article.get("teaser") or (article.get("body") or "")[:200])
         try:
             published_at = datetime.fromisoformat(
                 article.get("published", "").replace("Z", "+00:00")

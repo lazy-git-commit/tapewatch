@@ -7,6 +7,63 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v19.3 — 2026-07-08 (adversarial hardening: garbage-input immunity at every integration seam)
+
+Chaos-tested every external boundary with hostile payloads (malformed JSON,
+wrong types, NaN, explicit nulls, mis-scaled values). New contract, enforced
+by `tests/test_adversarial.py` (42 tests): nothing a service can send may
+crash a scheduler cycle or produce a trade approval — garbage in → None /
+reject / skip out, and one bad record never takes down its batch.
+
+### Finnhub quote normalization (`market/finnhub_bars.py`)
+The raw `/quote` dict was returned as-is after a `c == 0` check, so `c=None`,
+`c="abc"`, `c=-5` and `c=NaN` all passed through to price math and gate
+comparisons. NaN is the silent killer: it compares False against every
+threshold, so a NaN price would sail through the penny/dead-cat/extended-move
+gates. `_normalize_quote()` now requires a positive finite `c` (else no
+quote); `o`/`pc` degrade to 0 ("missing"), a bad `t` degrades to None
+(staleness fails open) instead of poisoning downstream.
+
+### Twelvedata defensive coercion (`market/twelvedata_bars.py`)
+- `/quote`: field-by-field coercion — a garbage `previous_close` or
+  `timestamp` degrades that field to None instead of discarding an otherwise
+  good quote (the old code dropped the whole quote via the outer except).
+- `time_series`: `values` must be a non-empty LIST (a dict/string payload
+  previously flowed into `values[0]` indexing at every caller).
+- `_parse_bar_time`: non-dict bars (nulls/scalars smuggled into the array)
+  parse as "no timestamp" → bar skipped, instead of AttributeError out of the
+  whole series. `get_volume_stats` also catches AttributeError now.
+
+### Position sizing guards (`trading/executor.py`)
+`calculate_quantity` refused nothing: price=0 was a ZeroDivisionError, a
+malformed T212 cash payload ({"total": "abc"}) an unhandled ValueError. Now:
+non-finite/non-positive/unparseable price → `(None, reason)`; cash payload
+parse failures and NaN values → `(None, reason)`. `t212_to_symbol(None/"")`
+returns "" instead of AttributeError.
+
+### Claude output per-record validation (`news/fetcher.py`)
+One malformed classification record (confidence="high") raised out of the
+parse loop and discarded the WHOLE batch. Records are now validated
+individually — malformed ones are skipped with a warning, the rest survive.
+Out-of-range values (confidence outside [0,1], magnitude outside [1,5], NaN)
+are REJECTED, not clamped: a confidence of 7 is more likely a mis-scaled
+0-10 answer than a genuine 100%+, and guessing the scale on a trading signal
+is worse than not trading it. A non-list `classifications` payload → {}.
+
+### Benzinga article hygiene (`news/fetcher.py`)
+- A null/scalar in the article array, a non-string ticker (int/null), or a
+  bare-string `tickers` field each crashed the ENTIRE fetch cycle. Type
+  guards skip the bad element. (Bare-string tickers mattered doubly: "AAPL"
+  iterated as characters, and "A" is a real NYSE ticker.)
+- Explicit `null` title/teaser/body values crashed slicing/regex/unescape at
+  six call sites — `.get(k, "")` only covers a MISSING key, not a null value.
+  All are now `or ""` coalesced.
+
+Tests: 181 passing (42 new adversarial). No thresholds or strategy behavior
+changed — every fix is input validation at a service boundary.
+
+---
+
 ## v19.2 — 2026-07-07 (post-mortem of the first live session: GLASF stuck exit + four classes of missed trades)
 
 The first session where the pipeline could execute end-to-end (2026-07-07)

@@ -107,3 +107,5 @@ Always deploy via `git push origin main`. GitHub Actions picks it up, rsyncs to 
 - `TestBuyPrecisionRetry` — T212 precision-mismatch auto-retry logic
 - `TestClaudeResilience` — typed Claude failure handling (529 outage → short cooldown, 403 `billing_error` → long cooldown, cooldown suppresses/lifts correctly)
 - `TestTwelvedataCreditGuard` — `credits_exhausted()` daily backstop + `_claim_minute_token()` per-minute bucket both short-circuit before HTTP; `fast=` makes one attempt (no 429 backoff loop)
+
+`tests/test_adversarial.py` (v19.3) — chaos suite for every integration seam: hostile payloads (NaN prices, null titles, bare-string ticker lists, mis-scaled Claude confidences, scalar bars) must never crash a cycle nor produce a trade approval. Run it after touching any service-boundary parsing.

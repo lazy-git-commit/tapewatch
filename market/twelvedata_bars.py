@@ -47,6 +47,7 @@ Liquidity (ADV-based, deliberately):
 """
 
 import logging
+import math
 import threading
 import time
 import requests
@@ -55,6 +56,16 @@ import pytz
 from config.settings import cfg
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_float(v) -> float | None:
+    """float(v) that returns None for unparseable/non-finite values instead of
+    raising — NaN would compare False against every downstream gate threshold."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 _BASE_URL = "https://api.twelvedata.com"
 _TIMEOUT = 8
@@ -353,8 +364,14 @@ def _get_time_series(
                 )
                 return None
             values = data.get("values", [])
-            if not values:
-                logger.warning("Twelvedata: empty values for %s interval=%s", symbol, interval)
+            # Must be a non-empty LIST: a dict/string here would make callers
+            # index into it (`values[0]`) with garbage semantics instead of
+            # failing cleanly at the source.
+            if not isinstance(values, list) or not values:
+                logger.warning(
+                    "Twelvedata: empty or malformed values for %s interval=%s",
+                    symbol, interval,
+                )
                 return None
             return values
         except requests.exceptions.Timeout:
@@ -396,6 +413,11 @@ def _parse_bar_time(bar: dict) -> datetime | None:
     ``YYYY-MM-DD``. Treat both as ET because Twelvedata timestamps US equity
     bars in the exchange timezone.
     """
+    # isinstance guard: a scalar/null smuggled into the values array must
+    # parse as "no timestamp" (bar gets skipped by every caller) rather than
+    # AttributeError out of the whole series.
+    if not isinstance(bar, dict):
+        return None
     try:
         raw = bar.get("datetime", "")
         fmt = "%Y-%m-%d" if len(raw) == 10 else "%Y-%m-%d %H:%M:%S"
@@ -484,19 +506,27 @@ def get_twelvedata_quote(symbol: str, fast: bool = False) -> dict | None:
                     symbol, data.get("message", "unknown")[:80],
                 )
                 return None
-            close = data.get("close")
-            if close is None or float(close) == 0:
+            # Defensive coercion field-by-field: one malformed secondary field
+            # (a garbage previous_close or timestamp) must degrade to None for
+            # THAT field, not discard an otherwise good quote. Only an unusable
+            # close (missing / non-numeric / non-positive / NaN) kills it.
+            close_f = _safe_float(data.get("close"))
+            if close_f is None or close_f <= 0:
                 return None
+            open_f = _safe_float(data.get("open"))
+            pc_f = _safe_float(data.get("previous_close"))
+            av_f = _safe_float(data.get("average_volume"))
+            ts_f = _safe_float(data.get("timestamp"))
             quote = {
-                "c": float(close),
-                "o": float(data["open"]) if data.get("open") else float(close),
-                "pc": float(data["previous_close"]) if data.get("previous_close") else None,
-                "av": int(float(data["average_volume"])) if data.get("average_volume") else None,
+                "c": close_f,
+                "o": open_f if open_f is not None and open_f > 0 else close_f,
+                "pc": pc_f if pc_f is not None and pc_f > 0 else None,
+                "av": int(av_f) if av_f is not None and av_f > 0 else None,
                 # Unix seconds of the quote's own data time — lets callers apply
                 # the same staleness test as Finnhub's "t" (see
                 # price_check._quote_is_stale; a frozen quote must not be
                 # treated as a live price).
-                "t": int(float(data["timestamp"])) if data.get("timestamp") else None,
+                "t": int(ts_f) if ts_f is not None and ts_f > 0 else None,
             }
             logger.debug(
                 "Twelvedata /quote [%s]: c=%.4f o=%.4f pc=%s (Finnhub fallback)",
@@ -775,6 +805,8 @@ def get_volume_stats(
             avg_dollar_volume or 0, prev_close,
         )
         return today_volume, avg_daily_volume, avg_dollar_volume, prev_close
-    except (KeyError, ValueError, TypeError) as exc:
+    # AttributeError included: a scalar smuggled into the bar list raises it
+    # from `.get` — same malformed-payload class, same fail-closed answer.
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
         logger.warning("Twelvedata: malformed daily bar data for %s: %s", symbol, exc)
         return None, None, None, None

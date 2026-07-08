@@ -14,6 +14,7 @@ the portfolio's total value, capped to available cash.
 
 import base64
 import logging
+import math
 import time
 import requests
 from dataclasses import dataclass
@@ -204,6 +205,8 @@ def t212_to_symbol(t212_ticker: str) -> str:
     common AAPL_US_EQ shape and the best available guess before the map is
     built.
     """
+    if not t212_ticker:
+        return ""  # downstream quote lookups 4xx harmlessly on ""
     mapped = _t212_to_symbol.get(t212_ticker)
     if mapped:
         return mapped
@@ -385,6 +388,16 @@ def calculate_quantity(
     quantity. This makes the ADV cap and the quantity division mathematically
     consistent regardless of FX moves.
     """
+    # A zero/negative/NaN price would make the quantity division meaningless
+    # (or a ZeroDivisionError). Upstream normalization should make this
+    # impossible, but sizing is where the money moves — belt and braces.
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None, f"invalid price {price!r} — refusing to size"
+    if not math.isfinite(price) or price <= 0:
+        return None, f"invalid price {price!r} — refusing to size"
+
     try:
         data = _get("/equity/account/cash")
     except Exception as exc:
@@ -392,8 +405,17 @@ def calculate_quantity(
         logger.error("calculate_quantity for %s: %s", ticker, reason)
         return None, reason
 
-    portfolio_value = float(data.get("total", 0))
-    available_cash = float(data.get("free", 0))
+    try:
+        portfolio_value = float(data.get("total", 0))
+        available_cash = float(data.get("free", 0))
+    except (TypeError, ValueError):
+        reason = f"malformed T212 cash payload: {str(data)[:120]}"
+        logger.error("calculate_quantity for %s: %s", ticker, reason)
+        return None, reason
+    if not (math.isfinite(portfolio_value) and math.isfinite(available_cash)):
+        reason = f"non-finite T212 cash values: {str(data)[:120]}"
+        logger.error("calculate_quantity for %s: %s", ticker, reason)
+        return None, reason
 
     if portfolio_value <= 0 or available_cash <= 0:
         reason = f"no funds available (total=£{portfolio_value:.2f} free=£{available_cash:.2f})"

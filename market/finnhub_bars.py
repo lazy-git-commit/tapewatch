@@ -12,6 +12,7 @@ Retry policy:
 """
 
 import logging
+import math
 import time
 import requests
 from config.settings import cfg
@@ -21,6 +22,48 @@ logger = logging.getLogger(__name__)
 _QUOTE_URL = "https://finnhub.io/api/v1/quote"
 _RETRIES = 3
 _BASE_BACKOFF = 1.0  # seconds
+
+
+def _safe_float(v) -> float | None:
+    """float(v) that returns None for unparseable/non-finite values instead
+    of raising. NaN matters: NaN compares False against every gate threshold,
+    so a NaN price would silently pass penny/dead-cat/extended-move checks."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _normalize_quote(symbol: str, data) -> dict | None:
+    """
+    Validate and coerce a raw /quote payload into {"c", "o", "pc", "t"}.
+
+    The old code returned Finnhub's dict as-is after checking `c == 0`, which
+    let c=None, c="abc", c=-5 and c=NaN through to price math and gate
+    comparisons. The current price must be a positive finite number or the
+    quote is worthless; o/pc degrade to 0 (callers treat 0 as "missing");
+    a bad `t` degrades to None (staleness check fails open on it) rather
+    than discarding an otherwise good quote.
+    """
+    if not isinstance(data, dict):
+        logger.warning("Finnhub: non-dict quote payload for %s — ignoring", symbol)
+        return None
+    c = _safe_float(data.get("c"))
+    if c is None or c <= 0:
+        # Finnhub returns c=0 for unknown/halted symbols; None/garbage/negative
+        # all mean the same thing to us: no usable price.
+        logger.debug("Finnhub: unusable c=%r for %s — no quote", data.get("c"), symbol)
+        return None
+    o = _safe_float(data.get("o"))
+    pc = _safe_float(data.get("pc"))
+    t = _safe_float(data.get("t"))
+    return {
+        "c": c,
+        "o": o if o is not None and o > 0 else 0,
+        "pc": pc if pc is not None and pc > 0 else 0,
+        "t": int(t) if t is not None and t > 0 else None,
+    }
 
 
 def get_finnhub_quote(symbol: str, fast: bool = False) -> dict | None:
@@ -75,16 +118,14 @@ def get_finnhub_quote(symbol: str, fast: bool = False) -> dict | None:
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
-            data = resp.json()
-            if data.get("c", 0) == 0:
-                # Finnhub returns c=0 for unknown/halted symbols
-                logger.debug("Finnhub: c=0 for %s — symbol unknown or halted", symbol)
+            quote = _normalize_quote(symbol, resp.json())
+            if quote is None:
                 return None
             logger.debug(
                 "Finnhub quote [%s]: c=%.4f o=%.4f pc=%.4f",
-                symbol, data["c"], data.get("o", 0), data.get("pc", 0),
+                symbol, quote["c"], quote["o"], quote["pc"],
             )
-            return data
+            return quote
         except requests.exceptions.Timeout:
             logger.warning(
                 "Finnhub quote timeout for %s (attempt %d/%d)", symbol, attempt, attempts,
