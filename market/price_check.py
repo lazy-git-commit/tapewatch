@@ -364,7 +364,8 @@ class PriceConfirmation:
     reason: str
     # approved | opening_block | penny_stock | wide_spread | dead_cat |
     # extended_move | illiquid | low_momentum | high_momentum |
-    # low_volume | high_volume | below_vwap | insufficient_data | no_price_data
+    # low_volume | high_volume | below_vwap | exhausted_bounce |
+    # insufficient_data | no_price_data
     reason_code: str
     vwap: float | None = None       # session VWAP at confirmation (v15)
 
@@ -627,11 +628,13 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         session_volume: int | None = None
         session_vwap: float | None = None
         session_last: float | None = None
+        session_low: float | None = None
+        session_high: float | None = None
         session_bars_fetched = False
 
         if avg_daily_volume and avg_daily_volume > 0:
             if today_volume is None or rvol < cfg.min_rvol:
-                session_volume, session_vwap, session_last = (
+                session_volume, session_vwap, session_last, session_low, session_high = (
                     get_session_volume_and_vwap(symbol, fast=fast)
                 )
                 session_bars_fetched = True
@@ -691,7 +694,9 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             if session_bars_fetched:
                 vwap, vwap_last = session_vwap, session_last
             else:
-                _sv, vwap, vwap_last = get_session_volume_and_vwap(symbol, fast=fast)
+                _sv, vwap, vwap_last, session_low, session_high = (
+                    get_session_volume_and_vwap(symbol, fast=fast)
+                )
             if vwap is not None and vwap > 0:
                 base["vwap"] = vwap
                 # Accept at/above VWAP minus a small tolerance (handles a fresh
@@ -712,6 +717,36 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
                     "Price check [%s]: VWAP unavailable — confirming on momentum + RVOL only",
                     symbol,
                 )
+
+        # ── 10.5. Intraday exhaustion (chasing an already-completed round trip) ─
+        # day_change_pct only sees distance from YESTERDAY's close;
+        # recent_move_pct only sees the last ~5 minutes. Neither can see the
+        # SHAPE of today's own session. 2026-07-09: LEVI gapped down as much as
+        # -7.8% at the open on an earnings beat ("sell the news"), then clawed
+        # all the way back to +2.3% by the time this gate would have run —
+        # within 15 cents of the exact high of the day, three minutes before
+        # the actual peak. Every other gate read clean; the trade faded for
+        # the rest of the session. Requires session_low/session_high from the
+        # same bar pull already spent on RVOL rescue / VWAP above — no extra
+        # credit. Both conditions must hold: the day's range must be large
+        # enough to be a real round trip (not noise), and price must already
+        # sit deep inside the recovered portion of it.
+        if (
+            cfg.require_exhaustion_check
+            and session_low is not None and session_high is not None
+            and session_high > session_low
+        ):
+            day_range_pct = (session_high - session_low) / session_low * 100
+            if day_range_pct >= cfg.exhaustion_min_range_pct:
+                recovered_frac = (current_price - session_low) / (session_high - session_low)
+                if recovered_frac >= cfg.exhaustion_recovery_threshold:
+                    return _reject(
+                        base, "exhausted_bounce",
+                        f"Price has recovered {recovered_frac:.0%} of today's "
+                        f"{day_range_pct:.1f}% low-to-high range (low ${session_low:.2f} "
+                        f"→ high ${session_high:.2f}) — chasing the tail of a bounce, "
+                        f"not a fresh move",
+                    )
 
         # ── Degraded-data floor: at least ONE participation gate must PASS ───
         # Each fallback above is individually reasonable (daily bar not rolled →

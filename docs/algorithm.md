@@ -128,6 +128,25 @@ Each article gets four fields: `sentiment`, `confidence` (0–1),
 `sentiment_scores`** for the eval loop (§9). The model classifies; code decides
 what trades.
 
+**Same-day same-ticker cross-reference (v19.5, 2026-07-09):** each article is
+otherwise scored with zero memory of any OTHER article about the same stock
+earlier that session. 2026-07-09: Benzinga ran two articles about LEVI's exact
+same earnings print two hours apart with opposite framing — 09:39 ET *"Stock
+Tumbles 4% Despite Q2 Earnings Beat"* (scored negative, correctly never
+traded), then 11:30 ET *"Posts Beat-And-Raise Quarter, Analysts See More
+Upside In 2H"* (scored positive, 85% confidence — the one traded, at the top
+of the recovery bounce the first article's "tumble" had already produced).
+A session-scoped, daily-reset `_ticker_history` dict (`news/fetcher.py`)
+records every scored article per ticker (sentiment + headline + time); the
+next article for that ticker carries up to 3 prior same-day verdicts as a
+`PRIOR ARTICLE(S) TODAY ON THIS TICKER` line appended to its entry in the
+(uncached, per-cycle) user message — the cache prefix is unaffected since
+this is per-cycle content, not the static rubric. The system prompt gained a
+"SAME-TICKER CONTEXT" instruction: a positive respin of a story that already
+had a negative reaction today should be read with extra skepticism (lower
+confidence, lean `already_moved=true`) unless it contains a genuinely new,
+separate fact.
+
 ### 3.3 Trade gates (code, not model)
 
 A positive classification only becomes a tradeable signal if **all** pass:
@@ -219,6 +238,7 @@ Checks run cheapest-first; each rejection records a `reason_code`:
 | 8 | `high_momentum` | > +15% over ~5 min | Post-halt spike — halt articles publish AFTER the 30–120% pop. Runs before VWAP to save a credit |
 | 9 | `low_volume` / `high_volume` | RVOL outside [1.5, 20] | See RVOL section (v19.2: daily-bar lag rescued with session minute bars; the "skip when the daily bar hasn't rolled" bypass is gone) |
 | 10 | `below_vwap` | price < session VWAP (− small tol) | v15: size-neutral accumulation test — see below |
+| 10.5 | `exhausted_bounce` | day's range ≥ **5%** AND price recovered ≥ **75%** of it | v19.5: LEVI bought within 15¢ of the day's exact high, 3 min before the peak, after gapping down −7.8% at the open — see below |
 | 11 | `insufficient_data` | no volume measurement AND no VWAP | v19.2: three individually-reasonable fallbacks (open-price baseline, RVOL deferred, VWAP skipped) could stack into approving on a bare stale quote — how GLASF traded. At least one participation measure must positively exist |
 
 **Transient vs terminal (v19.2):** `low_volume` and `low_momentum` describe
@@ -268,6 +288,51 @@ pull); every cheaper gate filters first.
 - Sources: [PEAD (Wikipedia)](https://en.wikipedia.org/wiki/Post%E2%80%93earnings-announcement_drift),
   [VWAP momentum strategy playbook](https://www.snappchart.app/blog/strategy-playbooks/vwap-momentum-trading-strategy),
   [volume confirmation for entries](https://www.quantvps.com/blog/using-volume-analysis-to-confirm-trade-entries-and-exits).
+
+### Intraday exhaustion — has the stock already had its move today? (v19.5)
+
+`day_change_pct` and `recent_move_pct` are both **endpoint** measures: distance
+from yesterday's close, and distance from ~5 minutes ago. Neither sees the
+**shape** of today's own session. A stock that gapped down hard at the open
+and clawed most of the way back looks, on both those measures, identical to
+one calmly grinding to fresh highs — yet the first is a fading bounce and the
+second is a real breakout.
+
+2026-07-09, LEVI: gapped as much as **−7.8%** at the open on an earnings beat
+("sell the news" — Benzinga's own 09:39 ET article was headlined *"Stock
+Tumbles 4% Despite Q2 Earnings Beat"*), then recovered to **+2.3%** vs
+yesterday's close by 11:30 ET. Every existing gate read clean at that point
+(momentum +0.32%, day change +2.09%, RVOL 1.5) and the trade was bought
+within **15 cents of the exact high of the day**, three minutes before the
+actual peak. It faded for the rest of the session, closing on the time-stop
+at −1.19%.
+
+```
+day_range_pct   = (session_high − session_low) / session_low × 100
+recovered_frac  = (current_price − session_low) / (session_high − session_low)
+reject if day_range_pct ≥ EXHAUSTION_MIN_RANGE_PCT (5.0)
+      AND recovered_frac ≥ EXHAUSTION_RECOVERY_THRESHOLD (0.75)
+```
+
+Both conditions must hold: the range floor keeps a normal day's noise from
+tripping the gate (a stock that's only moved 2% top-to-bottom hasn't "had its
+move"), and the recovery threshold only fires once price is deep inside the
+already-recovered portion of a real round trip. `session_low`/`session_high`
+come from the SAME 1-min-bar pull already spent on the RVOL rescue and VWAP
+(`get_session_volume_and_vwap` — extended from a 3-tuple to a 5-tuple to add
+them) — no extra Twelvedata credit. Toggle: `REQUIRE_EXHAUSTION_CHECK`.
+
+**Considered and rejected: scaling take-profit/stop-loss by catalyst_magnitude.**
+LEVI's catalyst was rated magnitude 2/5 (Claude's own "modest" judgement) and
+the stock topped out at +0.56% — nowhere near the flat 5% take-profit every
+trade uses. The tempting fix is to lower the TP target for low-magnitude
+catalysts so a trade like this can lock in a smaller real gain. Rejected: a
+2% profit target isn't worth taking the trade for at all — if that's genuinely
+the ceiling for a magnitude-2 catalyst, the right response is not to trade it,
+not to shrink the target. The exhaustion gate is the more precise fix anyway:
+it targets what actually went wrong (bought at the top of an already-completed
+move), not the catalyst class in general — a magnitude-2 catalyst caught EARLY
+in its move is not disqualified by this gate at all.
 
 ### RVOL — time-of-day normalized relative volume
 

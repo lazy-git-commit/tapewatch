@@ -180,8 +180,9 @@ class TestTimeSeriesGarbage(_TDBucketReset):
             "not-even-a-dict-would-be-nice",             # raises per-bar → skipped
         ]
         with patch.object(td, "_get_time_series", return_value=bars):
-            vol, vwap, last = td.get_session_volume_and_vwap("ACME")
+            vol, vwap, last, low, high = td.get_session_volume_and_vwap("ACME")
         assert vol == 3000 and last == 10.1 and vwap is not None
+        assert low == 10.0 and high == 10.2  # only the one clean bar counts
 
 
 # ── Price confirmation end-to-end with hostile inputs ─────────────────────────
@@ -195,7 +196,8 @@ class TestConfirmSignalGarbage:
         with patch.object(pc, "get_quote_with_fallback", return_value=quote), \
              patch.object(pc, "get_momentum_baseline", return_value=(None, None, None)), \
              patch.object(pc, "get_volume_stats", return_value=(None, None, None, None)), \
-             patch.object(pc, "get_session_volume_and_vwap", return_value=(None, None, None)):
+             patch.object(pc, "get_session_volume_and_vwap",
+                           return_value=(None, None, None, None, None)):
             return pc.confirm_price_signal("ACME_US_EQ")
 
     def test_minimal_quote_no_bars_fails_closed(self):

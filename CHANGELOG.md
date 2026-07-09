@@ -7,6 +7,58 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v19.5 — 2026-07-09 (bad-trade post-mortem: intraday exhaustion + same-day news respin)
+
+Post-mortem of the day's one trade, LEVI (Levi Strauss): bought $24.93 at
+11:30 ET on an 85%-confidence "beat-and-raise" earnings headline, sold
+$24.72 at 12:31 ET via time-stop, -1.19%. Every existing gate read clean
+(momentum +0.32%, day change +2.09% vs prev close, RVOL 1.5). Real minute
+bars from Yahoo Finance told a different story: LEVI had gapped down as
+much as -7.8% at the open on the SAME earnings ("sell the news"), then
+clawed back to +2.3% by the time of entry — bought within 15 cents of the
+exact high of the day, three minutes before the actual peak, then faded for
+the rest of the session. Two root causes, two fixes:
+
+### Intraday exhaustion gate (`market/price_check.py`, `market/twelvedata_bars.py`, `config/settings.py`)
+`day_change_pct` only measures distance from YESTERDAY's close; `recent_move_pct`
+only measures the last ~5 minutes. Neither can see the SHAPE of today's own
+session — a stock that gapped down hard and clawed most of the way back looks
+identical, on both those measures, to one calmly grinding to fresh highs.
+New gate 10.5, `exhausted_bounce`: reuses the SAME session-bar pull already
+spent on RVOL rescue / VWAP (`get_session_volume_and_vwap`, now also returns
+`session_low`/`session_high` — a 5-tuple, up from 3 — at no extra Twelvedata
+credit cost). Rejects when today's low-to-high range is at least
+`EXHAUSTION_MIN_RANGE_PCT` (5.0, i.e. a real round trip, not noise) AND price
+has already recovered at least `EXHAUSTION_RECOVERY_THRESHOLD` (0.75) of that
+range. Toggle: `REQUIRE_EXHAUSTION_CHECK` (default true).
+
+### Same-day same-ticker article cross-reference (`news/fetcher.py`)
+Benzinga published TWO articles about LEVI's exact same earnings print two
+hours apart with opposite framing: 09:39 ET *"Stock Tumbles 4% Despite Q2
+Earnings Beat"* (scored negative, correctly never traded), then 11:30 ET
+*"Posts Beat-And-Raise Quarter, Analysts See More Upside In 2H"* (scored
+positive, 85% confidence — the one traded). Claude scored the second article
+with zero memory of the first. A new session-scoped, daily-reset
+`_ticker_history` dict records every scored article per ticker; the next
+article for that ticker carries up to 3 prior same-day verdicts as a
+`PRIOR ARTICLE(S) TODAY ON THIS TICKER` line in the (per-cycle, uncached)
+user message. The cached system prompt gained a new "SAME-TICKER CONTEXT"
+paragraph instructing the model to read a positive respin of a story that
+already had a negative reaction today with extra skepticism — lower
+confidence, lean `already_moved=true` — unless the new article contains a
+genuinely new, separate fact.
+
+### Considered and rejected: scaling TP/SL by catalyst_magnitude
+LEVI's catalyst_magnitude was 2/5 (Claude's own "modest" rating) and the
+stock only reached +0.56% before fading, well short of the flat 5% take-
+profit every trade uses regardless of catalyst size. Proposed scaling TP/SL
+down for low-magnitude catalysts; rejected — a 2% target isn't worth taking
+the trade for. The exhaustion gate directly addresses what actually
+happened (bought at the top of an already-completed move) without touching
+the profit target, which stays a flat 5%/2% for every trade.
+
+Tests: 200 passing (12 new: 5 exhaustion-gate, 7 same-day cross-reference).
+
 ## v19.4 — 2026-07-08 (zero-trade post-mortem: pre-market RVOL miscalibration + candidate abandonment)
 
 Investigation of a genuinely quiet trading day (2026-07-08, zero trades) found

@@ -677,15 +677,16 @@ def get_session_vwap(symbol: str, fast: bool = False) -> tuple[float | None, flo
     accumulate only today's bars. Early in the session there are few bars, which
     is fine — VWAP is simply the average so far.
     """
-    _vol, vwap, last_price = get_session_volume_and_vwap(symbol, fast=fast)
+    _vol, vwap, last_price, _low, _high = get_session_volume_and_vwap(symbol, fast=fast)
     return vwap, last_price
 
 
 def get_session_volume_and_vwap(
     symbol: str, fast: bool = False
-) -> tuple[int | None, float | None, float | None]:
+) -> tuple[int | None, float | None, float | None, float | None, float | None]:
     """
-    One 1-min-bars pull (1 credit) → (session_volume, vwap, last_price).
+    One 1-min-bars pull (1 credit) →
+    (session_volume, vwap, last_price, session_low, session_high).
 
     session_volume — Σ volume of today's minute bars. This is the RESCUE
     source for RVOL when Twelvedata's daily bar hasn't rolled or lags at the
@@ -697,17 +698,27 @@ def get_session_volume_and_vwap(
     max(daily_bar_volume, session_volume) — the rescue can only ever ADD
     measured participation, never hide it.
 
-    Returns (None, None, None) if bar data is unavailable; session_volume=0
-    with vwap=None when bars exist but nothing traded today yet.
+    session_low/session_high — min/max of each bar's low/high so far today,
+    independent of volume. Added v19.5 to detect a stock that has already
+    round-tripped most of an intraday move (2026-07-09 LEVI post-mortem:
+    day_change_pct vs yesterday's close and the 5-min momentum window both
+    looked clean while the stock had actually gapped down -7.8% at the open
+    and clawed back to within cents of the day's high before entry).
+
+    Returns (None, None, None, None, None) if bar data is unavailable;
+    session_volume=0 with vwap=None (low/high still populated if any bars
+    exist) when bars exist but nothing traded today yet.
     """
     values = _get_time_series(symbol, interval="1min", outputsize=390, fast=fast)
     if values is None or len(values) < 1:
-        return None, None, None
+        return None, None, None, None, None
 
     now_et_date = datetime.now(_ET).date()
     cum_pv = 0.0   # Σ typical_price × volume
     cum_v = 0.0    # Σ volume
     last_price: float | None = None
+    session_low: float | None = None
+    session_high: float | None = None
 
     # values are newest-first; iterate oldest→newest so last_price ends on the
     # most recent bar. Only include bars from today's session.
@@ -726,17 +737,19 @@ def get_session_volume_and_vwap(
         cum_pv += typical * vol
         cum_v += vol
         last_price = close
+        session_low = low if session_low is None else min(session_low, low)
+        session_high = high if session_high is None else max(session_high, high)
 
     if cum_v <= 0 or last_price is None:
         # No volume yet (pre-open or dead tape) — VWAP undefined.
-        return int(cum_v), None, last_price
+        return int(cum_v), None, last_price, session_low, session_high
 
     vwap = cum_pv / cum_v
     logger.debug(
-        "Twelvedata session bars [%s]: vol=%d vwap=%.4f last=%.4f",
-        symbol, int(cum_v), vwap, last_price,
+        "Twelvedata session bars [%s]: vol=%d vwap=%.4f last=%.4f low=%s high=%s",
+        symbol, int(cum_v), vwap, last_price, session_low, session_high,
     )
-    return int(cum_v), vwap, last_price
+    return int(cum_v), vwap, last_price, session_low, session_high
 
 
 def get_volume_stats(

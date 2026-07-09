@@ -187,6 +187,118 @@ class TestSentimentScoring:
         assert kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
 
 
+# ── Same-day same-ticker cross-reference tests (v19.5) ────────────────────────
+
+class TestSameDayTickerCrossReference:
+    """
+    A second article about a ticker already scored today carries the earlier
+    verdict as context (2026-07-09 LEVI post-mortem: a negative "tumbles
+    despite beat" article at 09:39 ET had no bearing on how Claude read a
+    positive "more upside" respin of the SAME earnings at 11:30 ET — the
+    system bought at the top of the recovery bounce the first article's
+    "tumble" had already produced).
+    """
+
+    def setup_method(self):
+        import news.fetcher as f
+        f._scored_articles["date"] = None
+        f._scored_articles["ids"] = set()
+        f._ticker_history["date"] = None
+        f._ticker_history["tickers"] = {}
+
+    def _mock_tool_response(self, classifications):
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": classifications}
+        msg = MagicMock()
+        msg.content = [block]
+        return msg
+
+    def test_no_prior_history_returns_none(self):
+        from news.fetcher import _prior_ticker_context
+        assert _prior_ticker_context("AAPL_US_EQ") is None
+
+    def test_recording_then_lookup_returns_context(self):
+        import news.fetcher as f
+        f._record_ticker_history("AAPL_US_EQ", "X Tumbles Despite Beat", "negative",
+                                  datetime.now(timezone.utc))
+        ctx = f._prior_ticker_context("AAPL_US_EQ")
+        assert ctx is not None and "negative" in ctx and "Tumbles" in ctx
+
+    def test_context_caps_at_three_most_recent(self):
+        import news.fetcher as f
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            f._record_ticker_history("AAPL_US_EQ", f"Headline {i}", "neutral", now)
+        ctx = f._prior_ticker_context("AAPL_US_EQ")
+        assert "Headline 0" not in ctx and "Headline 1" not in ctx
+        assert "Headline 4" in ctx
+
+    def test_history_resets_on_new_day(self):
+        import news.fetcher as f
+        from datetime import timedelta
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        f._record_ticker_history("AAPL_US_EQ", "Old news", "positive", yesterday)
+        f._ticker_history["date"] = yesterday.date()  # simulate a stale day marker
+        assert f._prior_ticker_context("AAPL_US_EQ") is None
+
+    @patch("news.fetcher._claude")
+    def test_prior_context_reaches_claude_prompt(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
+        mock_claude.messages.create.return_value = self._mock_tool_response([])
+        _batch_score_sentiment([
+            {"id": "1", "headline": "H", "teaser": "T",
+             "prior_context": 'AAPL_US_EQ: 09:39 UTC negative ("X Tumbles")'},
+        ])
+        user_msg = mock_claude.messages.create.call_args.kwargs["messages"][0]["content"]
+        assert "PRIOR ARTICLE(S) TODAY" in user_msg and "X Tumbles" in user_msg
+
+    @patch("news.fetcher._claude")
+    def test_no_prior_context_key_omits_prompt_line(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
+        mock_claude.messages.create.return_value = self._mock_tool_response([])
+        _batch_score_sentiment([{"id": "1", "headline": "H", "teaser": "T"}])
+        user_msg = mock_claude.messages.create.call_args.kwargs["messages"][0]["content"]
+        assert "PRIOR ARTICLE(S) TODAY" not in user_msg
+
+    @patch("news.fetcher.save_sentiment_scores")
+    @patch("news.fetcher._batch_score_sentiment")
+    @patch("news.fetcher._fetch")
+    def test_second_article_same_ticker_carries_first_as_context(
+        self, mock_fetch, mock_score, _mock_save
+    ):
+        import news.fetcher as f
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        mock_fetch.return_value = [{
+            "tickers": ["AAPL"], "title": "AAPL Tumbles Despite Beat",
+            "teaser": "t1", "benzinga_id": "a1", "published": now_iso,
+        }]
+        mock_score.return_value = {"a1": {
+            "sentiment": "negative", "confidence": 0.75,
+            "catalyst_type": "earnings_beat", "already_moved": False,
+            "catalyst_magnitude": 2,
+        }}
+        f.fetch_all_news(seen_checker=lambda a, t: False)
+        first_payload = mock_score.call_args.args[0]
+        assert "prior_context" not in first_payload[0]
+
+        mock_fetch.return_value = [{
+            "tickers": ["AAPL"], "title": "AAPL More Upside In 2H",
+            "teaser": "t2", "benzinga_id": "a2", "published": now_iso,
+        }]
+        mock_score.return_value = {"a2": {
+            "sentiment": "positive", "confidence": 0.85,
+            "catalyst_type": "earnings_beat", "already_moved": False,
+            "catalyst_magnitude": 2,
+        }}
+        f.fetch_all_news(seen_checker=lambda a, t: False)
+        second_payload = mock_score.call_args.args[0]
+        assert "prior_context" in second_payload[0]
+        assert "negative" in second_payload[0]["prior_context"]
+        assert "Tumbles" in second_payload[0]["prior_context"]
+
+
 # ── Catalyst magnitude tests ─────────────────────────────────────────────────
 
 class TestCatalystMagnitude:
@@ -1858,8 +1970,15 @@ class TestQuoteStaleness:
 
 
 def _confirm_with(monkey_now_et, quote, baseline, volume_stats, session):
-    """Run confirm_price_signal with all data dependencies mocked."""
+    """Run confirm_price_signal with all data dependencies mocked.
+
+    `session` may be a 3-tuple (session_volume, vwap, last_price) — padded
+    with (None, None) for session_low/session_high, i.e. the exhaustion gate
+    sees no range data and stays silent — or a full 5-tuple to also drive it.
+    """
     import market.price_check as pc
+    if len(session) == 3:
+        session = (*session, None, None)
     fake_dt = MagicMock()
     fake_dt.now.side_effect = lambda tz=None: monkey_now_et
     with patch.object(pc, "datetime", fake_dt), \
@@ -1933,6 +2052,76 @@ class TestRvolRescueAndDegradedData:
         )
         assert conf is not None and not conf.is_confirmed
         assert conf.reason_code == "insufficient_data"
+
+
+class TestExhaustionGate:
+    """
+    v19.5: reject a stock that has already recovered most of a large intraday
+    round trip, even when day_change_pct (vs yesterday) and recent_move_pct
+    (last ~5 min) both look clean (2026-07-09 LEVI post-mortem: gapped -7.8%
+    at the open, recovered to +2.3% by entry — bought within 15 cents of the
+    exact high of the day).
+
+    today_volume=100_000 against avg_daily_volume=1_000_000 at 30 min since
+    open clears MIN_RVOL without needing the rescue path, so these exercise
+    the VWAP block's OWN session-bars fetch (the `else` branch), not the RVOL
+    rescue's.
+    """
+
+    _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.0}
+    _BASELINE = (10.2, 10.5, 0.5)             # +2.94% recent move
+    _VOLUME_STATS = (100_000, 1_000_000, 10_000_000.0, 10.0)  # rvol ~2.0, no rescue needed
+
+    @staticmethod
+    def _now_et():
+        import pytz
+        et = pytz.timezone("America/New_York")
+        return et.localize(datetime(2026, 7, 9, 10, 0, 0))  # 30 min after open
+
+    def test_recovered_bounce_rejected(self):
+        # range = (10.52-9.5)/9.5 = 10.7% (>=5%); recovered = (10.5-9.5)/(10.52-9.5) = 98% (>=75%)
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE, self._BASELINE, self._VOLUME_STATS,
+            (100_000, 10.0, 10.5, 9.5, 10.52),
+        )
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "exhausted_bounce"
+
+    def test_small_range_not_flagged(self):
+        # range = (10.6-10.3)/10.3 = 2.9% < 5% floor — not a real round trip,
+        # gate doesn't even evaluate recovered fraction.
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE, self._BASELINE, self._VOLUME_STATS,
+            (100_000, 10.0, 10.5, 10.3, 10.6),
+        )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+
+    def test_large_range_but_not_mostly_recovered_passes(self):
+        # range = (12.0-9.0)/9.0 = 33% (big); recovered = (10.5-9.0)/(12.0-9.0) = 50% < 75%
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE, self._BASELINE, self._VOLUME_STATS,
+            (100_000, 10.0, 10.5, 9.0, 12.0),
+        )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+
+    def test_missing_range_data_does_not_gate(self):
+        # No session_low/session_high available (3-tuple session, padded to
+        # (None, None) by _confirm_with) — the gate has nothing to evaluate
+        # and must not reject for lack of data (that's insufficient_data's job).
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE, self._BASELINE, self._VOLUME_STATS,
+            (100_000, 10.0, 10.5),
+        )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+
+    def test_toggle_off_disables_gate(self):
+        import market.price_check as pc
+        with patch.object(pc.cfg, "require_exhaustion_check", False):
+            conf, _ = _confirm_with(
+                self._now_et(), self._QUOTE, self._BASELINE, self._VOLUME_STATS,
+                (100_000, 10.0, 10.5, 9.5, 10.52),  # same as the rejected case above
+            )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
 
 
 class TestSellEscalation:
@@ -2056,7 +2245,7 @@ class TestSessionVolumeAndVwap:
     @patch("market.twelvedata_bars._get_time_series", return_value=None)
     def test_no_bars_returns_all_none(self, _ts):
         import market.twelvedata_bars as td
-        assert td.get_session_volume_and_vwap("ACME") == (None, None, None)
+        assert td.get_session_volume_and_vwap("ACME") == (None, None, None, None, None)
 
     @patch("market.twelvedata_bars._get_time_series")
     def test_sums_only_todays_volume(self, mock_ts):
@@ -2072,7 +2261,9 @@ class TestSessionVolumeAndVwap:
             {"datetime": "2026-06-29 15:59:00", "high": "9.0", "low": "8.8",
              "close": "8.9", "volume": "99999"},   # stale bar — excluded
         ]
-        vol, vwap, last = td.get_session_volume_and_vwap("ACME")
+        vol, vwap, last, low, high = td.get_session_volume_and_vwap("ACME")
         assert vol == 5000
         assert vwap is not None and 9.9 < vwap < 10.2
         assert last == 10.1
+        assert low == 9.9   # min of today's bars' low, stale bar excluded
+        assert high == 10.2  # max of today's bars' high, stale bar excluded

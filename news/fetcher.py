@@ -82,6 +82,47 @@ def _mark_scored(article_ids) -> None:
         _scored_articles["ids"] = set()
     _scored_articles["ids"].update(article_ids)
 
+
+# ── Same-day same-ticker history (session-scoped, reset daily) ──────────────
+# A stock can get multiple articles about the SAME underlying event hours
+# apart with opposite framing. 2026-07-09: LEVI got "Stock Tumbles 4% Despite
+# Q2 Earnings Beat" at 09:39 ET (scored negative, correctly never traded),
+# then "Posts Beat-And-Raise Quarter, Analysts See More Upside In 2H" at
+# 11:30 ET (scored positive, 85% confidence) — same earnings, opposite spin.
+# Claude scored the second article with zero memory of the first, and the
+# system bought right at the top of the recovery bounce the first article's
+# "tumble" had already produced. Prior same-day verdicts for a ticker are now
+# surfaced as context on its NEXT article so a reversal/respin gets read with
+# the fuller picture instead of scored blind.
+_ticker_history: dict = {"date": None, "tickers": {}}
+
+
+def _record_ticker_history(ticker: str, headline: str, sentiment: str, scored_at: datetime) -> None:
+    today = datetime.now(timezone.utc).date()
+    if _ticker_history["date"] != today:
+        _ticker_history["date"] = today
+        _ticker_history["tickers"] = {}
+    _ticker_history["tickers"].setdefault(ticker, []).append({
+        "headline": headline, "sentiment": sentiment, "scored_at": scored_at,
+    })
+
+
+def _prior_ticker_context(ticker: str) -> str | None:
+    """One-line summary of today's already-scored articles for `ticker`, or None."""
+    today = datetime.now(timezone.utc).date()
+    if _ticker_history["date"] != today:
+        return None
+    entries = _ticker_history["tickers"].get(ticker)
+    if not entries:
+        return None
+    # Cap at the 3 most recent so one heavily-covered ticker can't balloon
+    # the prompt; the most recent prior verdict matters most.
+    parts = [
+        f'{e["scored_at"].strftime("%H:%M UTC")} {e["sentiment"]} ("{e["headline"][:80]}")'
+        for e in entries[-3:]
+    ]
+    return "; ".join(parts)
+
 # Analyst rating events are never tradeable (catalyst_type=analyst_action is not
 # in TRADEABLE_CATALYSTS). Catching them by headline regex before the Claude call
 # avoids spending tokens on articles code gates will always reject. The pattern
@@ -223,6 +264,17 @@ Going On With X Stock?", "Why Is X Up Today?", "X Stock Rally Explained",
 — the move is OVER. Halt articles in particular publish AFTER a 30–120% spike.
 → sentiment=neutral, already_moved=true, catalyst_type=recap_explainer or
 halt_or_resume. No exceptions.
+
+SAME-TICKER CONTEXT: Some articles include a line "PRIOR ARTICLE(S) TODAY ON
+THIS TICKER" — earlier headlines about the SAME stock, already scored earlier
+this session. Use it. If a prior article was NEGATIVE (e.g. "X Tumbles
+Despite Earnings Beat") and this new article reframes the same underlying
+event positively (e.g. "Analysts See More Upside"), treat the new article
+with EXTRA skepticism: this is very likely commentary/analysis on an event
+the market has already priced in and reacted to, not fresh information. Lower
+confidence and set already_moved=true — UNLESS the new article describes a
+genuinely NEW, separate fact (a new number, a new deal, a new filing) rather
+than just a different spin on the same news.
 
 STEP 2 — Is the tagged ticker the actual SUBJECT of the news?
 In "Company B acquires Company A", the TARGET (A) spikes; the ACQUIRER (B)
@@ -447,7 +499,8 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
     """
     Score sentiment for multiple articles in a single Claude call.
 
-    articles: list of dicts with keys 'id', 'headline', 'teaser'
+    articles: list of dicts with keys 'id', 'headline', 'teaser', and
+              optionally 'prior_context' (see _prior_ticker_context).
     Returns: dict mapping article id → {sentiment, confidence, catalyst_type,
              already_moved}. Empty dict on failure (fail-closed: unscored
              articles are never traded).
@@ -463,10 +516,13 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
 
     # Per-cycle content goes in the user message; the static rubric stays in
     # the cached system block.
-    lines = [
-        f'ID {a["id"]}: {a["headline"]}\n   Teaser: {a["teaser"]}'
-        for a in articles
-    ]
+    lines = []
+    for a in articles:
+        line = f'ID {a["id"]}: {a["headline"]}\n   Teaser: {a["teaser"]}'
+        prior = a.get("prior_context")
+        if prior:
+            line += f'\n   PRIOR ARTICLE(S) TODAY ON THIS TICKER: {prior}'
+        lines.append(line)
     user_content = "Articles to classify:\n\n" + "\n\n".join(lines)
 
     # Tool-use JSON output runs ~55 tokens per article empirically; 60 gives
@@ -743,14 +799,24 @@ def fetch_all_news(
         return []
 
     # ── Step 2: batch score all eligible articles in one Claude call ──────────
-    to_score = [
-        {
+    to_score = []
+    for article, tickers, article_id in eligible:
+        entry = {
             "id": article_id,
             "headline": html.unescape(article.get("title") or ""),
             "teaser": html.unescape(article.get("teaser") or (article.get("body") or "")[:200]),
         }
-        for article, _, article_id in eligible
-    ]
+        # Surface today's already-scored articles for the same ticker(s) so a
+        # reversal/respin of the same story gets read with that context
+        # instead of scored blind (see _ticker_history docstring).
+        contexts = [
+            f"{t}: {ctx}"
+            for t in tickers
+            if (ctx := _prior_ticker_context(t)) is not None
+        ]
+        if contexts:
+            entry["prior_context"] = " | ".join(contexts)
+        to_score.append(entry)
     scores = _batch_score_sentiment(to_score)
     # Only successfully-scored ids enter the dedup set — a failed batch (Claude
     # outage/cooldown) leaves its articles eligible for refetch next cycle.
@@ -761,15 +827,17 @@ def fetch_all_news(
     # no way to measure the classifier's precision/recall against actual
     # forward returns, and every prompt change is a guess.
     score_rows = []
+    scored_at_now = datetime.now(timezone.utc)
     for article, tickers, article_id in eligible:
         s = scores.get(article_id)
         if s is None:
             continue
+        headline = html.unescape(article.get("title") or "")
         for ticker in tickers:
             score_rows.append({
                 "article_id": article_id,
                 "ticker": ticker,
-                "headline": html.unescape(article.get("title") or ""),
+                "headline": headline,
                 "sentiment": s["sentiment"],
                 "confidence": s["confidence"],
                 "catalyst_type": s["catalyst_type"],
@@ -777,6 +845,10 @@ def fetch_all_news(
                 "catalyst_magnitude": s["catalyst_magnitude"],
                 "published_at": article.get("published", ""),
             })
+            # Feeds _prior_ticker_context for this ticker's NEXT article today
+            # (including neutrals/negatives — the negative "tumbles despite
+            # beat" read is exactly the context a later bullish respin needs).
+            _record_ticker_history(ticker, headline, s["sentiment"], scored_at_now)
     if score_rows:
         try:
             save_sentiment_scores(score_rows)

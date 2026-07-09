@@ -78,6 +78,26 @@ class Settings:
     vwap_tolerance_pct: float = field(
         default_factory=lambda: float(os.getenv("VWAP_TOLERANCE_PCT", "0.1"))
     )
+    # ── Intraday exhaustion gate (v19.5) ──────────────────────────────────────
+    # day_change_pct (vs YESTERDAY's close) and recent_move_pct (last ~5 min)
+    # are both blind to the SHAPE of today's own session: a stock that gapped
+    # down hard and clawed most of the way back looks identical, on both those
+    # measures, to one calmly grinding to fresh highs. 2026-07-09: LEVI gapped
+    # -7.8% at the open on an earnings beat ("sell the news"), then recovered
+    # to +2.3% by the time we bought — within 15 cents of the exact high of
+    # the day, three minutes before the actual peak — and faded the rest of
+    # the session. Both thresholds must trip: the day's own low-to-high range
+    # must be large enough to represent a real round trip (not noise), AND
+    # price must already have recovered most of that range.
+    require_exhaustion_check: bool = field(
+        default_factory=lambda: os.getenv("REQUIRE_EXHAUSTION_CHECK", "true").lower() in ("1", "true", "yes")
+    )
+    exhaustion_min_range_pct: float = field(
+        default_factory=lambda: float(os.getenv("EXHAUSTION_MIN_RANGE_PCT", "5.0"))
+    )
+    exhaustion_recovery_threshold: float = field(
+        default_factory=lambda: float(os.getenv("EXHAUSTION_RECOVERY_THRESHOLD", "0.75"))
+    )
     # Momentum noise floor. With VWAP confirmation on, this only rejects
     # dead-flat tape (the catalyst produced literally no move); VWAP handles
     # the "is it being accumulated" judgement. With VWAP confirmation OFF this
@@ -341,6 +361,8 @@ class Settings:
             ("SELL_LIMIT_SLACK_PCT", self.sell_limit_slack_pct >= 0),
             ("MIN_GAP_PCT/MAX_GAP_PCT", self.max_gap_pct > self.min_gap_pct),
             ("ZERO_TRADE_ALERT_SESSIONS", self.zero_trade_alert_sessions > 0),
+            ("EXHAUSTION_MIN_RANGE_PCT", self.exhaustion_min_range_pct >= 0),
+            ("EXHAUSTION_RECOVERY_THRESHOLD", 0 < self.exhaustion_recovery_threshold <= 1),
         ]
         errors.extend(name for name, ok in numeric_checks if not ok)
         if errors:
