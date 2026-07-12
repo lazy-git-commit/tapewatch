@@ -142,6 +142,44 @@ _ANALYST_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Digest/preview/listicle headlines are NOT single-stock catalysts — they are
+# compilations written about the market, with tickers tagged incidentally.
+# 2026-07-10: Benzinga's "Market-Moving News for July 10th" (3 tickers tagged,
+# sliding under the >3-ticker roundup filter) was classified by Claude as
+# "earnings_beat, 80% confidence" for THREE unrelated companies at once
+# (WD-40, Circle, Delta) — a fabricated catalyst that put CRCL on the
+# premarket watchlist and bought the exact top of a 13% parabolic spike
+# (−3.97%, the second-worst trade on record). A deterministic title check is
+# cheaper and more reliable than hoping the classifier reads through the
+# template: no digest reaches Claude at all.
+# Pattern hygiene (v20.1 review finding): every phrase here must be one that
+# CANNOT plausibly appear in a genuine single-stock catalyst headline, because
+# a false positive is a silently-missed trade with no eval-loop trace. Two
+# were removed for exactly that reason: "market update" ("Acme Provides
+# Market Update On Phase 3 Results" is a real PR template) and "day ahead"
+# ("Acme Soars, Investor Day Ahead"). "Week ahead" stays — companies don't
+# phrase PRs that way; only digests do.
+_DIGEST_RE = re.compile(
+    r"\b("
+    r"market[- ]moving news"
+    r"|stocks? (to watch|making moves)"
+    r"|(pre[- ]?market|after[- ]?hours|midday|morning|premarket) (movers|gainers|losers)"
+    r"|top (stock )?(gainers|losers|movers|stories|picks)"
+    r"|biggest (movers|gainers|losers)"
+    r"|(before|after) the bell"
+    r"|(opening|closing) bell"
+    r"|market (wrap|recap|snapshot|rundown|preview)"
+    r"|daily (recap|digest|rundown|briefing)"
+    r"|week ahead"
+    r"|earnings (preview|calendar|scheduled|on deck|this week|to watch)"
+    r"|what to watch"
+    r"|things to know"
+    r"|trending tickers"
+    r"|\d+ (stocks?|things|names) (to|you|that|worth)"
+    r")\b",
+    re.IGNORECASE,
+)
+
 # ── Claude availability guard ───────────────────────────────────────────────────
 # The classifier is the one external dependency with NO fallback: if Claude can't
 # score articles, there are no signals at all (positive/neutral/negative are all
@@ -264,6 +302,14 @@ Going On With X Stock?", "Why Is X Up Today?", "X Stock Rally Explained",
 — the move is OVER. Halt articles in particular publish AFTER a 30–120% spike.
 → sentiment=neutral, already_moved=true, catalyst_type=recap_explainer or
 halt_or_resume. No exceptions.
+
+DIGESTS AND PREVIEWS ARE NEVER CATALYSTS: a compilation headline ("Market-
+Moving News for July 10th", "Stocks To Watch", "Premarket Movers", "Earnings
+Scheduled For Today") is written ABOUT the market, with tickers tagged
+incidentally — it contains no new single-stock information regardless of how
+positive its contents sound. → sentiment=neutral, catalyst_type=
+recap_explainer, catalyst_magnitude=1, for EVERY ticker on the article. A
+real catalyst headline names the specific company and the specific event.
 
 SAME-TICKER CONTEXT: Some articles include a line "PRIOR ARTICLE(S) TODAY ON
 THIS TICKER" — earlier headlines about the SAME stock, already scored earlier
@@ -789,6 +835,16 @@ def fetch_all_news(
         if _ANALYST_ACTION_RE.search(headline_raw):
             logger.debug(
                 "Skipping analyst action article (pre-Claude filter): %s", headline_raw[:80],
+            )
+            continue
+
+        # Digest/preview/listicle pre-filter: compilations are never a
+        # single-stock catalyst, and letting them through produced fabricated
+        # classifications (CRCL 2026-07-10 — see _DIGEST_RE).
+        if _DIGEST_RE.search(headline_raw):
+            logger.info(
+                "Skipping digest/preview article (pre-Claude filter): %s",
+                headline_raw[:80],
             )
             continue
 

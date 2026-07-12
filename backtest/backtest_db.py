@@ -279,7 +279,7 @@ def _session_vwap_at(bars: pd.DataFrame, ts: datetime) -> float | None:
     """
     Session VWAP up to (and including) the bar at `ts`, computed from the
     intraday DataFrame we already hold. Mirrors production's
-    twelvedata_bars.get_session_vwap():
+    twelvedata_bars.get_session_analysis() VWAP:
         VWAP = Σ(typical × volume) / Σ(volume),  typical = (H+L+C)/3
     accumulated from the session open. Returns None if no volume yet.
 

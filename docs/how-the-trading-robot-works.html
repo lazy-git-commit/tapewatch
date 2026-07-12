@@ -1,0 +1,577 @@
+<title>How the Trading Robot Works</title>
+<style>
+  :root {
+    --paper: #f4f6f8;
+    --card: #ffffff;
+    --ink: #1c2430;
+    --ink-2: #55617175;
+    --muted: #5a6676;
+    --line: #d7dde4;
+    --amber: #9a6a00;
+    --amber-soft: #9a6a0018;
+    --gain: #177e57;
+    --loss: #c03d47;
+    --gain-soft: #177e5714;
+    --loss-soft: #c03d4712;
+    --mono: Consolas, "SF Mono", Menlo, "Cascadia Mono", monospace;
+    --display: "Rockwell Nova", Rockwell, "Roboto Slab", Georgia, serif;
+    --body: "Segoe UI", -apple-system, "Helvetica Neue", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #12161d;
+      --card: #1a2029;
+      --ink: #e8ecf1;
+      --ink-2: #a8b2bf75;
+      --muted: #9aa5b3;
+      --line: #2c3542;
+      --amber: #f0b429;
+      --amber-soft: #f0b42916;
+      --gain: #2aa876;
+      --loss: #e0606e;
+      --gain-soft: #2aa87618;
+      --loss-soft: #e0606e14;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #12161d; --card: #1a2029; --ink: #e8ecf1; --ink-2: #a8b2bf75;
+    --muted: #9aa5b3; --line: #2c3542; --amber: #f0b429; --amber-soft: #f0b42916;
+    --gain: #2aa876; --loss: #e0606e; --gain-soft: #2aa87618; --loss-soft: #e0606e14;
+  }
+  :root[data-theme="light"] {
+    --paper: #f4f6f8; --card: #ffffff; --ink: #1c2430; --ink-2: #55617175;
+    --muted: #5a6676; --line: #d7dde4; --amber: #9a6a00; --amber-soft: #9a6a0018;
+    --gain: #177e57; --loss: #c03d47; --gain-soft: #177e5714; --loss-soft: #c03d4712;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 17px;
+    line-height: 1.65;
+  }
+  a { color: var(--amber); }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 24px 96px; }
+  .prose { max-width: 70ch; }
+
+  /* ── Header ── */
+  header { padding: 64px 0 20px; border-bottom: 3px solid var(--ink); }
+  .kicker {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--amber); margin: 0 0 14px;
+  }
+  h1 {
+    font-family: var(--display); font-weight: 700;
+    font-size: clamp(34px, 5.5vw, 52px); line-height: 1.08;
+    margin: 0 0 16px; text-wrap: balance;
+  }
+  .standfirst { font-size: 20px; color: var(--muted); margin: 0 0 26px; max-width: 62ch; text-wrap: balance; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 26px; }
+  .chip {
+    font-family: var(--mono); font-size: 12.5px; padding: 5px 12px;
+    border: 1px solid var(--line); border-radius: 999px; background: var(--card);
+    color: var(--muted); white-space: nowrap;
+  }
+  .chip strong { color: var(--ink); font-weight: 600; }
+  .chip.practice { border-color: var(--amber); color: var(--amber); background: var(--amber-soft); }
+
+  /* ── Sections ── */
+  section { padding-top: 56px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--amber); margin: 0 0 8px;
+  }
+  h2 {
+    font-family: var(--display); font-weight: 700;
+    font-size: clamp(24px, 3.4vw, 32px); line-height: 1.15;
+    margin: 0 0 14px; text-wrap: balance;
+  }
+  h3 { font-family: var(--display); font-size: 19px; margin: 26px 0 8px; }
+  p { margin: 0 0 16px; }
+  .note { font-size: 14.5px; color: var(--muted); }
+  .tick { font-family: var(--mono); font-size: 0.92em; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* ── Diagram bands ── */
+  figure { margin: 28px 0; }
+  .band {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 22px 22px 14px; overflow-x: auto;
+  }
+  .band svg { display: block; width: 100%; height: auto; min-width: 560px; }
+  figcaption { font-size: 14px; color: var(--muted); padding: 10px 4px 0; max-width: 74ch; }
+
+  /* SVG shared text styles */
+  svg text { font-family: var(--body); fill: var(--ink); }
+  svg .t-mono  { font-family: var(--mono); }
+  svg .t-mut   { fill: var(--muted); }
+  svg .t-amber { fill: var(--amber); }
+  svg .t-gain  { fill: var(--gain); }
+  svg .t-loss  { fill: var(--loss); }
+  svg .t-sm    { font-size: 12px; }
+  svg .t-xs    { font-size: 10.5px; }
+  svg .stroke-line { stroke: var(--line); }
+  svg .stroke-ink  { stroke: var(--ink); }
+  svg .box   { fill: var(--paper); stroke: var(--line); }
+  svg .box-a { fill: var(--amber-soft); stroke: var(--amber); }
+
+  /* ── Cards ── */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 24px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .card .glyph { font-family: var(--mono); font-size: 20px; color: var(--amber); }
+  .card h4 { margin: 8px 0 6px; font-size: 15.5px; font-family: var(--body); font-weight: 650; }
+  .card p { font-size: 14px; color: var(--muted); margin: 0; }
+  .card.exit-up   .glyph { color: var(--gain); }
+  .card.exit-down .glyph { color: var(--loss); }
+
+  /* ── Check list ── */
+  .checklist { list-style: none; padding: 0; margin: 20px 0; max-width: 74ch; }
+  .checklist li {
+    display: grid; grid-template-columns: 30px 210px 1fr; gap: 12px;
+    padding: 11px 4px; border-bottom: 1px solid var(--line); align-items: baseline;
+  }
+  .checklist .n { font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); }
+  .checklist .what { font-weight: 650; font-size: 15px; }
+  .checklist .why { font-size: 14.5px; color: var(--muted); }
+  @media (max-width: 620px) {
+    .checklist li { grid-template-columns: 26px 1fr; }
+    .checklist .why { grid-column: 2; }
+  }
+
+  /* ── Verdict table ── */
+  .verdict { border-collapse: collapse; width: 100%; font-size: 14.5px; margin: 8px 0 4px; }
+  .verdict th, .verdict td { text-align: left; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--line); }
+  .verdict th { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .verdict td.num { font-family: var(--mono); }
+  .pill { font-family: var(--mono); font-size: 11px; padding: 2px 9px; border-radius: 999px; }
+  .pill.keep { background: var(--gain-soft); color: var(--gain); border: 1px solid var(--gain); }
+  .pill.drop { background: var(--loss-soft); color: var(--loss); border: 1px solid var(--loss); }
+
+  footer {
+    margin-top: 72px; padding-top: 20px; border-top: 3px solid var(--ink);
+    font-family: var(--mono); font-size: 12.5px; color: var(--muted);
+    display: flex; flex-wrap: wrap; gap: 6px 24px;
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+<header>
+  <p class="kicker">Field manual · plain English</p>
+  <h1>How the Trading Robot Works</h1>
+  <p class="standfirst">A computer program that reads financial news the second it's published, decides whether it's the rare kind that moves a share price, and — if every safety check passes — buys the stock for about an hour with a safety net underneath it.</p>
+  <div class="chips">
+    <span class="chip practice"><strong>PRACTICE MODE</strong> — pretend money</span>
+    <span class="chip">Trades <strong>US stocks</strong></span>
+    <span class="chip">~<strong>£250</strong> per trade</span>
+    <span class="chip">Fully <strong>automatic</strong></span>
+    <span class="chip">Runs on a small server, <strong>24/5</strong></span>
+  </div>
+</header>
+
+<!-- ═══════════════ THE BIG PICTURE ═══════════════ -->
+<section>
+  <p class="eyebrow">The big picture</p>
+  <h2>Five steps, once a minute, all day</h2>
+  <div class="prose">
+    <p>The whole idea in one sentence: <strong>good news makes a share price drift upward for the next half hour or so — if you can spot the genuinely good news fast enough, you can ride that drift.</strong></p>
+    <p>Everything the robot does is one of these five steps. Most headlines die at step 2 or 3. On many days nothing gets through at all — and that's the system working, not failing.</p>
+  </div>
+
+  <figure>
+    <div class="band">
+      <svg viewBox="0 0 900 150" role="img" aria-label="Pipeline: listen, read, check, buy protected, exit by rules">
+        <!-- five step boxes -->
+        <g>
+          <rect class="box" x="8"   y="34" width="150" height="72" rx="8"/>
+          <rect class="box" x="190" y="34" width="150" height="72" rx="8"/>
+          <rect class="box" x="372" y="34" width="150" height="72" rx="8"/>
+          <rect class="box-a" x="554" y="34" width="150" height="72" rx="8"/>
+          <rect class="box" x="736" y="34" width="150" height="72" rx="8"/>
+          <!-- arrows -->
+          <g class="stroke-ink" stroke-width="1.6" fill="none">
+            <path d="M158 70 h24"/><path d="M340 70 h24"/><path d="M522 70 h24"/><path d="M704 70 h24"/>
+          </g>
+          <g fill="var(--ink)">
+            <path d="M182 70 l-7 -4.5 v9 z"/><path d="M364 70 l-7 -4.5 v9 z"/>
+            <path d="M546 70 l-7 -4.5 v9 z"/><path d="M728 70 l-7 -4.5 v9 z"/>
+          </g>
+          <!-- step numbers -->
+          <g class="t-mono t-xs" fill="var(--amber)">
+            <text x="22" y="54">1</text><text x="204" y="54">2</text><text x="386" y="54">3</text>
+            <text x="568" y="54">4</text><text x="750" y="54">5</text>
+          </g>
+          <!-- titles -->
+          <g font-size="14.5" font-weight="650">
+            <text x="22" y="76">Listen</text>
+            <text x="204" y="76">Read</text>
+            <text x="386" y="76">Check</text>
+            <text x="568" y="76">Buy, protected</text>
+            <text x="750" y="76">Exit by rules</text>
+          </g>
+          <!-- subtitles -->
+          <g class="t-sm t-mut">
+            <text x="22" y="95">to the news wire</text>
+            <text x="204" y="95">with an AI grader</text>
+            <text x="386" y="95">the live price</text>
+            <text x="568" y="95">safety net on</text>
+            <text x="750" y="95">never overnight</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+    <figcaption>One pass through this pipeline runs every 60&nbsp;seconds while the US market is open. A separate watchdog checks any open position every 5&nbsp;seconds.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══════════════ STEP 1 ═══════════════ -->
+<section>
+  <p class="eyebrow">Step 1 · Listen</p>
+  <h2>Read the news wire, bin the junk</h2>
+  <div class="prose">
+    <p>Every minute the robot pulls the newest headlines from a financial news wire. Most of what arrives is noise, and it's thrown away <em>before</em> the AI ever sees it — that keeps the expensive step cheap and, more importantly, keeps garbage from ever becoming a trade.</p>
+  </div>
+
+  <figure>
+    <div class="band">
+      <svg viewBox="0 0 900 226" role="img" aria-label="Examples of headlines that are kept versus binned">
+        <g class="t-mono t-xs t-mut"><text x="10" y="20">INCOMING HEADLINES</text></g>
+        <g font-size="14">
+          <!-- binned -->
+          <g class="t-mut">
+            <text x="10" y="52" text-decoration="line-through">"Market-Moving News for July 10th"</text>
+            <text x="10" y="82" text-decoration="line-through">"5 Stocks To Watch Before The Open"</text>
+            <text x="10" y="112" text-decoration="line-through">"Analyst Raises Price Target on XYZ"</text>
+            <text x="10" y="142" text-decoration="line-through">"Why Is ABC Stock Up Today?"</text>
+          </g>
+          <!-- kept -->
+          <text x="10" y="180" font-weight="650">"Acme Therapeutics Receives FDA Approval for Lead Drug"</text>
+          <text x="10" y="210" font-weight="650">"BuildCo Raises Full-Year Guidance Above Estimates"</text>
+        </g>
+        <!-- verdicts -->
+        <g class="t-mono t-xs">
+          <text x="620" y="52"  class="t-loss">✗ round-up, no single story</text>
+          <text x="620" y="82"  class="t-loss">✗ list article, not news</text>
+          <text x="620" y="112" class="t-loss">✗ analyst opinion, not an event</text>
+          <text x="620" y="142" class="t-loss">✗ explains a move that already happened</text>
+          <text x="620" y="180" class="t-gain">✓ real event → send to the AI</text>
+          <text x="620" y="210" class="t-gain">✓ real event → send to the AI</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>Also binned: stories older than 3 minutes (too late), tickers the robot can't trade, and anything it has already seen. In the quiet hours before the market opens, it builds a watchlist from overnight news instead.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══════════════ STEP 2 ═══════════════ -->
+<section>
+  <p class="eyebrow">Step 2 · Read</p>
+  <h2>An AI grades each headline — but the data picks what's tradeable</h2>
+  <div class="prose">
+    <p>Surviving headlines go to an AI reader (Claude). For each one it answers three questions: <strong>what kind of news is this</strong> (drug approval? contract win? earnings?), <strong>how confident am I it's genuinely positive</strong>, and <strong>has the price already moved</strong> — because if the jump already happened, we'd be buying someone else's profit.</p>
+    <p>Here's the important part: the AI only <em>labels</em> the news. Which labels are allowed to trade is decided by evidence. For 60 days the robot graded every headline and then checked what the share price actually did in the hour afterwards. The verdict was brutal — most "good news" types don't go up at all once you're a minute late. Only two types reliably do:</p>
+  </div>
+
+  <figure>
+    <div class="band">
+      <svg viewBox="0 0 900 268" role="img" aria-label="Bar chart: average price move one hour after each type of news">
+        <!-- title -->
+        <text x="10" y="20" font-size="13.5" font-weight="650">Average price move, 60 minutes after the headline</text>
+        <text x="10" y="38" class="t-sm t-mut">Measured on every graded headline over 60 days · positive types are traded, negative types are banned</text>
+
+        <!-- zero axis: x=430 maps 0%, 78 px per 1% -->
+        <line x1="430" y1="52" x2="430" y2="248" class="stroke-ink" stroke-width="1.3"/>
+        <text x="430" y="262" text-anchor="middle" class="t-mono t-xs t-mut">0%</text>
+        <line x1="586" y1="52" x2="586" y2="248" class="stroke-line" stroke-width="1" stroke-dasharray="3 4"/>
+        <text x="586" y="262" text-anchor="middle" class="t-mono t-xs t-mut">+2%</text>
+        <line x1="274" y1="52" x2="274" y2="248" class="stroke-line" stroke-width="1" stroke-dasharray="3 4"/>
+        <text x="274" y="262" text-anchor="middle" class="t-mono t-xs t-mut">−2%</text>
+
+        <!-- bars: y rows at 58,90,128,160,192,224; h=18 -->
+        <!-- guidance raise +2.97 → w 232 -->
+        <g><title>Guidance raise: +2.97% avg after 60 min (9 headlines)</title>
+          <rect x="430" y="58" width="232" height="18" rx="4" fill="var(--gain)"/>
+          <text x="252" y="72" text-anchor="end" font-size="13.5" font-weight="650">Company raises its forecast</text>
+          <text x="670" y="72" class="t-mono t-sm t-gain" font-weight="650">+2.97%</text>
+          <text x="745" y="72" class="t-mono t-xs t-mut">9 stories</text>
+        </g>
+        <!-- fda +1.42 → w 111 -->
+        <g><title>Drug approval: +1.42% avg after 60 min (86 headlines)</title>
+          <rect x="430" y="90" width="111" height="18" rx="4" fill="var(--gain)"/>
+          <text x="252" y="104" text-anchor="end" font-size="13.5" font-weight="650">Drug / FDA approval</text>
+          <text x="549" y="104" class="t-mono t-sm t-gain" font-weight="650">+1.42%</text>
+          <text x="622" y="104" class="t-mono t-xs t-mut">86 stories</text>
+        </g>
+        <!-- ma_target −0.37 → w 29 -->
+        <g><title>Company being acquired: −0.37% avg (71 headlines) — banned</title>
+          <rect x="401" y="128" width="29" height="18" rx="4" fill="var(--loss)"/>
+          <text x="252" y="142" text-anchor="end" font-size="13.5" class="t-mut">Company being bought out</text>
+          <text x="393" y="142" text-anchor="end" class="t-mono t-sm t-loss">−0.37%</text>
+        </g>
+        <!-- contract −1.34 → w 105 -->
+        <g><title>Contract win: −1.34% avg (152 headlines) — banned</title>
+          <rect x="325" y="160" width="105" height="18" rx="4" fill="var(--loss)"/>
+          <text x="252" y="174" text-anchor="end" font-size="13.5" class="t-mut">Big contract win</text>
+          <text x="317" y="174" text-anchor="end" class="t-mono t-sm t-loss">−1.34%</text>
+        </g>
+        <!-- earnings −1.60 → w 125 -->
+        <g><title>Earnings beat: −1.60% avg (33 headlines) — banned</title>
+          <rect x="305" y="192" width="125" height="18" rx="4" fill="var(--loss)"/>
+          <text x="252" y="206" text-anchor="end" font-size="13.5" class="t-mut">Better-than-expected earnings</text>
+          <text x="297" y="206" text-anchor="end" class="t-mono t-sm t-loss">−1.60%</text>
+        </g>
+        <!-- product −2.05 → w 160 -->
+        <g><title>Product launch: −2.05% avg (32 headlines) — banned</title>
+          <rect x="270" y="224" width="160" height="18" rx="4" fill="var(--loss)"/>
+          <text x="252" y="238" text-anchor="end" font-size="13.5" class="t-mut">Product launch</text>
+          <text x="262" y="238" text-anchor="end" class="t-mono t-sm t-loss">−2.05%</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>Why do the banned types <em>fall</em>? Because by the time a robot like ours can act (a minute or two after publication), the instant jump is over and early buyers are selling into the excitement. Earnings news is the classic trap — it gets <em>sold</em>. The two kept types are different: approvals and raised forecasts keep drifting up for an hour, which is exactly the window we trade.</figcaption>
+  </figure>
+
+  <div class="prose">
+    <p class="note">Every graded headline — traded or not — is stored, and its price outcome is measured again every night. If a banned news type starts working, the evidence will show it, and it can be re-allowed. Rules change on data, not hunches.</p>
+  </div>
+</section>
+
+<!-- ═══════════════ STEP 3 ═══════════════ -->
+<section>
+  <p class="eyebrow">Step 3 · Check</p>
+  <h2>Thirteen safety checks against the live price</h2>
+  <div class="prose">
+    <p>A great headline isn't enough — the <em>market's reaction</em> has to look right too. Before any money moves, the stock must pass a gauntlet of checks, run in order from cheapest to most expensive. One failure and the trade is off.</p>
+  </div>
+
+  <figure>
+    <div class="band">
+      <svg viewBox="0 0 900 180" role="img" aria-label="Funnel from many headlines to occasionally one trade">
+        <!-- funnel trapezoids -->
+        <g>
+          <path d="M10 40 L210 40 L210 140 L10 140 Z" fill="var(--amber-soft)" stroke="var(--line)"/>
+          <path d="M240 55 L440 55 L440 125 L240 125 Z" fill="var(--amber-soft)" stroke="var(--line)"/>
+          <path d="M470 68 L670 68 L670 112 L470 112 Z" fill="var(--amber-soft)" stroke="var(--line)"/>
+          <path d="M700 78 L890 78 L890 102 L700 102 Z" fill="var(--gain-soft)" stroke="var(--gain)"/>
+          <g class="stroke-ink" stroke-width="1.4" fill="none">
+            <path d="M212 90 h24"/><path d="M442 90 h24"/><path d="M672 90 h24"/>
+          </g>
+          <g fill="var(--ink)">
+            <path d="M238 90 l-7 -4.5 v9 z"/><path d="M468 90 l-7 -4.5 v9 z"/><path d="M698 90 l-7 -4.5 v9 z"/>
+          </g>
+        </g>
+        <g class="t-mono t-sm" text-anchor="middle">
+          <text x="110" y="86" font-weight="650">hundreds</text>
+          <text x="340" y="86" font-weight="650">a handful</text>
+          <text x="570" y="86" font-weight="650">one or two</text>
+          <text x="795" y="86" font-weight="650" class="t-gain">0–1</text>
+        </g>
+        <g class="t-sm t-mut" text-anchor="middle">
+          <text x="110" y="106">headlines a day</text>
+          <text x="340" y="104">pass the AI grade</text>
+          <text x="570" y="100">pass price checks</text>
+          <text x="795" y="120">actual trades</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>Illustrative volumes on a typical day. Zero-trade days are common and fine — cash is a position.</figcaption>
+  </figure>
+
+  <div class="prose"><h3>The checks that matter most, in plain words</h3></div>
+  <ul class="checklist">
+    <li><span class="n">01</span><span class="what">Not the opening chaos</span><span class="why">No buying in the first 5 minutes after the market opens — prices are wild and misleading there.</span></li>
+    <li><span class="n">02</span><span class="what">Not a penny stock</span><span class="why">Under $5 a share means manipulation risk and brutal costs. Skip.</span></li>
+    <li><span class="n">03</span><span class="what">Easy to get out of</span><span class="why">The stock must normally trade at least $5M a day, so our exit can't move the price against us.</span></li>
+    <li><span class="n">04</span><span class="what">Real buyers showed up</span><span class="why">Today's trading volume must be well above normal for this time of day. News without volume is news nobody believed.</span></li>
+    <li><span class="n">05</span><span class="what">Not already exhausted</span><span class="why">If the stock is already up 25%+ today, or just climbed all the way back from a big morning drop, the move has happened. We'd be buying the top.</span></li>
+    <li><span class="n">06</span><span class="what">Above fair value — but barely</span><span class="why">Price must sit above the day's volume-weighted average (the "fair value line") — proof big money is buying — but no more than 1.5% above it. Any higher and a normal dip would hit our safety net before the rise could play out.</span></li>
+  </ul>
+
+  <div class="prose">
+    <p>One clever wrinkle: some failures are <strong>"not yet" rather than "no."</strong> If the only problem is that buyers haven't arrived <em>yet</em>, or the price is stretched a bit too high <em>right now</em>, the robot doesn't discard the idea — it re-checks every minute for 15 minutes and buys the dip if things come right. That's how a patient human trader behaves: don't chase, wait for the pullback.</p>
+  </div>
+</section>
+
+<!-- ═══════════════ STEP 4 ═══════════════ -->
+<section>
+  <p class="eyebrow">Step 4 · Buy, protected</p>
+  <h2>Small position, safety net first</h2>
+  <div class="prose">
+    <p>A trade is deliberately small: about <strong>5% of the pot</strong> (~£250 in practice mode), sized so that if the trade fails, the loss is a fraction of a percent of the account. The moment the buy completes, a <strong>safety-net sell order is lodged with the broker at 2% below</strong> our price. That matters: even if our server crashes or the internet dies, the broker's own computers will sell the position if it falls 2%. The downside is never unguarded.</p>
+    <p>And if the trade gets going — up 2% — the safety net is <strong>raised to the price we paid</strong>. From that moment the worst case is roughly break-even: a winning trade is no longer allowed to turn into a losing one.</p>
+  </div>
+
+  <figure>
+    <div class="band">
+      <svg viewBox="0 0 900 260" role="img" aria-label="A trade's price path with safety net, raised net, and target">
+        <!-- guide lines: entry y=150 (0%), target +5% y=60, stop -2% y=186, breakeven y=150 -->
+        <g stroke-width="1.2">
+          <line x1="60" y1="60"  x2="880" y2="60"  stroke="var(--gain)" stroke-dasharray="5 5"/>
+          <line x1="60" y1="150" x2="880" y2="150" class="stroke-line"/>
+          <line x1="60" y1="186" x2="470" y2="186" stroke="var(--loss)" stroke-dasharray="5 5"/>
+          <!-- raised net after ratchet at x=470 -->
+          <line x1="470" y1="148" x2="880" y2="148" stroke="var(--loss)" stroke-dasharray="5 5"/>
+          <line x1="470" y1="186" x2="470" y2="148" stroke="var(--loss)" stroke-dasharray="2 4"/>
+        </g>
+        <!-- price path -->
+        <path d="M60 150 C110 156 140 168 180 158 S250 128 300 122 S380 96 470 114 S570 84 640 92 S760 66 820 60"
+              fill="none" stroke="var(--ink)" stroke-width="2.2"/>
+        <!-- entry marker -->
+        <circle cx="60" cy="150" r="5" fill="var(--amber)"/>
+        <!-- ratchet marker -->
+        <circle cx="470" cy="114" r="5" fill="var(--amber)"/>
+        <!-- labels -->
+        <g class="t-sm">
+          <text x="66" y="140" class="t-mono t-amber" font-weight="650">BUY</text>
+          <text x="66" y="54"  class="t-gain t-mono">target · sell at +5%</text>
+          <text x="66" y="204" class="t-loss t-mono">safety net · −2%, held at the broker</text>
+          <text x="482" y="106" class="t-mono t-amber" font-weight="650">up 2% → net raised to break-even</text>
+          <text x="482" y="166" class="t-loss t-mono">worst case ≈ £0 from here on</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>Why the safety net (and not the profit order) lives at the broker: only one order can rest there at a time, and a slow reaction on the way <em>down</em> costs real money, while a slow reaction on the way up only costs a little opportunity. The robot's own history proved this — its worst losses all came from stops that reacted too slowly.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══════════════ STEP 5 ═══════════════ -->
+<section>
+  <p class="eyebrow">Step 5 · Exit by rules</p>
+  <h2>Four doors out — one of them always closes the trade</h2>
+  <div class="prose">
+    <p>No trade is ever left to "see how it goes." Every position leaves through the first of these four doors it reaches, and nothing is ever held overnight — a bad surprise while the market is closed can't be defended against, so the robot simply never takes that risk.</p>
+  </div>
+  <div class="cards">
+    <div class="card exit-up"><span class="glyph">▲</span><h4>Target hit: +5%</h4><p>Price reached the goal. Sell, bank it.</p></div>
+    <div class="card exit-down"><span class="glyph">▼</span><h4>Safety net: −2%</h4><p>Wrong about the move. The broker sells instantly, loss capped small.</p></div>
+    <div class="card"><span class="glyph">◔</span><h4>60-minute clock</h4><p>The drift we trade lives in the first hour. Still nothing after 60 minutes? Out.</p></div>
+    <div class="card"><span class="glyph">☾</span><h4>Closing bell</h4><p>Everything is sold 10 minutes before the market closes. No exceptions, ever.</p></div>
+  </div>
+</section>
+
+<!-- ═══════════════ GUARDRAILS ═══════════════ -->
+<section>
+  <p class="eyebrow">Above it all</p>
+  <h2>The guardrails that protect the whole account</h2>
+  <div class="prose">
+    <p>Separate from any single trade, account-level brakes are checked before every purchase:</p>
+  </div>
+  <div class="cards">
+    <div class="card"><span class="glyph">■</span><h4>Daily kill switch</h4><p>Lose 2% of the account in one day and the robot stands down until tomorrow. A bad day is never allowed to become a terrible one.</p></div>
+    <div class="card"><span class="glyph">3</span><h4>Max 3 positions</h4><p>News clusters — one macro headline can fire five similar signals at once. The cap limits the blast radius.</p></div>
+    <div class="card"><span class="glyph">10</span><h4>Max 10 trades/day</h4><p>A day that "needs" more than ten attempts is a day the filters are wrong.</p></div>
+    <div class="card"><span class="glyph">24h</span><h4>One shot per stock</h4><p>After trading a stock, it's off-limits for 24 hours — follow-up articles about the same event can't re-trigger a buy.</p></div>
+  </div>
+</section>
+
+<!-- ═══════════════ LEARNING LOOP ═══════════════ -->
+<section>
+  <p class="eyebrow">Why it keeps improving</p>
+  <h2>Every rule is on trial, every night</h2>
+  <div class="prose">
+    <p>The robot writes down every headline it grades and every decision it makes. Each night, it looks up what the price <em>actually did</em> 5, 15 and 60 minutes after each headline — including all the ones it didn't trade. That scorecard is what banned four news types in Step&nbsp;2, and it's how every future rule change gets decided: measure first, then change.</p>
+  </div>
+
+  <figure>
+    <div class="band">
+      <svg viewBox="0 0 900 150" role="img" aria-label="Learning loop: grade, act, measure, adjust">
+        <g>
+          <rect class="box" x="20"  y="42" width="180" height="60" rx="8"/>
+          <rect class="box" x="250" y="42" width="180" height="60" rx="8"/>
+          <rect class="box" x="480" y="42" width="180" height="60" rx="8"/>
+          <rect class="box-a" x="710" y="42" width="180" height="60" rx="8"/>
+          <g class="stroke-ink" stroke-width="1.5" fill="none">
+            <path d="M200 72 h40"/><path d="M430 72 h40"/><path d="M660 72 h40"/>
+            <path d="M800 102 v26 H110 v-26" stroke-dasharray="4 4"/>
+          </g>
+          <g fill="var(--ink)">
+            <path d="M248 72 l-7 -4.5 v9 z"/><path d="M478 72 l-7 -4.5 v9 z"/><path d="M708 72 l-7 -4.5 v9 z"/>
+            <path d="M110 104 l-4.5 7 h9 z"/>
+          </g>
+          <g font-size="14" font-weight="650" text-anchor="middle">
+            <text x="110" y="68">Grade every headline</text>
+            <text x="340" y="68">Trade — or skip</text>
+            <text x="570" y="68">Measure what the</text>
+            <text x="800" y="68">Change the rules</text>
+          </g>
+          <g class="t-sm t-mut" text-anchor="middle">
+            <text x="110" y="88">and record the grade</text>
+            <text x="340" y="88">record either way</text>
+            <text x="570" y="88">price really did</text>
+            <text x="800" y="88">only on evidence</text>
+          </g>
+        </g>
+      </svg>
+    </div>
+    <figcaption>The dashed return arrow is the whole point: yesterday's outcomes feed tomorrow's rules.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══════════════ A DAY ═══════════════ -->
+<section>
+  <p class="eyebrow">The clock</p>
+  <h2>A trading day, on one line</h2>
+  <figure>
+    <div class="band">
+      <svg viewBox="0 0 900 132" role="img" aria-label="Timeline of a trading day from 7am to 4pm New York time">
+        <!-- baseline -->
+        <line x1="30" y1="70" x2="880" y2="70" class="stroke-ink" stroke-width="1.6"/>
+        <!-- phase bands: 7:00→x=30, 16:00→x=880 → 94.4px/hr -->
+        <rect x="30"  y="58" width="236" height="24" fill="var(--amber-soft)"/>
+        <rect x="266" y="58" width="47"  height="24" fill="var(--gain-soft)"/>
+        <rect x="880" y="58" width="0"   height="24" fill="none"/>
+        <rect x="864" y="58" width="16"  height="24" fill="var(--loss-soft)"/>
+        <!-- ticks -->
+        <g class="stroke-ink" stroke-width="1.4">
+          <line x1="30"  y1="62" x2="30"  y2="78"/>
+          <line x1="266" y1="62" x2="266" y2="78"/>
+          <line x1="313" y1="62" x2="313" y2="78"/>
+          <line x1="864" y1="62" x2="864" y2="78"/>
+          <line x1="880" y1="62" x2="880" y2="78"/>
+        </g>
+        <g class="t-mono t-xs t-mut">
+          <text x="30" y="50" text-anchor="middle">07:00</text>
+          <text x="266" y="50" text-anchor="middle">09:30</text>
+          <text x="330" y="50" text-anchor="middle">10:00</text>
+          <text x="864" y="50" text-anchor="end">15:50</text>
+        </g>
+        <g class="t-sm">
+          <text x="34" y="104" class="t-amber">Pre-market: build a watchlist from overnight news</text>
+          <text x="266" y="122" class="t-gain">Open: 30-min window to catch stocks gapping on real news</text>
+          <text x="620" y="104" class="t-mut">All day: the 5-step pipeline, once a minute</text>
+        </g>
+        <g class="t-sm">
+          <text x="880" y="122" text-anchor="end" class="t-loss">15:50 — sell everything</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>Times are New York (US market hours). From London that's 12:00–21:00 in summer.</figcaption>
+  </figure>
+</section>
+
+<!-- ═══════════════ HONESTY ═══════════════ -->
+<section>
+  <p class="eyebrow">Where it stands</p>
+  <h2>Practice mode, on purpose</h2>
+  <div class="prose">
+    <p>The robot currently trades a <strong>demo account with pretend money</strong>. Its early record was poor — and every loss got a full post-mortem that hardened the rules above: the banned news types, the "don't chase" check, the broker-held safety net, and the break-even ratchet all came out of specific, named losing trades. That's what practice mode is for: pay for lessons in play money, keep the lessons.</p>
+    <p class="note">The bar for switching to real money is simple and unsentimental: a sustained stretch where the measured edge is positive after costs. The nightly scorecard — not optimism — makes that call.</p>
+  </div>
+</section>
+
+<footer>
+  <span>MOMENTUM TRADER · v20</span>
+  <span>MODE: DEMO</span>
+  <span>NEWS: BENZINGA · PRICES: FINNHUB + TWELVEDATA · BROKER: TRADING 212 · AI: CLAUDE</span>
+</footer>
+
+</div>

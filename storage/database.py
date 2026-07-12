@@ -138,9 +138,30 @@ def init_db() -> None:
             # tp_order_id: the resting take-profit LIMIT order placed right
             # after the buy fills. The monitor checks its status each cycle;
             # it must be cancelled before any stop-loss/time-stop sell.
+            # LEGACY as of v20 (exit inversion): new trades rest a STOP
+            # instead; the column remains so trades opened under the old
+            # regime are still managed correctly across the deploy.
             cur.execute("""
                 ALTER TABLE trades
                 ADD COLUMN IF NOT EXISTS tp_order_id TEXT
+            """)
+            # ── v20 migration ────────────────────────────────────────────────
+            # stop_order_id: the resting STOP (stop-market) sell placed right
+            # after the buy fills — the loss side executes broker-side with
+            # zero polling latency; the profit side is polled instead. Must be
+            # cancelled before any TP/time-stop/EOD sell, and is replaced once
+            # with a breakeven stop at the ratchet trigger.
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS stop_order_id TEXT
+            """)
+            # ratchet_armed (v20.1): the breakeven ratchet fired for this
+            # trade. Persisted ON the row — an in-memory flag silently
+            # regressed protection to the original −2% polled stop after a
+            # service restart. 0/1 integer.
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS ratchet_armed INTEGER NOT NULL DEFAULT 0
             """)
             # catalyst_type on signals: which catalyst class Claude assigned.
             cur.execute("""
@@ -556,12 +577,35 @@ def get_today_realized_pnl() -> float:
 
 
 def set_tp_order_id(trade_id: int, tp_order_id: str | None) -> None:
-    """Attach (or clear) the resting take-profit limit order id on a trade."""
+    """Attach (or clear) the resting take-profit limit order id on a trade.
+
+    Legacy (pre-v20) trades only — new trades rest a stop, not a TP."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE trades SET tp_order_id = %s WHERE id = %s",
                 (tp_order_id, trade_id),
+            )
+
+
+def set_stop_order_id(trade_id: int, stop_order_id: str | None) -> None:
+    """Attach (or clear) the resting stop-loss order id on a trade (v20)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trades SET stop_order_id = %s WHERE id = %s",
+                (stop_order_id, trade_id),
+            )
+
+
+def set_ratchet_armed(trade_id: int) -> None:
+    """Mark the breakeven ratchet as fired for a trade (v20.1, durable —
+    survives restarts so the polled-breakeven fallback can't regress)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE trades SET ratchet_armed = 1 WHERE id = %s",
+                (trade_id,),
             )
 
 

@@ -78,6 +78,18 @@ class Settings:
     vwap_tolerance_pct: float = field(
         default_factory=lambda: float(os.getenv("VWAP_TOLERANCE_PCT", "0.1"))
     )
+    # ── VWAP extension ceiling (v20) ──────────────────────────────────────────
+    # Maximum entry distance ABOVE VWAP. Derived from the stop, not arbitrary:
+    # the stop sits stop_loss_pct below entry, so if entry is further above
+    # VWAP than the stop is wide, a routine mean-reversion to value — the
+    # base case for any extended stock, even in an uptrend — hits the stop by
+    # construction. Both 2026-07 losses had this geometry (LEVI +1.9% above
+    # VWAP, CRCL +2.2%, stop 2%). Default 1.5 = stop 2.0 minus safety margin;
+    # keep it BELOW stop_loss_pct. The reject is TRANSIENT: the re-eval queue
+    # re-checks and enters on the first pullback into value instead.
+    max_vwap_extension_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_VWAP_EXTENSION_PCT", "1.5"))
+    )
     # ── Intraday exhaustion gate (v19.5) ──────────────────────────────────────
     # day_change_pct (vs YESTERDAY's close) and recent_move_pct (last ~5 min)
     # are both blind to the SHAPE of today's own session: a stock that gapped
@@ -172,15 +184,29 @@ class Settings:
         default_factory=lambda: int(os.getenv("OPEN_BLOCK_MINUTES", "5"))
     )
     # Catalyst classes that are allowed to trade. Claude tags every article
-    # with a catalyst_type; only these classes have durable enough follow-
-    # through to survive our 10–90s structural latency (news → fetch → Claude
-    # → price check → order). Halt/recap/analyst classes are recorded for the
-    # eval loop but never traded.
+    # with a catalyst_type; every class is recorded to sentiment_scores for
+    # the eval loop, but only these trade.
+    #
+    # v20 (2026-07-10): pruned to the classes with MEASURED positive forward
+    # returns. 60 days of the system's own eval loop (positive sentiment,
+    # not-already-moved, confidence ≥ 0.7; avg fwd returns @5/15/60 min):
+    #   fda_approval   n=86   −0.02 / +0.55 / +1.42   ← kept
+    #   guidance_raise n=9    +0.38 / +1.15 / +2.97   ← kept
+    #   contract_win   n=152  −0.42 / −0.84 / −1.34   ← removed
+    #   ma_target      n=71   −0.08 / −0.07 / −0.37   ← removed (targets pin
+    #                          to deal price instantly; nothing left to capture)
+    #   earnings_beat  n=33   −0.74 / −1.13 / −1.60   ← removed (earnings news
+    #                          at our latency gets SOLD — LEVI/CRCL losses)
+    #   product_launch n=32   −0.93 / −1.13 / −2.05   ← removed
+    #   short_squeeze  n=0    never produced a tradeable signal ← removed
+    # The kept classes are binary regulatory/guidance surprises whose drift
+    # BUILDS over 15–60 min — a shape our 1–3 min entry latency captures.
+    # Re-enable a class only with fresh forward-return evidence.
     tradeable_catalysts: list[str] = field(
         default_factory=lambda: [
             c.strip().lower() for c in os.getenv(
                 "TRADEABLE_CATALYSTS",
-                "earnings_beat,guidance_raise,fda_approval,ma_target,contract_win,product_launch,short_squeeze",
+                "fda_approval,guidance_raise",
             ).split(",") if c.strip()
         ]
     )
@@ -232,11 +258,29 @@ class Settings:
     time_stop_minutes: int = field(
         default_factory=lambda: int(os.getenv("TIME_STOP_MINUTES", "60"))
     )
-    # How often the position monitor runs. 20s (was 60s): a momentum stock
-    # moves 1–5% per minute, so a 60s stop-loss poll routinely turned −2%
-    # stops into −4%+ fills before slippage.
+    # v20 exit inversion: the STOP rests at the broker (zero-latency loss
+    # side); the TP is polled by the monitor. Disable only for brokers/modes
+    # where stop orders are unavailable — the monitor then polls both sides.
+    resting_stop_enabled: bool = field(
+        default_factory=lambda: os.getenv("RESTING_STOP_ENABLED", "true").lower() in ("1", "true", "yes")
+    )
+    # Breakeven ratchet: once a position is up ratchet_trigger_pct, the stop
+    # moves to buy × (1 + ratchet_lock_pct/100), once. A trade that has paid
+    # one full risk unit (trigger = stop distance by default) may mean-revert
+    # but must not become a loser.
+    ratchet_trigger_pct: float = field(
+        default_factory=lambda: float(os.getenv("RATCHET_TRIGGER_PCT", "2.0"))
+    )
+    ratchet_lock_pct: float = field(
+        default_factory=lambda: float(os.getenv("RATCHET_LOCK_PCT", "0.1"))
+    )
+    # How often the position monitor runs. 5s (v20; was 20s): with the stop
+    # resting broker-side the poll no longer guards the loss side, but the
+    # POLLED side (take-profit) still pays the full cadence as latency at
+    # the exact moment price touches the target. The cycle early-outs when
+    # no positions are open, so the idle cost is one local DB query.
     monitor_interval_seconds: int = field(
-        default_factory=lambda: int(os.getenv("MONITOR_INTERVAL_SECONDS", "20"))
+        default_factory=lambda: int(os.getenv("MONITOR_INTERVAL_SECONDS", "5"))
     )
     # Flatten ALL positions this many minutes before the close, regardless of
     # P&L. This is a day-trading system: holding a momentum spike overnight
@@ -363,6 +407,11 @@ class Settings:
             ("ZERO_TRADE_ALERT_SESSIONS", self.zero_trade_alert_sessions > 0),
             ("EXHAUSTION_MIN_RANGE_PCT", self.exhaustion_min_range_pct >= 0),
             ("EXHAUSTION_RECOVERY_THRESHOLD", 0 < self.exhaustion_recovery_threshold <= 1),
+            ("MAX_VWAP_EXTENSION_PCT", self.max_vwap_extension_pct > 0),
+            ("MAX_VWAP_EXTENSION_PCT < STOP_LOSS_PCT (stop must sit at/above value)",
+             self.max_vwap_extension_pct < self.stop_loss_pct),
+            ("RATCHET_TRIGGER_PCT", self.ratchet_trigger_pct > 0),
+            ("RATCHET_LOCK_PCT", 0 <= self.ratchet_lock_pct < self.ratchet_trigger_pct),
         ]
         errors.extend(name for name, ok in numeric_checks if not ok)
         if errors:

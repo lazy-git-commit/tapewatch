@@ -6,10 +6,12 @@ Entry point for the momentum trader.
 Scheduled jobs:
   1. news_cycle       — every minute. During market hours: fetch Benzinga →
                         Claude sentiment → price confirmation → risk gates →
-                        buy + resting take-profit. During the pre-market
+                        buy + resting stop-loss (v20). During the pre-market
                         window: scan news into the at-open watchlist.
-  2. monitor_positions — every cfg.monitor_interval_seconds (20s). Manages
-                        resting TP fills, stop-loss, time-stop, EOD flatten.
+  2. monitor_positions — every cfg.monitor_interval_seconds (default 5s, v20).
+                        Notices resting-stop fills, polls take-profit and
+                        time-stop, ratchets the stop to breakeven at +1R,
+                        EOD-flattens before the close.
   3. forward_returns  — nightly at 22:30 UTC. Fills 5/15/60-min forward
                         returns for every Claude classification (eval loop).
   4. symbol_map_rebuild — daily at 08:00 UTC. Refreshes the T212 symbol map
@@ -43,7 +45,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from config.settings import cfg
 from storage.database import (
     init_db, save_signal, mark_signal_acted_on, open_trade, was_recently_traded,
-    is_article_seen, set_rejection_reason, clear_rejection, set_tp_order_id,
+    is_article_seen, set_rejection_reason, clear_rejection, set_stop_order_id,
     touch_heartbeat, count_open_trades, count_trades_today, get_today_realized_pnl,
     update_premarket_candidate, save_snapshot,
     trading_days_since_last_trade, record_system_event,
@@ -53,7 +55,7 @@ from market.price_check import (
     confirm_price_signal, is_market_open, is_too_late_to_buy, PriceConfirmation,
 )
 from trading.executor import (
-    buy, sell, build_symbol_map, place_take_profit, cancel_order,
+    buy, sell, build_symbol_map, place_stop_loss, cancel_order,
     get_portfolio_value, get_account_summary,
 )
 from monitor.position_monitor import monitor_positions
@@ -95,7 +97,10 @@ _retry_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"ite
 # (their news_signals row keeps the rejection) and re-confirmed each cycle for
 # _REEVAL_TTL_MINUTES; if participation arrives, the trade proceeds and the
 # row's rejection is cleared. If not, the final rejection stands.
-_TRANSIENT_REJECT_CODES = frozenset({"low_volume", "low_momentum"})
+# overextended joined in v20: "too far above VWAP to place a stop sensibly"
+# is a property of THIS MINUTE's price, not of the catalyst — the re-eval
+# queue converts it into a first-pullback entry (see price_check gate 10.2).
+_TRANSIENT_REJECT_CODES = frozenset({"low_volume", "low_momentum", "overextended"})
 _REEVAL_TTL_MINUTES = 15
 _reeval_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"item", "signal_id", "expires_at"}
 
@@ -424,39 +429,46 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
         # protected.
         logger.warning("mark_signal_acted_on failed for signal %d: %s", signal_id, exc)
 
-    # ── Resting take-profit ───────────────────────────────────────────────────
-    # Placed at the exchange so the profit side has zero polling latency.
-    # If placement fails, the monitor's polled TP covers this position instead.
-    tp_price = result.price * (1 + cfg.take_profit_pct / 100)
-    tp_order_id = place_take_profit(item.ticker, result.quantity, tp_price)
-    if tp_order_id:
+    # ── Resting stop-loss (v20 exit inversion) ───────────────────────────────
+    # The LOSS side rests at the broker — zero polling latency exactly where
+    # latency costs capital (a fast reversal). The profit side is polled by
+    # the monitor at its 5s cadence instead; T212 has no OCO and each sell
+    # reserves the shares, so only one side can rest — it must be the stop
+    # (see executor.place_stop_loss for the realized-slippage evidence).
+    # If placement fails, the monitor's polled stop covers this position.
+    stop_price = result.price * (1 - cfg.stop_loss_pct / 100)
+    stop_order_id = (
+        place_stop_loss(item.ticker, result.quantity, stop_price)
+        if cfg.resting_stop_enabled else None
+    )
+    if stop_order_id:
         try:
-            set_tp_order_id(trade_id, tp_order_id)
+            set_stop_order_id(trade_id, stop_order_id)
         except Exception as exc:
             logger.error(
-                "Could not store tp_order_id %s for trade %d: %s — monitor will "
+                "Could not store stop_order_id %s for trade %d: %s — monitor will "
                 "not know about the resting order; cancelling it now",
-                tp_order_id, trade_id, exc,
+                stop_order_id, trade_id, exc,
             )
-            if cancel_order(tp_order_id):
+            if cancel_order(stop_order_id):
                 logger.warning(
-                    "Untracked resting TP %s for trade %d cancelled; monitor will use polled TP",
-                    tp_order_id, trade_id,
+                    "Untracked resting stop %s for trade %d cancelled; monitor will poll the stop",
+                    stop_order_id, trade_id,
                 )
-                tp_order_id = None
+                stop_order_id = None
             else:
                 logger.critical(
-                    "Could not cancel untracked TP order %s for trade %d — "
-                    "manual broker reconciliation required before any stop sell",
-                    tp_order_id, trade_id,
+                    "Could not cancel untracked stop order %s for trade %d — "
+                    "manual broker reconciliation required before any polled sell",
+                    stop_order_id, trade_id,
                 )
 
     logger.info(
         "Trade #%d opened: %s × %.6f @ $%.4f | net=£%.2f fx=%.4f fees=£%.2f | "
-        "order=%s | resting_tp=%s",
+        "order=%s | resting_stop=%s | tp=polled",
         trade_id, item.ticker, result.quantity, result.price,
         result.net_gbp or 0, result.fx_rate or 0, result.fees_gbp or 0,
-        result.order_id, tp_order_id or "polled",
+        result.order_id, stop_order_id or "polled",
     )
     return True
 

@@ -7,6 +7,139 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v20 — 2026-07-10 (first-principles rebuild: trade what's measured, protect the downside at broker speed)
+
+Ground-up critical review of every strategy component, driven by the
+system's own 60 days of forward-return data (the eval loop finally paying
+for itself) and the realized record (1W/10L, −£85). The theme is REMOVAL
+and INVERSION, not addition: stop trading the signal classes that measurably
+lose, stop chasing extended prices, and put the broker's speed on the side
+of the trade where speed is capital.
+
+### 1. TRADEABLE_CATALYSTS pruned to the measured-positive classes
+Forward returns of every positive, not-already-moved, confidence≥0.7 signal
+over 60 days (avg @5/15/60 min):
+
+| class          | n   | 5m     | 15m    | 60m    | verdict |
+|----------------|-----|--------|--------|--------|---------|
+| fda_approval   | 86  | −0.02  | +0.55  | +1.42  | KEEP    |
+| guidance_raise | 9   | +0.38  | +1.15  | +2.97  | KEEP    |
+| contract_win   | 152 | −0.42  | −0.84  | −1.34  | REMOVED |
+| ma_target      | 71  | −0.08  | −0.07  | −0.37  | REMOVED |
+| earnings_beat  | 33  | −0.74  | −1.13  | −1.60  | REMOVED |
+| product_launch | 32  | −0.93  | −1.13  | −2.05  | REMOVED |
+| short_squeeze  | 0   | —      | —      | —      | REMOVED |
+
+The kept classes are binary regulatory/guidance surprises whose drift BUILDS
+over 15–60 min — a shape a 1–3 min entry latency captures. Earnings news at
+this latency gets sold (both July losses — LEVI, CRCL — were earnings_beat).
+Magnitude was checked as an alternative filter and does NOT predict returns
+(mag 3/4/5 all negative) — MIN_CATALYST_MAGNITUDE stays at 2. Every class is
+still scored and persisted, so re-enabling stays evidence-based.
+
+### 2. Exit inversion: the STOP rests at the broker, the TP is polled
+T212 has no OCO and each sell reserves its shares — only one side can rest.
+v14 rested the TP and polled the stop every 20s; the record proved that
+backwards: 1 resting-TP fill in 11 trades vs stop slippage of −3.4% (VECO),
+−3.97% (CRCL — falling ~1%/min, the poll gave it a 20s head start) and
+−18.99% (GOAI) on −2% triggers. A missed TP costs opportunity; a slow stop
+costs capital on EVERY fast reversal.
+- `executor.place_stop_loss()` (stop-market, DAY) replaces
+  `place_take_profit()` (deleted); `trades.stop_order_id` column added
+  (tp_order_id kept for trades open across the deploy — both regimes
+  coexist in the monitor until legacy positions close).
+- Monitor notices stop fills (status + fill-detail, GONE≠filled), cancels
+  the stop before any polled TP/time-stop/EOD sell, and handles the
+  cancel/fill race in both directions.
+- **Breakeven ratchet**: at +RATCHET_TRIGGER_PCT (2% = 1R) the stop is
+  cancelled and re-placed at buy×(1+RATCHET_LOCK_PCT/100) (+0.1%), once.
+  If the replacement fails the armed flag drives a POLLED breakeven stop —
+  the ratchet can only tighten protection, never lose it.
+- Monitor cadence 20s → **5s** (the polled TP side pays cadence as latency);
+  reconciliation throttled to 60s so the faster loop doesn't multiply
+  broker API load; cycle early-outs when flat.
+
+### 3. Overextension gate — never park the stop on the far side of value
+New `overextended` reject (gate 10.2): entry price more than
+MAX_VWAP_EXTENSION_PCT (1.5%) above session VWAP is refused, because with a
+2% stop, a routine mean-reversion to VWAP — the base case for any extended
+stock — hits the stop by construction. LEVI entered +1.9% above VWAP and
+CRCL +2.2%: both were structurally dead on arrival. TRANSIENT: the re-eval
+queue re-checks every cycle, mechanically converting "chase the vertical
+move" into the professional playbook's "enter on the first pullback into
+value" with zero new infrastructure. Validation enforces
+MAX_VWAP_EXTENSION_PCT < STOP_LOSS_PCT.
+
+### 4. Digest/preview pre-filter (the CRCL fabrication class, killed deterministically)
+`_DIGEST_RE` blocks compilation headlines ("Market-Moving News for July
+10th", "Stocks To Watch", "Premarket Movers", "Earnings Scheduled For…",
+listicles) before Claude ever sees them — on 2026-07-10 one such digest
+(3 tickers, sliding under the >3-ticker roundup filter) was classified
+"earnings_beat, 80% confidence" for THREE unrelated companies and bought
+the top of CRCL's 13% parabolic spike. The system prompt also gained an
+explicit "digests and previews are never catalysts" rule as defense in
+depth (a digest classified as fda_approval would still pass the catalyst
+gate — the regex is the reliable layer).
+
+### 5. Data plan consolidation: 3 Twelvedata calls → 1 (+1 cached daily)
+`get_session_analysis()` — ONE 390-bar 1-min pull — now feeds momentum
+baseline, spread proxy, session volume, VWAP, and session low/high;
+`get_daily_stats()` (ADV, dollar-ADV, prev close — immutable intraday) is
+cached per symbol per ET day. `get_momentum_baseline`, `get_volume_stats`,
+`get_session_vwap`, `get_session_volume_and_vwap` deleted. Effects:
+- A re-evaluation retry costs **1 credit** (was 2–3) and ~2 HTTP round
+  trips (was 3–4) — confirmation latency roughly halved, premarket window
+  throughput up.
+- Session minute-bar volume is now THE RVOL numerator: the lagging
+  daily-bar `today_volume` and the v19.2 "rescue" second-fetch dance are
+  gone wholesale (the failure class died with the mechanism).
+- Fixed a long-standing subtle bug: right after the open, the momentum
+  baseline ("newest bar ≥5 min old") could match YESTERDAY's 15:59 bar,
+  silently treating the overnight gap as 5-minute momentum. Baseline
+  selection is now restricted to today's session.
+
+### Post-review hardening (pre-deploy code review, 7 findings, 6 fixed)
+A recall-biased review of the diff before shipping surfaced and fixed:
+- **Monitor price path at 5s** (`get_current_price`): quote chain now runs
+  fast (single-attempt — at a 5s cadence the next cycle IS the retry, and
+  in-call backoff sleeps overran the interval), and the 390-bar Twelvedata
+  fallback is throttled to one attempt per 30s per symbol — an unthrottled
+  quote outage would have burned ~12 pulls/min/position and saturated the
+  55/min bucket, starving signal confirmation.
+- **Digest regex over-match**: dropped "market update" ("Acme Provides
+  Market Update On Phase 3" is a real single-stock PR template), "day
+  ahead" and "stocks moving" — a false positive here is a silently-missed
+  trade with no eval-loop trace.
+- **Ratchet crash-safety**: the armed flag now lives ON the trade row
+  (`trades.ratchet_armed`, v20.1 migration) and is set only after the move
+  resolves; a crash between cancel and re-place self-repairs — the next
+  above-trigger cycle places a fresh breakeven stop directly. An in-memory
+  flag silently regressed protection to −2% after a restart.
+- **Gate decoupling**: `overextended` now evaluates whenever a VWAP exists,
+  independent of `REQUIRE_VWAP_CONFIRMATION` — disabling the accumulation
+  test must not silently disable the chasing protection.
+- **T212 order-endpoint bursts**: resting-order status checks throttled to
+  once per 15s per trade (bookkeeping, not protection — the money is
+  guarded broker-side; between checks the order is presumed live, the same
+  safe assumption as the network-error path).
+- **Stale docs**: main.py's "(20s)" monitor docstring, backtest_db's
+  reference to the deleted `get_session_vwap`.
+- *Accepted as designed*: a polled exit cancels the resting stop on its
+  first sell attempt, so repeated unfilled limit sells leave polled-only
+  protection — bounded by the 3-strike market escalation, which at the 5s
+  cadence fires within ~15-25s (versus 60s+ under v19).
+
+Also added `docs/how-the-trading-robot-works.html` — a self-contained,
+shareable plain-English explainer of the whole algorithm with diagrams
+(pipeline, catalyst evidence chart, safety-check funnel, trade lifecycle,
+guardrails, learning loop).
+
+Tests: 235 passing (26 new vs v19.5; suite runs ~10× faster — the mocked
+retry-sleep paths went away with the old data plan). No changes to: TP 5% /
+SL 2% (per user), TIME_STOP 60 (the kept classes' drift is still building
+at 60m), MIN_SENTIMENT_CONFIDENCE 7, RVOL band, liquidity floor, sizing,
+kill switch.
+
 ## v19.5 — 2026-07-09 (bad-trade post-mortem: intraday exhaustion + same-day news respin)
 
 Post-mortem of the day's one trade, LEVI (Levi Strauss): bought $24.93 at

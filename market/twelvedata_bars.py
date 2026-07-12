@@ -39,11 +39,18 @@ Momentum baseline (BY TIMESTAMP, not index):
   cfg.momentum_lookback_minutes old.
 
 Liquidity (ADV-based, deliberately):
-  get_volume_stats() returns avg_dollar_volume = 20-day ADV × last close.
+  get_daily_stats() returns avg_dollar_volume = 20-day ADV × last close.
   We do NOT use today's volume × price for the liquidity filter: during a
   halt-spike, today's dollar volume explodes, which would let the illiquidity
   filter PASS exactly the micro-caps it exists to block. Exit slippage is
   governed by the stock's NORMAL book depth, which ADV measures.
+
+Call plan per confirmation (v20):
+  get_session_analysis() — 1 credit, one 390-bar 1-min pull → momentum
+  baseline (by timestamp, today-only), spread proxy, session volume, VWAP,
+  session low/high. get_daily_stats() — 1 credit ONCE per symbol per day
+  (cached) → ADV, dollar-ADV, prev close. A re-evaluation retry costs 1
+  credit total, down from the 2-3 the old three-function plan re-paid.
 """
 
 import logging
@@ -51,6 +58,7 @@ import math
 import threading
 import time
 import requests
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import pytz
 from config.settings import cfg
@@ -545,183 +553,85 @@ def get_twelvedata_quote(symbol: str, fast: bool = False) -> dict | None:
     return None
 
 
-def get_momentum_baseline(
-    symbol: str, fast: bool = False
-) -> tuple[float | None, float | None, float | None]:
+@dataclass
+class SessionAnalysis:
+    """Everything the entry gates need from today's 1-min bars — ONE pull.
+
+    v20 consolidation: momentum baseline, spread proxy, session volume, VWAP
+    and session low/high were previously three separate /time_series calls
+    (get_momentum_baseline + get_volume_stats + get_session_volume_and_vwap)
+    made sequentially per confirmation — 2-3 credits and 2-3 HTTP round-trips
+    per signal, re-paid in full by every re-eval retry. All of them are
+    derivable from the same 390-bar 1-min series. One pull now feeds every
+    gate; the daily series (ADV/prev-close, immutable intraday) is cached per
+    day in get_daily_stats. A re-evaluation now costs 1 credit, not 3.
     """
-    Fetch 1-min intraday bars and return
-    (past_price, current_bar_price, spread_proxy_pct).
+    past_price: float | None        # close of newest TODAY bar ≥ lookback old
+    current_bar_price: float | None # close of the newest TODAY bar
+    spread_proxy_pct: float | None  # (high−low)/close of the newest bar, %
+    session_volume: int | None      # Σ volume of today's bars (current, unlike
+                                    # the daily bar's lagging volume field)
+    vwap: float | None              # session VWAP (typical price, volume-wtd)
+    last_price: float | None        # close of the newest TODAY bar
+    session_low: float | None       # min(low) of today's bars
+    session_high: float | None      # max(high) of today's bars
 
-    `fast` (default False) propagates to _get_time_series for the time-boxed
-    pre-market eval window (no retry backoff). Returns (None, None, None) on a
-    fast-mode miss or when the credit budget is exhausted — the caller treats
-    that as "data unavailable, retry next cycle".
 
-    past_price        — close of the newest bar that is at least
-                        cfg.momentum_lookback_minutes old (selected by
-                        TIMESTAMP, see module docstring)
-    current_bar_price — close of the most recent completed 1-min bar
-    spread_proxy_pct  — (high − low) / close of the most recent bar, in %.
-                        We have no bid/ask feed; the latest bar's range is a
-                        usable proxy for effective spread + microstructure
-                        noise. Used by the wide_spread entry filter.
-
-    Returns (None, None, None) if data is unavailable.
-
-    Staleness guard: if the most recent bar's timestamp is >10 minutes old,
-    the data is considered stale and rejected. This prevents the VECO failure
-    mode where a feed returned a bar from hours ago.
+def get_session_analysis(symbol: str, fast: bool = False) -> SessionAnalysis | None:
     """
-    # Fetch enough bars to cover the look-back window even if some minutes
-    # are missing (thin stocks skip bars when no trades print).
-    outputsize = max(10, cfg.momentum_lookback_minutes * 3)
-    values = _get_time_series(symbol, interval="1min", outputsize=outputsize, fast=fast)
-    if values is None or len(values) < 2:
-        return None, None, None
+    One 1-min-bars pull (1 credit) → SessionAnalysis for TODAY's session.
 
-    now_utc = datetime.now(timezone.utc)
-    most_recent = values[0]
+    Momentum baseline is selected BY TIMESTAMP among today's bars only: the
+    newest bar at least cfg.momentum_lookback_minutes old. Restricting the
+    walk to today's session fixes a long-standing subtle bug in the old
+    get_momentum_baseline: right after the open, "the newest bar ≥5 min old"
+    could be YESTERDAY'S 15:59 bar, silently turning the overnight gap into
+    fake 5-minute momentum. If no today-bar is old enough (first minutes of
+    the session), past_price is None and the caller falls back to the
+    official open price.
 
-    # ── Staleness guard ───────────────────────────────────────────────────────
-    most_recent_time = _parse_bar_time(most_recent)
-    if most_recent_time is not None:
-        age_minutes = (now_utc - most_recent_time).total_seconds() / 60
-        if age_minutes > 10:
-            logger.warning(
-                "Twelvedata: stale bar for %s — most recent bar is %.1f min old (bar_time=%s)",
-                symbol, age_minutes, most_recent.get("datetime", "?"),
-            )
-            return None, None, None
+    Staleness guard (VECO, 2026-06-05): if the newest today-bar is >10 min
+    old, past/current/spread are returned as None — a bar from an hour ago is
+    not "momentum". The cumulative session aggregates (volume, VWAP, low,
+    high) are still returned: they are true as of the last print, and the
+    volume undercount can only make RVOL conservative (a transient
+    low_volume reject that self-heals via the re-eval queue).
 
-    # ── Baseline selection by timestamp ───────────────────────────────────────
-    # Walk newest→oldest and take the first bar at least lookback_minutes old.
-    # This keeps the momentum window honest on stocks with missing bars.
-    cutoff = now_utc - timedelta(minutes=cfg.momentum_lookback_minutes)
-    baseline_bar = None
-    for bar in values[1:]:
-        bar_time = _parse_bar_time(bar)
-        if bar_time is not None and bar_time <= cutoff:
-            baseline_bar = bar
-            break
-    if baseline_bar is None:
-        # No bar is old enough to honor the look-back window (e.g. only a few
-        # bars exist right after the open). Fall back to the OLDEST bar we have
-        # rather than failing — but only if it is genuinely a different bar
-        # from the most recent one. If the oldest available bar IS the most
-        # recent (degenerate single-usable-bar case), there is no momentum
-        # window at all: return past_price=None so the caller's early-session
-        # open-price fallback (or a clean reject) kicks in instead of a
-        # spurious 0.00% reading.
-        if values[-1] is most_recent:
-            logger.debug(
-                "Twelvedata [%s]: no bar old enough for a momentum window "
-                "(have %d bar(s)) — momentum baseline unavailable",
-                symbol, len(values),
-            )
-            # Still return the current bar price + spread so the caller has them.
-            try:
-                cur = float(most_recent["close"])
-                hi = float(most_recent.get("high", cur))
-                lo = float(most_recent.get("low", cur))
-                sp = ((hi - lo) / cur) * 100 if cur > 0 else None
-            except (KeyError, ValueError, TypeError):
-                cur, sp = None, None
-            return None, cur, sp
-        baseline_bar = values[-1]
+    session_volume — Σ volume of today's minute bars. v20: this is THE
+    primary RVOL numerator. The old daily-bar `today_volume` trailed the live
+    session by minutes (worst at the open — ZTS read RVOL 0.07 and AGIO 0.40
+    minutes after gapping on real catalysts, 2026-07-07), which forced a
+    "rescue" second fetch of exactly this series. Minute bars are current;
+    the rescue dance and its failure class are gone. Known caveat: minute-bar
+    volume can undercount the consolidated tape, so RVOL reads conservative —
+    and low_volume is a TRANSIENT reject, so a false low re-checks in minutes.
 
-    try:
-        current_bar_price = float(most_recent["close"])
-        past_price = float(baseline_bar["close"])
-        bar_high = float(most_recent.get("high", current_bar_price))
-        bar_low = float(most_recent.get("low", current_bar_price))
-        spread_proxy_pct = (
-            ((bar_high - bar_low) / current_bar_price) * 100
-            if current_bar_price > 0 else None
-        )
-    except (KeyError, ValueError, TypeError) as exc:
-        logger.warning("Twelvedata: malformed bar data for %s: %s", symbol, exc)
-        return None, None, None
+    session_low/session_high — min/max of today's bars (v19.5 exhaustion
+    gate: LEVI gapped −7.8% and clawed back to +2.3% by entry; endpoint
+    measures couldn't see the round trip).
 
-    logger.debug(
-        "Twelvedata [%s]: current_bar=%.4f baseline=%.4f (bar_time=%s) spread_proxy=%.2f%%",
-        symbol, current_bar_price, past_price,
-        baseline_bar.get("datetime", "?"), spread_proxy_pct or 0,
-    )
-    return past_price, current_bar_price, spread_proxy_pct
-
-
-def get_session_vwap(symbol: str, fast: bool = False) -> tuple[float | None, float | None]:
-    """
-    Compute today's session VWAP and return (vwap, last_price).
-
-    VWAP (Volume-Weighted Average Price) is the institutional fair-value line:
-        VWAP = Σ(typical_price × volume) / Σ(volume),  typical = (H+L+C)/3
-    accumulated from the session open.
-
-    Why VWAP instead of a fixed % momentum floor (the v15 strategy fix):
-      A genuine catalyst on a deep-book large-cap reprices it by well under
-      1.5% in 5 minutes (DXCM +0.14%, SNY +0.07% on 2026-06-15 — all rejected
-      by the old fixed floor), yet the stock trades and HOLDS above VWAP
-      because institutions are net buyers. A fading "gap-and-crap" sits below
-      VWAP regardless of its raw % change. Price-vs-VWAP is therefore a
-      SIZE-NEUTRAL "is this being accumulated?" signal — the same test works
-      for a $2 micro-cap and a $1000 mega-cap. This is the standard
-      practitioner confirmation (see docs/algorithm.md research notes).
-
-    Returns (None, None) if data is unavailable. Costs 1 credit.
-
-    `fast` (default False) propagates to _get_time_series for the time-boxed
-    pre-market eval window (no retry backoff).
-
-    Implementation note: we pull up to 390 1-min bars (a full RTH session) and
-    accumulate only today's bars. Early in the session there are few bars, which
-    is fine — VWAP is simply the average so far.
-    """
-    _vol, vwap, last_price, _low, _high = get_session_volume_and_vwap(symbol, fast=fast)
-    return vwap, last_price
-
-
-def get_session_volume_and_vwap(
-    symbol: str, fast: bool = False
-) -> tuple[int | None, float | None, float | None, float | None, float | None]:
-    """
-    One 1-min-bars pull (1 credit) →
-    (session_volume, vwap, last_price, session_low, session_high).
-
-    session_volume — Σ volume of today's minute bars. This is the RESCUE
-    source for RVOL when Twelvedata's daily bar hasn't rolled or lags at the
-    open (observed 2026-07-07: ZTS read RVOL 0.07 and AGIO 0.40 minutes after
-    gapping up on real catalysts — the daily bar's volume field trails the
-    session by several minutes, so every at-open evaluation read near-zero
-    participation). Minute bars ARE current. Note the caveat: minute-bar
-    volume can undercount the consolidated tape, so callers should take
-    max(daily_bar_volume, session_volume) — the rescue can only ever ADD
-    measured participation, never hide it.
-
-    session_low/session_high — min/max of each bar's low/high so far today,
-    independent of volume. Added v19.5 to detect a stock that has already
-    round-tripped most of an intraday move (2026-07-09 LEVI post-mortem:
-    day_change_pct vs yesterday's close and the 5-min momentum window both
-    looked clean while the stock had actually gapped down -7.8% at the open
-    and clawed back to within cents of the day's high before entry).
-
-    Returns (None, None, None, None, None) if bar data is unavailable;
-    session_volume=0 with vwap=None (low/high still populated if any bars
-    exist) when bars exist but nothing traded today yet.
+    Returns None when bar data is unavailable or today has no bars yet.
     """
     values = _get_time_series(symbol, interval="1min", outputsize=390, fast=fast)
     if values is None or len(values) < 1:
-        return None, None, None, None, None
+        return None
 
+    now_utc = datetime.now(timezone.utc)
     now_et_date = datetime.now(_ET).date()
+
     cum_pv = 0.0   # Σ typical_price × volume
     cum_v = 0.0    # Σ volume
-    last_price: float | None = None
+    newest_bar: dict | None = None
+    newest_time: datetime | None = None
+    baseline_price: float | None = None
     session_low: float | None = None
     session_high: float | None = None
+    last_price: float | None = None
+    cutoff = now_utc - timedelta(minutes=cfg.momentum_lookback_minutes)
 
-    # values are newest-first; iterate oldest→newest so last_price ends on the
-    # most recent bar. Only include bars from today's session.
+    # values are newest-first; iterate oldest→newest so last_price/newest_bar
+    # end on the most recent TODAY bar. Bars from prior sessions are skipped —
+    # for the aggregates AND the momentum baseline (see docstring).
     for bar in reversed(values):
         bar_dt = _parse_bar_time(bar)
         if bar_dt is None or bar_dt.astimezone(_ET).date() != now_et_date:
@@ -733,93 +643,126 @@ def get_session_volume_and_vwap(
             vol = float(bar.get("volume", 0))
         except (KeyError, ValueError, TypeError):
             continue
-        typical = (high + low + close) / 3
-        cum_pv += typical * vol
+        cum_pv += ((high + low + close) / 3) * vol
         cum_v += vol
         last_price = close
         session_low = low if session_low is None else min(session_low, low)
         session_high = high if session_high is None else max(session_high, high)
+        newest_bar, newest_time = bar, bar_dt
+        # Oldest→newest walk: keep overwriting until we pass the cutoff, so
+        # this ends on the NEWEST bar that is still ≥ lookback old.
+        if bar_dt <= cutoff:
+            baseline_price = close
 
-    if cum_v <= 0 or last_price is None:
-        # No volume yet (pre-open or dead tape) — VWAP undefined.
-        return int(cum_v), None, last_price, session_low, session_high
+    if newest_bar is None:
+        logger.debug("Twelvedata [%s]: no bars for today's session yet", symbol)
+        return None
 
-    vwap = cum_pv / cum_v
-    logger.debug(
-        "Twelvedata session bars [%s]: vol=%d vwap=%.4f last=%.4f low=%s high=%s",
-        symbol, int(cum_v), vwap, last_price, session_low, session_high,
+    vwap = (cum_pv / cum_v) if cum_v > 0 else None
+
+    # ── Momentum staleness guard ─────────────────────────────────────────────
+    current_bar_price: float | None = last_price
+    spread_proxy_pct: float | None = None
+    age_minutes = (now_utc - newest_time).total_seconds() / 60
+    if age_minutes > 10:
+        logger.warning(
+            "Twelvedata: stale bar for %s — newest today-bar is %.1f min old "
+            "(bar_time=%s); momentum unavailable, session aggregates kept",
+            symbol, age_minutes, newest_bar.get("datetime", "?"),
+        )
+        baseline_price = None
+        current_bar_price = None
+    else:
+        try:
+            hi = float(newest_bar.get("high", last_price))
+            lo = float(newest_bar.get("low", last_price))
+            if last_price and last_price > 0:
+                spread_proxy_pct = ((hi - lo) / last_price) * 100
+        except (ValueError, TypeError):
+            spread_proxy_pct = None
+
+    return SessionAnalysis(
+        past_price=baseline_price,
+        current_bar_price=current_bar_price,
+        spread_proxy_pct=spread_proxy_pct,
+        session_volume=int(cum_v),
+        vwap=vwap,
+        last_price=last_price,
+        session_low=session_low,
+        session_high=session_high,
     )
-    return int(cum_v), vwap, last_price, session_low, session_high
 
 
-def get_volume_stats(
+# ── Daily stats (ADV / prev close) — cached per symbol per day ───────────────
+# ADV, dollar-ADV and the previous close come from COMPLETED sessions: they
+# cannot change intraday, so re-fetching them on every confirmation attempt
+# (the old get_volume_stats call) was pure waste — a re-evaluating signal
+# re-paid 1 credit + 1 HTTP round-trip per retry for numbers that were
+# identical all day. Successful results are cached until the ET date rolls.
+_daily_stats_cache: dict[tuple[str, str], tuple[int, float | None, float | None]] = {}
+_daily_stats_lock = threading.Lock()
+
+
+def get_daily_stats(
     symbol: str, fast: bool = False
-) -> tuple[int | None, int | None, float | None, float | None]:
+) -> tuple[int, float | None, float | None] | None:
     """
-    Fetch 21 daily bars and return
-    (today_volume, avg_daily_volume, avg_dollar_volume, prev_close).
+    (avg_daily_volume, avg_dollar_volume, prev_close) for `symbol`, cached per
+    ET calendar day. Fetches 21 daily bars on the first call of the day
+    (1 credit); every later call for the same symbol is free.
 
-    `fast` (default False) propagates to _get_time_series for the time-boxed
-    pre-market eval window (no retry backoff).
+    avg_daily_volume  — 20-day average share volume (completed sessions only;
+                        today's partial bar, when present, is excluded).
+    avg_dollar_volume — ADV × most recent completed close. THE liquidity
+                        metric: normal book depth, immune to spike-day
+                        volume inflation.
+    prev_close        — most recent completed session's close (gap baseline
+                        backup when the quote's `pc` is missing).
 
-    today_volume      — today's cumulative volume so far (bar[0], partial)
-    avg_daily_volume  — 20-day average daily share volume (bars[1..20])
-    avg_dollar_volume — ADV × most recent prior close. THE liquidity metric:
-                        measures normal book depth, immune to spike-day
-                        volume inflation (see module docstring).
-    prev_close        — previous session's close, used by price_check for
-                        gap/day-change calculations.
-
-    Returns (None, None, None, None) if data is unavailable.
+    Returns None if data is unavailable (failures are NOT cached — the next
+    attempt retries the fetch).
     """
+    key = (symbol, datetime.now(_ET).date().isoformat())
+    with _daily_stats_lock:
+        if key in _daily_stats_cache:
+            return _daily_stats_cache[key]
+        # Drop entries from prior days so the cache can't grow unbounded.
+        for stale in [k for k in _daily_stats_cache if k[1] != key[1]]:
+            _daily_stats_cache.pop(stale, None)
+
     values = _get_time_series(symbol, interval="1day", outputsize=21, fast=fast)
     if values is None or len(values) < 2:
-        return None, None, None, None
+        return None
 
     try:
-        today_bar = values[0]
-        today_bar_time = _parse_bar_time(today_bar)
+        today_bar_time = _parse_bar_time(values[0])
         today_et = datetime.now(_ET).date()
-        today_rolled = (
-            today_bar_time is not None
+        # Exclude today's partial bar from the ADV window when it has rolled.
+        prior_bars = (
+            values[1:]
+            if today_bar_time is not None
             and today_bar_time.astimezone(_ET).date() == today_et
+            else values
         )
-
-        # prior_bars and prev_close are derived from COMPLETED sessions and are
-        # valid regardless of whether today's bar has appeared yet. Only
-        # today_volume / RVOL require today's bar to have rolled.
-        if today_rolled:
-            prior_bars = values[1:]
-            today_volume: int | None = int(float(today_bar.get("volume", 0)))
-        else:
-            logger.warning(
-                "Twelvedata daily bar for %s has not rolled to today yet "
-                "(latest=%s, expected=%s) — volume/RVOL unavailable",
-                symbol, today_bar.get("datetime", "?"), today_et,
-            )
-            prior_bars = values  # bar[0] is yesterday — still valid for ADV+prev_close
-            today_volume = None
 
         prior_volumes = [int(float(b.get("volume", 0))) for b in prior_bars if b.get("volume")]
         avg_daily_volume = int(sum(prior_volumes) / len(prior_volumes)) if prior_volumes else 0
-
-        # Previous close = close of the most recent COMPLETED session.
         prev_close = float(prior_bars[0].get("close", 0)) or None
-
-        # ADV-based dollar volume — normal liquidity, not spike-day liquidity.
         avg_dollar_volume = (
             avg_daily_volume * prev_close
             if avg_daily_volume > 0 and prev_close else None
         )
-
-        logger.debug(
-            "Twelvedata volume [%s]: today=%s avg20d=%d adv$=%.0f prev_close=%s",
-            symbol, today_volume, avg_daily_volume,
-            avg_dollar_volume or 0, prev_close,
-        )
-        return today_volume, avg_daily_volume, avg_dollar_volume, prev_close
     # AttributeError included: a scalar smuggled into the bar list raises it
     # from `.get` — same malformed-payload class, same fail-closed answer.
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         logger.warning("Twelvedata: malformed daily bar data for %s: %s", symbol, exc)
-        return None, None, None, None
+        return None
+
+    result = (avg_daily_volume, avg_dollar_volume, prev_close)
+    with _daily_stats_lock:
+        _daily_stats_cache[key] = result
+    logger.debug(
+        "Twelvedata daily stats [%s]: avg20d=%d adv$=%.0f prev_close=%s (cached for today)",
+        symbol, avg_daily_volume, avg_dollar_volume or 0, prev_close,
+    )
+    return result

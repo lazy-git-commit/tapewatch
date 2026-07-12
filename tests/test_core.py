@@ -96,6 +96,306 @@ class TestExitConditions:
         assert price is None
 
 
+class TestExitInversion:
+    """v20: the resting side is the STOP; the TP is polled; breakeven ratchet.
+
+    Realized evidence for the inversion: 1 resting-TP fill in 11 trades vs
+    stop-side slippage of −3.4%/−3.97%/−18.99% on −2% triggers — the polled
+    stop gave every fast reversal a 20-second head start.
+    """
+
+    def setup_method(self):
+        import monitor.position_monitor as pm
+        pm._sell_fail_counts.clear()
+        pm._last_status_check.clear()
+
+    teardown_method = setup_method
+
+    def _trade(self, buy_price=100.0, minutes_ago=10, stop_order_id="stop-1",
+               ratchet_armed=0):
+        buy_time = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+        return {
+            "id": 7,
+            "ticker": "AAPL_US_EQ",
+            "buy_price": buy_price,
+            "quantity": 5.0,
+            "buy_time": buy_time,
+            "stop_order_id": stop_order_id,
+            "tp_order_id": None,
+            "ratchet_armed": ratchet_armed,
+            "mode": "demo",
+        }
+
+    # ── check_exit_conditions with a live resting stop ───────────────────────
+    @patch("monitor.position_monitor.get_current_price", return_value=97.0)
+    def test_polled_stop_suppressed_when_resting_stop_live(self, _mock):
+        from monitor.position_monitor import check_exit_conditions
+        should_exit, reason, _ = check_exit_conditions(
+            self._trade(), has_resting_stop=True
+        )
+        assert should_exit is False  # broker owns the stop — no double-sell
+
+    @patch("monitor.position_monitor.get_current_price", return_value=106.0)
+    def test_polled_tp_fires_with_resting_stop_live(self, _mock):
+        from monitor.position_monitor import check_exit_conditions
+        should_exit, reason, _ = check_exit_conditions(
+            self._trade(), has_resting_stop=True
+        )
+        assert should_exit is True and reason == "take_profit"
+
+    @patch("monitor.position_monitor.get_current_price", return_value=97.0)
+    def test_polled_stop_active_when_no_resting_stop(self, _mock):
+        from monitor.position_monitor import check_exit_conditions
+        should_exit, reason, _ = check_exit_conditions(
+            self._trade(stop_order_id=None), has_resting_stop=False
+        )
+        assert should_exit is True and reason == "stop_loss"
+
+    # ── Breakeven ratchet (armed flag persisted on the trade row — v20.1) ────
+    @patch("monitor.position_monitor.get_current_price", return_value=100.05)
+    def test_polled_stop_uses_breakeven_after_arm(self, _mock):
+        import monitor.position_monitor as pm
+        trade = self._trade(stop_order_id=None, ratchet_armed=1)
+        # 100.05 < breakeven 100.10 → armed polled stop fires at a tiny gain,
+        # not at the original 98.0. The flag comes from the DB row, so this
+        # holds across service restarts.
+        should_exit, reason, _ = pm.check_exit_conditions(trade)
+        assert should_exit is True and reason == "stop_loss"
+
+    @patch("monitor.position_monitor.set_ratchet_armed")
+    @patch("monitor.position_monitor.set_stop_order_id")
+    @patch("monitor.position_monitor.place_stop_loss", return_value="stop-2")
+    @patch("monitor.position_monitor.cancel_order", return_value=True)
+    def test_ratchet_replaces_stop_once(self, mock_cancel, mock_place, mock_set, mock_arm):
+        import monitor.position_monitor as pm
+        trade = self._trade()
+        pm._maybe_ratchet_stop(trade, current_price=102.5)  # ≥ +2% trigger
+        mock_cancel.assert_called_once_with("stop-1")
+        mock_place.assert_called_once()
+        # New stop at breakeven: buy × (1 + 0.1%) = 100.10
+        assert mock_place.call_args.args[2] == pytest.approx(100.10)
+        mock_arm.assert_called_once_with(7)   # durable, not in-memory
+        assert trade["ratchet_armed"] == 1
+        assert trade["stop_order_id"] == "stop-2"
+        # Second call is a no-op (once per trade).
+        pm._maybe_ratchet_stop(trade, current_price=103.0)
+        mock_place.assert_called_once()
+
+    @patch("monitor.position_monitor.place_stop_loss", return_value="x")
+    def test_ratchet_not_triggered_below_threshold(self, mock_place):
+        import monitor.position_monitor as pm
+        pm._maybe_ratchet_stop(self._trade(), current_price=101.0)  # +1% < 2%
+        mock_place.assert_not_called()
+
+    @patch("monitor.position_monitor.place_stop_loss", return_value="x")
+    def test_ratchet_never_touches_legacy_tp_trades(self, mock_place):
+        import monitor.position_monitor as pm
+        trade = self._trade(stop_order_id=None)
+        trade["tp_order_id"] = "tp-9"   # pre-v20 regime
+        pm._maybe_ratchet_stop(trade, current_price=105.0)
+        mock_place.assert_not_called()
+
+    @patch("monitor.position_monitor.set_ratchet_armed")
+    @patch("monitor.position_monitor.set_stop_order_id")
+    @patch("monitor.position_monitor.place_stop_loss", return_value=None)
+    @patch("monitor.position_monitor.cancel_order", return_value=True)
+    def test_ratchet_placement_failure_falls_back_to_polled_breakeven(
+        self, _cancel, _place, _set, mock_arm
+    ):
+        # Cancel succeeded but the breakeven stop wouldn't place: the trade
+        # must still be protected — the DURABLE armed flag drives the POLLED
+        # breakeven, and survives a restart.
+        import monitor.position_monitor as pm
+        trade = self._trade()
+        pm._maybe_ratchet_stop(trade, current_price=102.5)
+        mock_arm.assert_called_once_with(7)
+        assert trade["ratchet_armed"] == 1
+        assert trade.get("stop_order_id") is None
+
+    @patch("monitor.position_monitor.set_ratchet_armed")
+    @patch("monitor.position_monitor.set_stop_order_id")
+    @patch("monitor.position_monitor.place_stop_loss", return_value="stop-9")
+    def test_ratchet_crash_recovery_places_fresh_stop(self, mock_place, _set, mock_arm):
+        # Crash landed between cancel and re-place: restart sees an un-armed
+        # trade with NO resting stop. The ratchet must repair it by placing a
+        # breakeven stop directly (nothing to cancel first).
+        import monitor.position_monitor as pm
+        trade = self._trade(stop_order_id=None)
+        pm._maybe_ratchet_stop(trade, current_price=102.5)
+        mock_place.assert_called_once()
+        assert mock_place.call_args.args[2] == pytest.approx(100.10)
+        mock_arm.assert_called_once_with(7)
+        assert trade["stop_order_id"] == "stop-9"
+
+    @patch("monitor.position_monitor._close_as_resting_fill")
+    @patch("monitor.position_monitor.get_order_status", return_value="FILLED")
+    @patch("monitor.position_monitor.cancel_order", return_value=False)
+    def test_ratchet_cancel_race_resolves_as_stop_fill(
+        self, _cancel, _status, mock_close
+    ):
+        # Whipsaw: stop filled while we were cancelling it for the ratchet.
+        import monitor.position_monitor as pm
+        trade = self._trade()
+        pm._maybe_ratchet_stop(trade, current_price=102.5)
+        mock_close.assert_called_once()
+        assert not trade.get("ratchet_armed")  # trade closed, never armed
+
+    # ── Cancel-before-sell handles the stop kind ─────────────────────────────
+    @patch("monitor.position_monitor.set_stop_order_id")
+    @patch("monitor.position_monitor.cancel_order", return_value=True)
+    def test_cancel_resting_stop_before_sell(self, mock_cancel, _set):
+        from monitor.position_monitor import _cancel_resting_before_sell
+        trade = self._trade()
+        assert _cancel_resting_before_sell(trade) is True
+        mock_cancel.assert_called_once_with("stop-1")
+        assert trade["stop_order_id"] is None
+
+    @patch("monitor.position_monitor._close_as_resting_fill")
+    @patch("monitor.position_monitor.get_order_status", return_value="FILLED")
+    @patch("monitor.position_monitor.cancel_order", return_value=False)
+    def test_cancel_race_stop_filled_closes_as_stop(self, _c, _s, mock_close):
+        from monitor.position_monitor import _cancel_resting_before_sell
+        trade = self._trade()
+        assert _cancel_resting_before_sell(trade) is False  # nothing left to sell
+        mock_close.assert_called_once()
+        assert mock_close.call_args.args[2] == "stop"
+
+
+class TestGetCurrentPriceDegraded:
+    """v20.1: the monitor's price path must not melt down in a quote outage.
+
+    At the 5s cadence, in-call retry backoff would overrun the cycle and an
+    unthrottled 390-bar fallback would saturate the Twelvedata token bucket
+    (~12 pulls/min/position) and starve signal confirmation.
+    """
+
+    def setup_method(self):
+        import market.price_check as pc
+        pc._last_bars_fallback.clear()
+
+    teardown_method = setup_method
+
+    @patch("market.price_check.get_quote_with_fallback")
+    def test_quote_path_is_fast_mode(self, mock_quote):
+        import market.price_check as pc
+        mock_quote.return_value = {"c": 10.5}
+        assert pc.get_current_price("AAPL_US_EQ") == 10.5
+        assert mock_quote.call_args.kwargs.get("fast") is True
+
+    @patch("market.price_check.get_session_analysis")
+    @patch("market.price_check.get_quote_with_fallback", return_value=None)
+    def test_bars_fallback_throttled_per_symbol(self, _quote, mock_sa):
+        import market.price_check as pc
+        mock_sa.return_value = _mk_sa()
+        assert pc.get_current_price("AAPL_US_EQ") == 10.5  # first: fallback runs
+        assert pc.get_current_price("AAPL_US_EQ") is None  # within 30s: throttled
+        mock_sa.assert_called_once()
+
+
+class TestPlaceStopLoss:
+    """executor.place_stop_loss — the v20 resting order."""
+
+    @patch("trading.executor._post")
+    def test_payload_shape(self, mock_post):
+        from trading.executor import place_stop_loss
+        mock_post.return_value = {"id": 12345}
+        order_id = place_stop_loss("AAPL_US_EQ", 5.0, 98.0)
+        assert order_id == "12345"
+        path, payload = mock_post.call_args.args
+        assert path == "/equity/orders/stop"
+        assert payload["quantity"] == -5.0          # negative = sell
+        assert payload["stopPrice"] == 98.0
+        assert payload["timeValidity"] == "DAY"
+
+    @patch("trading.executor._post", side_effect=Exception("HTTP 400"))
+    def test_failure_returns_none(self, _mock):
+        from trading.executor import place_stop_loss
+        assert place_stop_loss("AAPL_US_EQ", 5.0, 98.0) is None
+
+
+class TestDigestPrefilter:
+    """v20: digest/preview/listicle headlines never reach Claude.
+
+    CRCL 2026-07-10: 'Market-Moving News for July 10th' (3 tickers, slid
+    under the >3 roundup filter) was classified 'earnings_beat conf=0.8' for
+    three unrelated companies and bought the top of a 13% parabolic spike.
+    """
+
+    def setup_method(self):
+        import news.fetcher as f
+        f._scored_articles["date"] = None
+        f._scored_articles["ids"] = set()
+        f._ticker_history["date"] = None
+        f._ticker_history["tickers"] = {}
+
+    def _fetch_with(self, title):
+        import news.fetcher as f
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        article = {"tickers": ["CRCL"], "title": title, "teaser": "t",
+                   "benzinga_id": "d1", "published": now_iso}
+        with patch("news.fetcher._fetch", return_value=[article]), \
+             patch("news.fetcher._batch_score_sentiment", return_value={}) as mock_score:
+            f.fetch_all_news(seen_checker=lambda a, t: False)
+        return mock_score
+
+    def test_market_moving_news_blocked(self):
+        mock_score = self._fetch_with("Market-Moving News for July 10th")
+        mock_score.assert_not_called()
+
+    def test_stocks_to_watch_blocked(self):
+        mock_score = self._fetch_with("3 Stocks To Watch Before The Open")
+        mock_score.assert_not_called()
+
+    def test_premarket_movers_blocked(self):
+        mock_score = self._fetch_with("Friday's Premarket Movers: Winners and Losers")
+        mock_score.assert_not_called()
+
+    def test_earnings_preview_blocked(self):
+        mock_score = self._fetch_with("Earnings Scheduled For July 10, 2026")
+        mock_score.assert_not_called()
+
+    def test_real_catalyst_headline_passes(self):
+        mock_score = self._fetch_with(
+            "Circle Internet Receives Federal Trust Bank Charter Approval"
+        )
+        mock_score.assert_called_once()
+
+    def test_company_market_update_pr_passes(self):
+        # v20.1 review finding: "market update" is a real PR template for
+        # single-stock news — it must NOT be treated as a digest.
+        mock_score = self._fetch_with(
+            "Acme Therapeutics Provides Market Update On Phase 3 Results"
+        )
+        mock_score.assert_called_once()
+
+    def test_investor_day_ahead_passes(self):
+        # "day ahead" appears in genuine headlines; only "week ahead" digests.
+        mock_score = self._fetch_with(
+            "Acme Soars With Investor Day Ahead Of Product Launch"
+        )
+        mock_score.assert_called_once()
+
+    def test_week_ahead_digest_still_blocked(self):
+        mock_score = self._fetch_with("Wall Street's Week Ahead: Earnings, CPI")
+        mock_score.assert_not_called()
+
+
+class TestCatalystPrune:
+    """v20: TRADEABLE_CATALYSTS default pruned to measured-positive classes."""
+
+    def test_default_is_evidence_backed_pair(self):
+        # Defaults matter: a missing env var must not silently re-enable the
+        # classes the forward-return data measured as negative.
+        import os
+        from config.settings import Settings
+        old = os.environ.pop("TRADEABLE_CATALYSTS", None)
+        try:
+            assert Settings().tradeable_catalysts == ["fda_approval", "guidance_raise"]
+        finally:
+            if old is not None:
+                os.environ["TRADEABLE_CATALYSTS"] = old
+
+
 # ── Sentiment scoring tests (forced tool use) ─────────────────────────────────
 
 class TestSentimentScoring:
@@ -341,6 +641,13 @@ class TestCatalystMagnitude:
 class TestBrokerReconciliation:
     """Tests for monitor/position_monitor.py::_reconcile_positions"""
 
+    def setup_method(self):
+        # v20 throttles reconciliation to once/60s — reset so each test runs it.
+        import monitor.position_monitor as pm
+        pm._last_reconcile_ts = 0.0
+
+    teardown_method = setup_method
+
     def _trade(self, trade_id, ticker, qty=10.0):
         return {"id": trade_id, "ticker": ticker, "quantity": qty,
                 "buy_price": 100.0, "buy_time": "2026-06-17T13:00:00+00:00",
@@ -543,54 +850,87 @@ class TestSellExecution:
         assert mock_post.call_args[0][0] == "/equity/orders/market"
 
 
-class TestGoneTpOrderResolution:
-    """Tests for monitor/position_monitor.py::_handle_gone_tp_order
+class TestGoneRestingOrderResolution:
+    """Tests for monitor/position_monitor.py::_handle_gone_resting_order
 
-    A TP order that 404s on the pending endpoint is NOT automatically a fill.
-    DAY orders expire at close; treating expiry as profit corrupts P&L and
-    leaves the real position unmanaged with no stop or EOD flatten.
+    A resting order that 404s on the pending endpoint is NOT automatically a
+    fill. DAY orders expire at close; treating expiry as an exit corrupts P&L
+    and leaves the real position unmanaged.
     """
 
-    def _trade(self, buy_price=100.0):
+    def _trade(self, buy_price=100.0, kind="tp"):
         buy_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        return {
+        trade = {
             "id": 42,
             "ticker": "TEST_US_EQ",
             "buy_price": buy_price,
             "quantity": 10.0,
             "buy_time": buy_time,
-            "tp_order_id": "tp-order-99",
+            "tp_order_id": None,
+            "stop_order_id": None,
             "mode": "demo",
         }
+        trade["tp_order_id" if kind == "tp" else "stop_order_id"] = "order-99"
+        return trade
 
     @patch("monitor.position_monitor.set_tp_order_id")
     @patch("monitor.position_monitor.close_trade")
     @patch("monitor.position_monitor._fetch_fill")
     def test_gone_with_fill_closes_trade_as_tp(self, mock_fetch, mock_close, mock_set_tp):
-        """GONE + fill detail → trade closed as take_profit, returns True."""
+        """GONE + fill detail (legacy TP) → trade closed as take_profit, returns True."""
         mock_fetch.return_value = {
             "price": "105.00",
             "walletImpact": {"netValue": "52.30", "fxRate": "1.25", "taxes": []},
         }
-        from monitor.position_monitor import _handle_gone_tp_order
-        trade = self._trade()
-        result = _handle_gone_tp_order(trade, "tp-order-99")
+        from monitor.position_monitor import _handle_gone_resting_order
+        trade = self._trade(kind="tp")
+        result = _handle_gone_resting_order(trade, "order-99", "tp")
         assert result is True
         mock_close.assert_called_once()
+        assert mock_close.call_args.args[2] == "take_profit"
         mock_set_tp.assert_not_called()
+
+    @patch("monitor.position_monitor.set_stop_order_id")
+    @patch("monitor.position_monitor.close_trade")
+    @patch("monitor.position_monitor._fetch_fill")
+    def test_gone_with_fill_closes_trade_as_stop(self, mock_fetch, mock_close, mock_set_stop):
+        """GONE + fill detail (v20 stop) → trade closed as stop_loss, returns True."""
+        mock_fetch.return_value = {
+            "price": "97.90",
+            "walletImpact": {"netValue": "48.10", "fxRate": "1.25", "taxes": []},
+        }
+        from monitor.position_monitor import _handle_gone_resting_order
+        trade = self._trade(kind="stop")
+        result = _handle_gone_resting_order(trade, "order-99", "stop")
+        assert result is True
+        mock_close.assert_called_once()
+        assert mock_close.call_args.args[2] == "stop_loss"
+        mock_set_stop.assert_not_called()
 
     @patch("monitor.position_monitor.set_tp_order_id")
     @patch("monitor.position_monitor.close_trade")
     @patch("monitor.position_monitor._fetch_fill", return_value=None)
     def test_gone_without_fill_reverts_to_polled_exits(self, _mock_fetch, mock_close, mock_set_tp):
-        """GONE + no fill detail → stale TP id cleared, trade stays open, returns False."""
-        from monitor.position_monitor import _handle_gone_tp_order
-        trade = self._trade()
-        result = _handle_gone_tp_order(trade, "tp-order-99")
+        """GONE + no fill detail → stale order id cleared, trade stays open, returns False."""
+        from monitor.position_monitor import _handle_gone_resting_order
+        trade = self._trade(kind="tp")
+        result = _handle_gone_resting_order(trade, "order-99", "tp")
         assert result is False
         mock_close.assert_not_called()
         mock_set_tp.assert_called_once_with(42, None)
         assert trade["tp_order_id"] is None
+
+    @patch("monitor.position_monitor.set_stop_order_id")
+    @patch("monitor.position_monitor.close_trade")
+    @patch("monitor.position_monitor._fetch_fill", return_value=None)
+    def test_gone_stop_without_fill_reverts_to_polled_stop(self, _mock_fetch, mock_close, mock_set_stop):
+        from monitor.position_monitor import _handle_gone_resting_order
+        trade = self._trade(kind="stop")
+        result = _handle_gone_resting_order(trade, "order-99", "stop")
+        assert result is False
+        mock_close.assert_not_called()
+        mock_set_stop.assert_called_once_with(42, None)
+        assert trade["stop_order_id"] is None
 
 
 class TestCashflowPnl:
@@ -828,10 +1168,10 @@ class TestQuoteFallback:
         mock_td.assert_not_called()
 
 
-# ── VWAP computation tests (v15) ──────────────────────────────────────────────
+# ── Session analysis tests (v20: one pull feeds every gate) ──────────────────
 
 class TestVwap:
-    """Tests for market/twelvedata_bars.py::get_session_vwap"""
+    """VWAP math inside market/twelvedata_bars.py::get_session_analysis"""
 
     def _bar(self, dt, h, l, c, v):
         return {"datetime": dt, "high": str(h), "low": str(l), "close": str(c), "volume": str(v)}
@@ -842,59 +1182,83 @@ class TestVwap:
         import pytz
         now_et = datetime.now(pytz.timezone("America/New_York"))
         d = now_et.strftime("%Y-%m-%d")
-        # Heavy volume (900) at price 10, light (100) at 20.
-        # Use times safely in the past relative to "now" so they're today.
+        # Heavy volume (900) at price 10, light (100) at 20. Times recent
+        # enough to pass the 10-min staleness guard.
+        t1 = (now_et - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:00")
+        t2 = (now_et - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:00")
         return [
-            self._bar(f"{d} 09:31:00", 20, 20, 20, 100),  # newest first
-            self._bar(f"{d} 09:30:00", 10, 10, 10, 900),
+            self._bar(t1, 20, 20, 20, 100),  # newest first
+            self._bar(t2, 10, 10, 10, 900),
         ]
 
     @patch("market.twelvedata_bars._get_time_series")
     def test_vwap_weighted_by_volume(self, mock_ts):
         import market.twelvedata_bars as td
         mock_ts.return_value = self._today_bars()
-        vwap, last = td.get_session_vwap("AAPL")
+        sa = td.get_session_analysis("AAPL")
         # typical prices 20 and 10; volume-weighted (20*100 + 10*900)/1000 = 11.0
-        assert vwap == pytest.approx(11.0, rel=1e-6)
-        assert last == 20.0  # last_price = most recent bar's close
+        assert sa is not None
+        assert sa.vwap == pytest.approx(11.0, rel=1e-6)
+        assert sa.last_price == 20.0  # most recent bar's close
 
     @patch("market.twelvedata_bars._get_time_series")
-    def test_vwap_none_when_no_data(self, mock_ts):
+    def test_none_when_no_data(self, mock_ts):
         import market.twelvedata_bars as td
         mock_ts.return_value = None
-        vwap, last = td.get_session_vwap("AAPL")
-        assert vwap is None and last is None
+        assert td.get_session_analysis("AAPL") is None
+
+    @patch("market.twelvedata_bars._get_time_series")
+    def test_stale_bars_keep_aggregates_but_drop_momentum(self, mock_ts):
+        # VECO guard: newest today-bar >10 min old → momentum fields None;
+        # the cumulative session aggregates are still valid as-of-last-print.
+        from datetime import datetime
+        import pytz
+        import market.twelvedata_bars as td
+        now_et = datetime.now(pytz.timezone("America/New_York"))
+        stale = (now_et - timedelta(minutes=45)).strftime("%Y-%m-%d %H:%M:00")
+        mock_ts.return_value = [self._bar(stale, 10.2, 10.0, 10.1, 5000)]
+        sa = td.get_session_analysis("AAPL")
+        assert sa is not None
+        assert sa.past_price is None and sa.current_bar_price is None
+        assert sa.session_volume == 5000 and sa.vwap is not None
+
+    @patch("market.twelvedata_bars._get_time_series")
+    def test_baseline_never_comes_from_yesterday(self, mock_ts):
+        # Pre-existing bug fixed in v20: right after the open, "the newest bar
+        # ≥ lookback old" used to match YESTERDAY'S 15:59 bar, silently
+        # treating the overnight gap as 5-minute momentum. Today-only now.
+        from datetime import datetime
+        import pytz
+        import market.twelvedata_bars as td
+        now_et = datetime.now(pytz.timezone("America/New_York"))
+        d = now_et.strftime("%Y-%m-%d")
+        y = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
+        fresh = (now_et - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:00")
+        mock_ts.return_value = [
+            self._bar(fresh, 15.1, 14.9, 15.0, 1000),      # today, fresh
+            self._bar(f"{y} 15:59:00", 10.1, 9.9, 10.0, 8000),  # yesterday
+        ]
+        sa = td.get_session_analysis("AAPL")
+        assert sa is not None
+        assert sa.past_price is None  # no today-bar old enough — NOT 10.0
+        assert sa.session_volume == 1000  # yesterday's bar excluded
 
 
-class TestTwelvedataVolumeStats:
-    """Tests for market/twelvedata_bars.py::get_volume_stats"""
+class TestDailyStats:
+    """market/twelvedata_bars.py::get_daily_stats — ADV/prev-close, day-cached."""
+
+    def setup_method(self):
+        import market.twelvedata_bars as td
+        td._daily_stats_cache.clear()
+
+    teardown_method = setup_method
 
     def _daily_bar(self, dt, close=10, volume=1000):
         return {"datetime": dt, "close": str(close), "volume": str(volume)}
 
     @patch("market.twelvedata_bars._get_time_series")
-    def test_daily_bar_not_rolled_returns_none_today_volume_but_valid_prev_close(self, mock_ts):
-        # When today's daily bar hasn't appeared yet (common at 09:30 ET), we
-        # must still return prev_close and ADV — those come from completed
-        # sessions and are required for the dead_cat and extended_move gates.
-        # Only today_volume (needed for RVOL) is unavailable.
-        import pytz
-        import market.twelvedata_bars as td
-        now_et = datetime.now(pytz.timezone("America/New_York"))
-        yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
-        before = (now_et - timedelta(days=2)).strftime("%Y-%m-%d")
-        mock_ts.return_value = [
-            self._daily_bar(yesterday, close=10, volume=5000),
-            self._daily_bar(before, close=9, volume=1000),
-        ]
-        today_vol, avg_vol, adv_dollars, prev_close = td.get_volume_stats("AAPL")
-        assert today_vol is None                          # bar not rolled — RVOL unavailable
-        assert avg_vol == pytest.approx(3000)             # avg of both prior bars: (5000+1000)/2
-        assert adv_dollars == pytest.approx(30_000)       # 3000 avg * close=10
-        assert prev_close == pytest.approx(10)            # most recent completed close
-
-    @patch("market.twelvedata_bars._get_time_series")
-    def test_date_only_daily_bar_parses(self, mock_ts):
+    def test_prior_sessions_only_in_adv(self, mock_ts):
+        # Today's partial daily bar (when rolled) must be EXCLUDED from ADV.
         import pytz
         import market.twelvedata_bars as td
         now_et = datetime.now(pytz.timezone("America/New_York"))
@@ -904,11 +1268,53 @@ class TestTwelvedataVolumeStats:
             self._daily_bar(today, close=11, volume=500),
             self._daily_bar(yesterday, close=10, volume=1000),
         ]
-        today_vol, avg_vol, adv_dollars, prev_close = td.get_volume_stats("AAPL")
-        assert today_vol == 500
+        stats = td.get_daily_stats("AAPL")
+        assert stats is not None
+        avg_vol, adv_dollars, prev_close = stats
         assert avg_vol == 1000
         assert adv_dollars == pytest.approx(10_000)
         assert prev_close == pytest.approx(10)
+
+    @patch("market.twelvedata_bars._get_time_series")
+    def test_unrolled_daily_bar_still_gives_adv_and_prev_close(self, mock_ts):
+        import pytz
+        import market.twelvedata_bars as td
+        now_et = datetime.now(pytz.timezone("America/New_York"))
+        yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
+        before = (now_et - timedelta(days=2)).strftime("%Y-%m-%d")
+        mock_ts.return_value = [
+            self._daily_bar(yesterday, close=10, volume=5000),
+            self._daily_bar(before, close=9, volume=1000),
+        ]
+        stats = td.get_daily_stats("AAPL")
+        assert stats is not None
+        avg_vol, adv_dollars, prev_close = stats
+        assert avg_vol == pytest.approx(3000)
+        assert adv_dollars == pytest.approx(30_000)
+        assert prev_close == pytest.approx(10)
+
+    @patch("market.twelvedata_bars._get_time_series")
+    def test_second_call_same_day_hits_cache(self, mock_ts):
+        import pytz
+        import market.twelvedata_bars as td
+        now_et = datetime.now(pytz.timezone("America/New_York"))
+        yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
+        before = (now_et - timedelta(days=2)).strftime("%Y-%m-%d")
+        mock_ts.return_value = [
+            self._daily_bar(yesterday, close=10, volume=5000),
+            self._daily_bar(before, close=9, volume=1000),
+        ]
+        first = td.get_daily_stats("AAPL")
+        second = td.get_daily_stats("AAPL")
+        assert first == second
+        mock_ts.assert_called_once()  # the whole point: one HTTP per symbol per day
+
+    @patch("market.twelvedata_bars._get_time_series", return_value=None)
+    def test_failures_are_not_cached(self, mock_ts):
+        import market.twelvedata_bars as td
+        assert td.get_daily_stats("AAPL") is None
+        assert td.get_daily_stats("AAPL") is None
+        assert mock_ts.call_count == 2  # each attempt retries the fetch
 
 
 # ── Backtest ↔ production parity tests (v15 audit) ─────────────────────────────
@@ -1969,89 +2375,148 @@ class TestQuoteStaleness:
         assert q is not None and q["c"] == 12.50
 
 
-def _confirm_with(monkey_now_et, quote, baseline, volume_stats, session):
-    """Run confirm_price_signal with all data dependencies mocked.
+def _mk_sa(**overrides):
+    """Build a SessionAnalysis with confirmable defaults for gate tests.
 
-    `session` may be a 3-tuple (session_volume, vwap, last_price) — padded
-    with (None, None) for session_low/session_high, i.e. the exhaustion gate
-    sees no range data and stays silent — or a full 5-tuple to also drive it.
+    Defaults describe a healthy setup for a $10.50 quote: +2.94% momentum vs
+    the 10.2 baseline, RVOL ≈ 2 (100k session volume vs 1M ADV at 30 min into
+    the session), price +0.48% above a 10.45 VWAP (inside the 1.5% extension
+    ceiling), no low/high range data (exhaustion gate silent).
     """
+    from market.twelvedata_bars import SessionAnalysis
+    kw = dict(
+        past_price=10.2, current_bar_price=10.5, spread_proxy_pct=0.5,
+        session_volume=100_000, vwap=10.45, last_price=10.5,
+        session_low=None, session_high=None,
+    )
+    kw.update(overrides)
+    return SessionAnalysis(**kw)
+
+
+_DAILY = (1_000_000, 10_000_000.0, 10.0)  # (avg_daily_volume, adv$, prev_close)
+
+
+def _confirm_with(monkey_now_et, quote, sa, daily=_DAILY):
+    """Run confirm_price_signal with all data dependencies mocked (v20 seams:
+    one session-analysis pull + cached daily stats)."""
     import market.price_check as pc
-    if len(session) == 3:
-        session = (*session, None, None)
     fake_dt = MagicMock()
     fake_dt.now.side_effect = lambda tz=None: monkey_now_et
     with patch.object(pc, "datetime", fake_dt), \
          patch.object(pc, "get_quote_with_fallback", return_value=quote), \
-         patch.object(pc, "get_momentum_baseline", return_value=baseline), \
-         patch.object(pc, "get_volume_stats", return_value=volume_stats), \
-         patch.object(pc, "get_session_volume_and_vwap",
-                      return_value=session) as mock_sess:
+         patch.object(pc, "get_session_analysis", return_value=sa) as mock_sa, \
+         patch.object(pc, "get_daily_stats", return_value=daily):
         conf = pc.confirm_price_signal("ACME_US_EQ")
-    return conf, mock_sess
+    return conf, mock_sa
 
 
-class TestRvolRescueAndDegradedData:
+class TestSessionVolumeGates:
     """
-    v19.2 RVOL/VWAP data-integrity fixes:
-      - daily-bar volume lag is rescued with session minute bars (AGIO case)
-      - session bars fetched for the rescue are REUSED for VWAP (no 2nd credit)
-      - all-fallbacks-degraded no longer approves on a bare quote (GLASF case)
+    v20: session minute-bar volume is THE RVOL numerator (the lagging daily
+    bar and its rescue dance are gone), and degraded data still fails closed:
+      - zero measured session volume → low_volume (GLASF must not trade)
+      - session bars entirely missing early in the session → insufficient_data
+        (open-price momentum fallback alone must never confirm a bare quote)
     """
+
+    _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.0}
+
+    @staticmethod
+    def _now_et(minutes_after_open=30):
+        import pytz
+        et = pytz.timezone("America/New_York")
+        return et.localize(datetime(2026, 7, 10, 9, 30 + minutes_after_open % 60,
+                                    0)) if minutes_after_open < 30 else \
+               et.localize(datetime(2026, 7, 10, 10, minutes_after_open - 30, 0))
+
+    def test_healthy_session_volume_confirms_with_one_pull(self):
+        conf, mock_sa = _confirm_with(self._now_et(), self._QUOTE, _mk_sa())
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+        assert conf.rvol > 1.5
+        mock_sa.assert_called_once()  # every gate fed by ONE bars pull
+
+    def test_zero_session_volume_rejects_low_volume(self):
+        # GLASF case: nothing traded per the minute bars. The zero measurement
+        # counts as a measurement and fails the participation gate.
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE,
+            _mk_sa(session_volume=0, vwap=None, last_price=None),
+        )
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "low_volume"
+
+    def test_no_session_bars_early_rejects_insufficient_data(self):
+        # First 15 min: no bars at all → open-price momentum fallback engages,
+        # but with no volume measurement AND no VWAP the signal must NOT
+        # confirm on a bare quote.
+        conf, _ = _confirm_with(self._now_et(10), self._QUOTE, None)
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "insufficient_data"
+
+    def test_no_session_bars_late_cannot_evaluate(self):
+        # Past the open window the open-price fallback is not honest — the
+        # signal is unpriceable this cycle (retry), not rejected.
+        conf, _ = _confirm_with(self._now_et(30), self._QUOTE, None)
+        assert conf is None
+
+
+class TestOverextendedGate:
+    """
+    v20: never enter with the stop on the far side of value. If price is
+    further above VWAP than the stop is wide, a routine reversion to VWAP
+    stops the trade out by construction (LEVI +1.9% above VWAP, CRCL +2.2%,
+    both with a 2% stop — the two 2026-07 losses). TRANSIENT: the re-eval
+    queue converts the reject into a first-pullback entry.
+    """
+
+    _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.0}
 
     @staticmethod
     def _now_et():
         import pytz
         et = pytz.timezone("America/New_York")
-        # 10:00 ET = 30 minutes after the open, outside the opening block.
-        return et.localize(datetime(2026, 7, 7, 10, 0, 0))
+        return et.localize(datetime(2026, 7, 10, 10, 0, 0))  # 30 min after open
 
-    _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.0}
-    _BASELINE = (10.2, 10.5, 0.5)   # past, current bar, spread% → +2.94% move
-
-    def test_daily_bar_lag_rescued_by_session_volume(self):
-        # AGIO 2026-07-07: real catalyst, daily-bar RVOL read 0.40 → rejected.
-        # today_volume=5000 → rvol 0.03; session bars say 300k → rvol 1.88.
-        conf, mock_sess = _confirm_with(
-            self._now_et(), self._QUOTE, self._BASELINE,
-            (5_000, 1_000_000, 10_000_000.0, 10.0),
-            (300_000, 10.2, 10.5),
-        )
-        assert conf is not None and conf.is_confirmed, conf and conf.reason
-        assert conf.rvol > 1.5
-        mock_sess.assert_called_once()  # rescue + VWAP share ONE bars pull
-
-    def test_unrolled_daily_bar_rescued(self):
-        conf, mock_sess = _confirm_with(
-            self._now_et(), self._QUOTE, self._BASELINE,
-            (None, 1_000_000, 10_000_000.0, 10.0),   # daily bar not rolled
-            (300_000, 10.2, 10.5),
-        )
-        assert conf is not None and conf.is_confirmed, conf and conf.reason
-        mock_sess.assert_called_once()
-
-    def test_zero_session_volume_rejects_low_volume(self):
-        # GLASF case: no daily bar AND nothing traded per the minute bars.
-        # Old code skipped the RVOL band entirely and approved; now the zero
-        # measurement counts as a measurement and fails the participation gate.
+    def test_extended_above_vwap_rejected(self):
+        # price 10.5 vs vwap 10.0 → +5.0% above, way past the 1.5% ceiling.
         conf, _ = _confirm_with(
-            self._now_et(), self._QUOTE, self._BASELINE,
-            (None, 1_000_000, 10_000_000.0, 10.0),
-            (0, None, None),
+            self._now_et(), self._QUOTE, _mk_sa(vwap=10.0),
         )
         assert conf is not None and not conf.is_confirmed
-        assert conf.reason_code == "low_volume"
+        assert conf.reason_code == "overextended"
 
-    def test_no_volume_and_no_vwap_rejects_insufficient_data(self):
-        # All participation evidence unavailable → refuse to confirm on a
-        # bare quote instead of approving with every gate degraded away.
+    def test_near_vwap_passes(self):
+        # price 10.5 vs vwap 10.45 → +0.48% above — inside the band.
+        conf, _ = _confirm_with(self._now_et(), self._QUOTE, _mk_sa())
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+
+    def test_overextended_is_transient_everywhere(self):
+        # Both re-check mechanisms must treat it as tape-of-this-minute.
+        import main as m
+        import premarket.scanner as sc
+        assert "overextended" in m._TRANSIENT_REJECT_CODES
+        assert "overextended" in sc._TRANSIENT_REJECT_CODES
+
+    def test_no_vwap_means_gate_silent(self):
+        # Without a VWAP there is no value reference — the extension gate
+        # stays out of it (insufficient_data governs the fully-blind case;
+        # here session volume still provides participation evidence).
         conf, _ = _confirm_with(
-            self._now_et(), self._QUOTE, self._BASELINE,
-            (None, 1_000_000, 10_000_000.0, 10.0),
-            (None, None, None),
+            self._now_et(), self._QUOTE, _mk_sa(vwap=None),
         )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+
+    def test_fires_even_with_vwap_confirmation_disabled(self):
+        # v20.1 review finding: the extension ceiling is stop-geometry, not an
+        # accumulation test — turning off REQUIRE_VWAP_CONFIRMATION must not
+        # silently disable the chasing protection with it.
+        import market.price_check as pc
+        with patch.object(pc.cfg, "require_vwap_confirmation", False):
+            conf, _ = _confirm_with(
+                self._now_et(), self._QUOTE, _mk_sa(vwap=10.0),  # +5% above
+            )
         assert conf is not None and not conf.is_confirmed
-        assert conf.reason_code == "insufficient_data"
+        assert conf.reason_code == "overextended"
 
 
 class TestExhaustionGate:
@@ -2061,16 +2526,9 @@ class TestExhaustionGate:
     (last ~5 min) both look clean (2026-07-09 LEVI post-mortem: gapped -7.8%
     at the open, recovered to +2.3% by entry — bought within 15 cents of the
     exact high of the day).
-
-    today_volume=100_000 against avg_daily_volume=1_000_000 at 30 min since
-    open clears MIN_RVOL without needing the rescue path, so these exercise
-    the VWAP block's OWN session-bars fetch (the `else` branch), not the RVOL
-    rescue's.
     """
 
     _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.0}
-    _BASELINE = (10.2, 10.5, 0.5)             # +2.94% recent move
-    _VOLUME_STATS = (100_000, 1_000_000, 10_000_000.0, 10.0)  # rvol ~2.0, no rescue needed
 
     @staticmethod
     def _now_et():
@@ -2081,8 +2539,8 @@ class TestExhaustionGate:
     def test_recovered_bounce_rejected(self):
         # range = (10.52-9.5)/9.5 = 10.7% (>=5%); recovered = (10.5-9.5)/(10.52-9.5) = 98% (>=75%)
         conf, _ = _confirm_with(
-            self._now_et(), self._QUOTE, self._BASELINE, self._VOLUME_STATS,
-            (100_000, 10.0, 10.5, 9.5, 10.52),
+            self._now_et(), self._QUOTE,
+            _mk_sa(session_low=9.5, session_high=10.52),
         )
         assert conf is not None and not conf.is_confirmed
         assert conf.reason_code == "exhausted_bounce"
@@ -2091,35 +2549,32 @@ class TestExhaustionGate:
         # range = (10.6-10.3)/10.3 = 2.9% < 5% floor — not a real round trip,
         # gate doesn't even evaluate recovered fraction.
         conf, _ = _confirm_with(
-            self._now_et(), self._QUOTE, self._BASELINE, self._VOLUME_STATS,
-            (100_000, 10.0, 10.5, 10.3, 10.6),
+            self._now_et(), self._QUOTE,
+            _mk_sa(session_low=10.3, session_high=10.6),
         )
         assert conf is not None and conf.is_confirmed, conf and conf.reason
 
     def test_large_range_but_not_mostly_recovered_passes(self):
         # range = (12.0-9.0)/9.0 = 33% (big); recovered = (10.5-9.0)/(12.0-9.0) = 50% < 75%
         conf, _ = _confirm_with(
-            self._now_et(), self._QUOTE, self._BASELINE, self._VOLUME_STATS,
-            (100_000, 10.0, 10.5, 9.0, 12.0),
+            self._now_et(), self._QUOTE,
+            _mk_sa(session_low=9.0, session_high=12.0, vwap=10.5),
         )
         assert conf is not None and conf.is_confirmed, conf and conf.reason
 
     def test_missing_range_data_does_not_gate(self):
-        # No session_low/session_high available (3-tuple session, padded to
-        # (None, None) by _confirm_with) — the gate has nothing to evaluate
-        # and must not reject for lack of data (that's insufficient_data's job).
-        conf, _ = _confirm_with(
-            self._now_et(), self._QUOTE, self._BASELINE, self._VOLUME_STATS,
-            (100_000, 10.0, 10.5),
-        )
+        # No session_low/session_high available — the gate has nothing to
+        # evaluate and must not reject for lack of data (that's
+        # insufficient_data's job).
+        conf, _ = _confirm_with(self._now_et(), self._QUOTE, _mk_sa())
         assert conf is not None and conf.is_confirmed, conf and conf.reason
 
     def test_toggle_off_disables_gate(self):
         import market.price_check as pc
         with patch.object(pc.cfg, "require_exhaustion_check", False):
             conf, _ = _confirm_with(
-                self._now_et(), self._QUOTE, self._BASELINE, self._VOLUME_STATS,
-                (100_000, 10.0, 10.5, 9.5, 10.52),  # same as the rejected case above
+                self._now_et(), self._QUOTE,
+                _mk_sa(session_low=9.5, session_high=10.52),  # rejected case above
             )
         assert conf is not None and conf.is_confirmed, conf and conf.reason
 
@@ -2239,31 +2694,29 @@ class TestReevalQueue:
         mock_confirm.assert_not_called()
 
 
-class TestSessionVolumeAndVwap:
-    """twelvedata get_session_volume_and_vwap — one pull, volume + VWAP."""
-
-    @patch("market.twelvedata_bars._get_time_series", return_value=None)
-    def test_no_bars_returns_all_none(self, _ts):
-        import market.twelvedata_bars as td
-        assert td.get_session_volume_and_vwap("ACME") == (None, None, None, None, None)
+class TestSessionAnalysisAggregates:
+    """get_session_analysis: today-only volume/low/high aggregation."""
 
     @patch("market.twelvedata_bars._get_time_series")
     def test_sums_only_todays_volume(self, mock_ts):
         import market.twelvedata_bars as td
         import pytz as _pytz
         et = _pytz.timezone("America/New_York")
-        today = datetime.now(et).strftime("%Y-%m-%d")
+        now_et = datetime.now(et)
+        t1 = (now_et - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:00")
+        t2 = (now_et - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:00")
         mock_ts.return_value = [
-            {"datetime": f"{today} 09:32:00", "high": "10.2", "low": "10.0",
+            {"datetime": t1, "high": "10.2", "low": "10.0",
              "close": "10.1", "volume": "3000"},
-            {"datetime": f"{today} 09:31:00", "high": "10.1", "low": "9.9",
+            {"datetime": t2, "high": "10.1", "low": "9.9",
              "close": "10.0", "volume": "2000"},
             {"datetime": "2026-06-29 15:59:00", "high": "9.0", "low": "8.8",
-             "close": "8.9", "volume": "99999"},   # stale bar — excluded
+             "close": "8.9", "volume": "99999"},   # prior session — excluded
         ]
-        vol, vwap, last, low, high = td.get_session_volume_and_vwap("ACME")
-        assert vol == 5000
-        assert vwap is not None and 9.9 < vwap < 10.2
-        assert last == 10.1
-        assert low == 9.9   # min of today's bars' low, stale bar excluded
-        assert high == 10.2  # max of today's bars' high, stale bar excluded
+        sa = td.get_session_analysis("ACME")
+        assert sa is not None
+        assert sa.session_volume == 5000
+        assert sa.vwap is not None and 9.9 < sa.vwap < 10.2
+        assert sa.last_price == 10.1
+        assert sa.session_low == 9.9   # prior-session bar excluded
+        assert sa.session_high == 10.2

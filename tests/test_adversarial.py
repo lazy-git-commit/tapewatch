@@ -139,50 +139,53 @@ class TestTimeSeriesGarbage(_TDBucketReset):
         with patch("market.twelvedata_bars.requests.get", return_value=_resp(json_body=body)):
             assert _get_time_series("ACME", "1min", 10, fast=True) is None
 
-    def test_momentum_baseline_survives_dict_values(self):
-        from market.twelvedata_bars import get_momentum_baseline
+    def test_session_analysis_survives_dict_values(self):
+        from market.twelvedata_bars import get_session_analysis
         body = {"values": "garbage-string"}
         with patch("market.twelvedata_bars.requests.get", return_value=_resp(json_body=body)):
-            assert get_momentum_baseline("ACME", fast=True) == (None, None, None)
+            assert get_session_analysis("ACME", fast=True) is None
 
-    def test_volume_stats_survive_scalar_bars(self):
+    def test_daily_stats_survive_scalar_bars(self):
         import market.twelvedata_bars as td
+        td._daily_stats_cache.clear()
         with patch.object(td, "_get_time_series",
                           return_value=["junk", None, 42]):
-            assert td.get_volume_stats("ACME") == (None, None, None, None)
+            assert td.get_daily_stats("ACME") is None
 
-    def test_momentum_baseline_survives_scalar_bars(self):
+    def test_session_analysis_survives_scalar_bars(self):
         import market.twelvedata_bars as td
-        result = None
+        result = "sentinel"
         with patch.object(td, "_get_time_series",
                           return_value=["junk", None, 42]):
             try:
-                result = td.get_momentum_baseline("ACME", fast=True)
+                result = td.get_session_analysis("ACME", fast=True)
             except Exception as exc:  # noqa: BLE001 — the assertion IS "no raise"
-                pytest.fail(f"get_momentum_baseline raised on scalar bars: {exc!r}")
-        assert result[0] is None  # no usable baseline → fail closed
+                pytest.fail(f"get_session_analysis raised on scalar bars: {exc!r}")
+        assert result is None  # no usable bars → fail closed
 
     def test_session_bars_skip_malformed_rows(self):
         import market.twelvedata_bars as td
         import pytz
         et = pytz.timezone("America/New_York")
-        from datetime import datetime
-        today = datetime.now(et).strftime("%Y-%m-%d")
+        from datetime import datetime, timedelta
+        now_et = datetime.now(et)
+        fresh = (now_et - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:00")
+        older = (now_et - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:00")
         bars = [
-            {"datetime": f"{today} 09:32:00", "high": "10.2", "low": "10.0",
+            {"datetime": fresh, "high": "10.2", "low": "10.0",
              "close": "10.1", "volume": "3000"},
-            {"datetime": f"{today} 09:31:00", "high": "oops", "low": "9.9",
+            {"datetime": older, "high": "oops", "low": "9.9",
              "close": "10.0", "volume": "2000"},        # bad high → skipped
-            {"datetime": f"{today} 09:30:00", "high": "10.0", "low": "9.8",
-             "close": "9.9", "volume": None},            # null volume → skipped
             {"datetime": "not-a-date", "high": "1", "low": "1",
              "close": "1", "volume": "1"},               # bad date → skipped
             "not-even-a-dict-would-be-nice",             # raises per-bar → skipped
         ]
         with patch.object(td, "_get_time_series", return_value=bars):
-            vol, vwap, last, low, high = td.get_session_volume_and_vwap("ACME")
-        assert vol == 3000 and last == 10.1 and vwap is not None
-        assert low == 10.0 and high == 10.2  # only the one clean bar counts
+            sa = td.get_session_analysis("ACME")
+        assert sa is not None
+        assert sa.session_volume == 3000 and sa.last_price == 10.1
+        assert sa.vwap is not None
+        assert sa.session_low == 10.0 and sa.session_high == 10.2  # clean bar only
 
 
 # ── Price confirmation end-to-end with hostile inputs ─────────────────────────
@@ -194,10 +197,8 @@ class TestConfirmSignalGarbage:
     def _confirm(self, quote):
         import market.price_check as pc
         with patch.object(pc, "get_quote_with_fallback", return_value=quote), \
-             patch.object(pc, "get_momentum_baseline", return_value=(None, None, None)), \
-             patch.object(pc, "get_volume_stats", return_value=(None, None, None, None)), \
-             patch.object(pc, "get_session_volume_and_vwap",
-                           return_value=(None, None, None, None, None)):
+             patch.object(pc, "get_session_analysis", return_value=None), \
+             patch.object(pc, "get_daily_stats", return_value=None):
             return pc.confirm_price_signal("ACME_US_EQ")
 
     def test_minimal_quote_no_bars_fails_closed(self):

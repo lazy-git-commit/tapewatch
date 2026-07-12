@@ -521,34 +521,48 @@ def cancel_order(order_id: str) -> bool:
         return False
 
 
-def place_take_profit(ticker: str, quantity: float, tp_price: float) -> str | None:
+def place_stop_loss(ticker: str, quantity: float, stop_price: float) -> str | None:
     """
-    Place a resting LIMIT sell at the take-profit price, immediately after a
-    buy fills. This removes ALL polling latency from the profit side: the
-    exchange executes the moment the price touches TP, instead of waiting up
-    to monitor_interval_seconds and then crossing the spread with a market
-    order (the old way realized +3.1% on a +5% target).
+    Place a resting STOP (stop-market) sell at the broker, immediately after
+    a buy fills.
+
+    v20 exit inversion — WHY THE STOP RESTS AND THE TP IS POLLED:
+    T212 has no OCO, and every sell order reserves the shares it covers, so
+    only ONE closing order can rest at a time. v14-v19 rested the TAKE-PROFIT
+    limit and polled the stop every 20s. The realized record proves that was
+    backwards: 1 resting-TP fill in 11 trades, versus repeated stop-side
+    slippage where the 20s poll + limit-retry ladder turned a −2% trigger
+    into −3.4% (VECO), −3.97% (CRCL: price fell ~1%/min; the poll alone gave
+    it a 20s head start) and −18.99% (GOAI). A missed TP costs opportunity;
+    a slow stop costs capital on EVERY fast reversal. The stop now executes
+    broker-side with zero polling latency; the monitor polls the TP instead
+    (at the 5s monitor cadence), cancelling the stop before selling.
+
+    Stop-market, not stop-limit, on purpose: when the stop triggers, the book
+    is moving against us — execution certainty is the point of the order.
+    The ADV liquidity floor (min_daily_dollar_volume) bounds the expected
+    slippage; GOAI-class fills came from names that gate now rejects.
 
     Returns the order id, or None if placement failed — the monitor then
-    falls back to polled TP checking for this position, so a failed placement
-    degrades gracefully rather than leaving the position unmanaged.
+    falls back to polled stop checking for this position, so a failed
+    placement degrades gracefully rather than leaving the position unmanaged.
     """
     try:
-        order = _post("/equity/orders/limit", {
+        order = _post("/equity/orders/stop", {
             "quantity": -quantity,           # negative = sell
             "ticker": ticker,
-            "limitPrice": _round_price(tp_price),
+            "stopPrice": _round_price(stop_price),
             "timeValidity": "DAY",           # EOD flatten covers the close anyway
         })
         order_id = str(order.get("id", "")) or None
         logger.info(
-            "Resting TP placed: %s × %.4f @ $%.4f | order_id=%s",
-            ticker, quantity, tp_price, order_id,
+            "Resting STOP placed: %s × %.4f @ $%.4f | order_id=%s",
+            ticker, quantity, stop_price, order_id,
         )
         return order_id
     except Exception as exc:
         logger.warning(
-            "Could not place resting TP for %s (monitor will poll TP instead): %s",
+            "Could not place resting stop for %s (monitor will poll the stop instead): %s",
             ticker, exc,
         )
         return None

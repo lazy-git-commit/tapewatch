@@ -51,8 +51,23 @@ cheapest checks first so we fail fast and spend fewer API credits):
                        holds above VWAP when institutions buy; a fading
                        gap-up sits below VWAP regardless of % change. This is
                        the v15 fix for the fixed-% momentum floor rejecting
-                       every real large-cap catalyst. Runs LAST — it spends an
-                       extra Twelvedata credit, so all cheaper gates go first.
+                       every real large-cap catalyst.
+ 10.2 overextended   — but NOT more than cfg.max_vwap_extension_pct ABOVE
+                       VWAP either: with the stop cfg.stop_loss_pct below
+                       entry, an entry further above value than the stop is
+                       wide means a routine reversion-to-VWAP stops it out by
+                       construction (LEVI +1.9% / CRCL +2.2% above VWAP with
+                       a 2% stop — both dead on arrival, 2026-07-09/10).
+                       TRANSIENT: the re-eval queue re-checks, so this
+                       converts "chase the vertical move now" into "enter on
+                       the first pullback into value".
+ 10.5 exhausted_bounce — price must not have already recovered most of a
+                       large intraday round trip (v19.5, LEVI).
+
+Data plan (v20): ONE Twelvedata 1-min session pull feeds momentum, spread,
+RVOL, VWAP, extension and exhaustion; the daily series (ADV/prev close) is
+fetched once per symbol per day and cached. Steps 1-2 run before any bar
+call; a typical re-evaluation costs 1 credit.
 """
 
 import logging
@@ -66,8 +81,7 @@ import pytz
 from config.settings import cfg
 from market.finnhub_bars import get_finnhub_quote
 from market.twelvedata_bars import (
-    get_momentum_baseline, get_volume_stats, get_twelvedata_quote,
-    get_session_volume_and_vwap,
+    get_twelvedata_quote, get_session_analysis, get_daily_stats,
 )
 from trading.executor import t212_to_symbol
 
@@ -364,8 +378,8 @@ class PriceConfirmation:
     reason: str
     # approved | opening_block | penny_stock | wide_spread | dead_cat |
     # extended_move | illiquid | low_momentum | high_momentum |
-    # low_volume | high_volume | below_vwap | exhausted_bounce |
-    # insufficient_data | no_price_data
+    # low_volume | high_volume | below_vwap | overextended |
+    # exhausted_bounce | insufficient_data | no_price_data
     reason_code: str
     vwap: float | None = None       # session VWAP at confirmation (v15)
 
@@ -465,23 +479,30 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
                 f"< ${cfg.min_stock_price:.2f} minimum — spread/halt/manipulation risk",
             )
 
-        # ── Momentum baseline + spread proxy (Twelvedata 1-min bars) ─────────
-        past_price, current_bar_price, spread_proxy_pct = get_momentum_baseline(symbol, fast=fast)
+        # ── Session analysis (ONE Twelvedata 1-min pull — v20) ───────────────
+        # Momentum baseline, spread proxy, session volume, VWAP and session
+        # low/high all come from the same 390-bar series. The old plan fetched
+        # them across three sequential calls (2-3 credits + round trips per
+        # confirmation, re-paid on every re-eval retry).
+        sa = get_session_analysis(symbol, fast=fast)
+
+        past_price = sa.past_price if sa else None
+        spread_proxy_pct = sa.spread_proxy_pct if sa else None
         base["spread_proxy_pct"] = spread_proxy_pct
 
         if past_price is None:
-            # Early-session fallback: Twelvedata may not have enough bars in
-            # the first ~15 min; the official open price is a fair baseline.
+            # Early-session fallback: not enough today-bars for a momentum
+            # window in the first ~15 min; the official open is a fair baseline.
             if minutes_since_open < 15 and open_price and open_price > 0:
                 past_price = open_price
                 logger.info(
-                    "Price check [%s]: Twelvedata unavailable — using Finnhub open=%.4f as baseline",
+                    "Price check [%s]: no momentum window yet — using open=%.4f as baseline",
                     symbol, open_price,
                 )
             else:
                 logger.warning(
-                    "Price check [%s]: Twelvedata momentum baseline unavailable and "
-                    "not in open window — cannot evaluate",
+                    "Price check [%s]: momentum baseline unavailable and not in "
+                    "open window — cannot evaluate",
                     symbol,
                 )
                 return None
@@ -499,8 +520,20 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
                 f"{cfg.max_spread_pct}% — effective spread would eat the edge",
             )
 
-        # ── Volume stats + prev close (Twelvedata 1-day bars) ────────────────
-        today_volume, avg_daily_volume, avg_dollar_volume, td_prev_close = get_volume_stats(symbol, fast=fast)
+        # ── Daily stats: ADV + prev close (cached per symbol per day) ────────
+        daily = get_daily_stats(symbol, fast=fast)
+
+        # FAIL-CLOSED if ADV data is missing entirely: without avg_dollar_volume
+        # we cannot run the liquidity gate, and without avg_daily_volume we
+        # cannot run RVOL — both are non-negotiable risk controls.
+        if daily is None:
+            logger.warning(
+                "Price check [%s]: volume/liquidity data unavailable — cannot run "
+                "liquidity or RVOL gates; deferring (will retry)",
+                symbol,
+            )
+            return None
+        avg_daily_volume, avg_dollar_volume, td_prev_close = daily
 
         # Prefer Finnhub's prev close (real-time source); Twelvedata's daily
         # bar is the backup when the quote lacks `pc`.
@@ -511,33 +544,20 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         )
         base["day_change_pct"] = day_change_pct
 
-        # FAIL-CLOSED if ADV data is missing entirely: without avg_dollar_volume
-        # we cannot run the liquidity gate, and without avg_daily_volume we
-        # cannot run RVOL — both are non-negotiable risk controls.
-        # today_volume may be None when Twelvedata's daily bar hasn't rolled yet
-        # at the open (first ~5 min). That is a TRANSIENT condition: prev_close
-        # and avg_daily_volume come from prior completed bars and are still
-        # valid. We defer RVOL and today_volume-based gates until the bar rolls,
-        # but allow the remaining gates (dead_cat, extended_move, illiquid,
-        # momentum, VWAP) to proceed with the data we do have.
-        if avg_daily_volume is None or avg_dollar_volume is None:
+        # RVOL numerator = today's session volume from the minute bars — the
+        # CURRENT source (the daily bar's volume field trails the session by
+        # minutes; its lag forced the v19.2 "rescue" second fetch, now gone).
+        session_volume = sa.session_volume if sa else None
+        if session_volume is None:
             logger.warning(
-                "Price check [%s]: volume/liquidity data unavailable — cannot run "
-                "liquidity or RVOL gates; deferring (will retry)",
-                symbol,
-            )
-            return None
-
-        if today_volume is None:
-            logger.warning(
-                "Price check [%s]: today's volume bar not yet available — "
-                "RVOL gate deferred; continuing with dead_cat/extended_move/liquidity checks",
+                "Price check [%s]: session volume unavailable — RVOL gate "
+                "deferred; continuing with dead_cat/extended_move/liquidity checks",
                 symbol,
             )
             current_volume = 0
             rvol = 0.0
         else:
-            current_volume = today_volume
+            current_volume = session_volume
             rvol = compute_rvol(current_volume, avg_daily_volume or 0, minutes_since_open)
 
         base.update(
@@ -603,9 +623,8 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             return _reject(base, "low_momentum", detail)
 
         # ── 8. Momentum ceiling ──────────────────────────────────────────────
-        # Runs BEFORE the VWAP call so a post-halt spike (which is also far
-        # ABOVE VWAP and would pass step 9) is rejected without spending the
-        # extra Twelvedata credit that get_session_vwap costs.
+        # A post-halt spike is also far ABOVE VWAP, but it would pass the
+        # below_vwap floor — this ceiling names the pattern explicitly.
         if recent_move_pct > cfg.max_price_move_pct:
             return _reject(
                 base, "high_momentum",
@@ -615,90 +634,41 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             )
 
         # ── 9. RVOL band ─────────────────────────────────────────────────────
-        # today_volume comes from Twelvedata's DAILY bar, whose volume field
-        # trails the live session by several minutes — worst at the open, which
-        # is exactly when the gap-and-go eval runs (observed 2026-07-07: ZTS
-        # read RVOL 0.07 and AGIO 0.40 minutes after gapping up on real
-        # catalysts; both were false rejections). When the daily bar is missing
-        # or reads below the floor, RESCUE with today's minute bars (1 extra
-        # credit, only spent when the gate would otherwise fail): their volume
-        # is current. max() of the two sources — the rescue can only add
-        # measured participation, never hide it, so the max_rvol halt-pattern
-        # ceiling keeps its protective bite.
-        session_volume: int | None = None
-        session_vwap: float | None = None
-        session_last: float | None = None
-        session_low: float | None = None
-        session_high: float | None = None
-        session_bars_fetched = False
-
-        if avg_daily_volume and avg_daily_volume > 0:
-            if today_volume is None or rvol < cfg.min_rvol:
-                session_volume, session_vwap, session_last, session_low, session_high = (
-                    get_session_volume_and_vwap(symbol, fast=fast)
+        # Enforced whenever a volume measurement exists. (The old "skip when
+        # volume is unmeasured" bypass meant the tickers with the WORST data
+        # got a free pass on the participation gate — GLASF traded on RVOL 0.0
+        # while liquid names were being rejected.)
+        volume_measured = session_volume is not None
+        if avg_daily_volume and avg_daily_volume > 0 and volume_measured:
+            if rvol < cfg.min_rvol:
+                return _reject(
+                    base, "low_volume",
+                    f"RVOL {rvol:.2f} below {cfg.min_rvol} — price move lacks real "
+                    f"participation (time-normalized vs 20-day avg)",
                 )
-                session_bars_fetched = True
-                if session_volume is not None and session_volume > (today_volume or 0):
-                    rescued = compute_rvol(
-                        session_volume, avg_daily_volume, minutes_since_open
-                    )
-                    if rescued > rvol:
-                        logger.info(
-                            "Price check [%s]: RVOL rescued from session minute bars "
-                            "— daily-bar volume %s → session volume %d (RVOL %.2f → %.2f)",
-                            symbol, today_volume, session_volume, rvol, rescued,
-                        )
-                        rvol = rescued
-                        current_volume = session_volume
-                        base.update(current_volume=session_volume, rvol=rvol)
-
-            # Enforce the band whenever ANY volume measurement exists. (The old
-            # "skip when the daily bar hasn't rolled" bypass meant the tickers
-            # with the WORST data got a free pass on the participation gate —
-            # GLASF traded on RVOL 0.0 while liquid names were being rejected.)
-            volume_measured = today_volume is not None or session_volume is not None
-            if volume_measured:
-                if rvol < cfg.min_rvol:
-                    return _reject(
-                        base, "low_volume",
-                        f"RVOL {rvol:.2f} below {cfg.min_rvol} — price move lacks real "
-                        f"participation (time-normalized vs 20-day avg)",
-                    )
-                if rvol > cfg.max_rvol:
-                    return _reject(
-                        base, "high_volume",
-                        f"RVOL {rvol:.1f} above {cfg.max_rvol} — parabolic volume is the "
-                        f"halt-pattern signature, not a tradeable catalyst",
-                    )
+            if rvol > cfg.max_rvol:
+                return _reject(
+                    base, "high_volume",
+                    f"RVOL {rvol:.1f} above {cfg.max_rvol} — parabolic volume is the "
+                    f"halt-pattern signature, not a tradeable catalyst",
+                )
 
         # ── 10. VWAP confirmation (size-neutral accumulation test) ───────────
-        # LAST gate, because get_session_vwap() spends an extra Twelvedata
-        # credit (a full-session bar pull) — every cheaper gate runs first so
-        # this is only reached by signals that have already passed everything
-        # else. Price held at/above session VWAP = institutions are net buyers,
+        # Price held at/above session VWAP = institutions are net buyers,
         # independent of the raw % change. This is what lets a deep-book
         # large-cap catalyst through (it sits above VWAP even at +0.2%) while
         # rejecting a fading gap-up (below VWAP regardless of % change).
         # Research basis: PEAD literature + VWAP-reclaim practitioner playbooks
-        # (citations in docs/algorithm.md).
+        # (citations in docs/algorithm.md). The VWAP comes from the same
+        # session-analysis pull as everything else (v20) — no extra credit.
         vwap_passed = False
+        vwap = sa.vwap if sa else None
+        session_low = sa.session_low if sa else None
+        session_high = sa.session_high if sa else None
+        if vwap is not None and vwap > 0:
+            base["vwap"] = vwap
         if cfg.require_vwap_confirmation:
-            # fast= keeps the pre-market eval window inside its wall-clock budget:
-            # a fast miss returns (None, None), which falls through to the
-            # "confirm on momentum + RVOL only" branch below — the same graceful
-            # degradation as a genuine VWAP data gap. This also makes VWAP the
-            # cheapest credit to lose under budget pressure (it's the 4th/last
-            # TD call), without weakening confirmation when data IS available.
-            # If the RVOL rescue already pulled today's minute bars, reuse them
-            # (same series → same VWAP) instead of spending a second credit.
-            if session_bars_fetched:
-                vwap, vwap_last = session_vwap, session_last
-            else:
-                _sv, vwap, vwap_last, session_low, session_high = (
-                    get_session_volume_and_vwap(symbol, fast=fast)
-                )
             if vwap is not None and vwap > 0:
-                base["vwap"] = vwap
                 # Accept at/above VWAP minus a small tolerance (handles a fresh
                 # reclaim on the current bar).
                 vwap_floor = vwap * (1 - cfg.vwap_tolerance_pct / 100)
@@ -718,6 +688,35 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
                     symbol,
                 )
 
+        # ── 10.2. VWAP extension ceiling — never park the stop beyond value ──
+        # The stop-loss sits cfg.stop_loss_pct below entry. If entry is MORE
+        # than that above VWAP, a routine mean-reversion to VWAP — the base
+        # case for any extended stock, even in a healthy uptrend — hits the
+        # stop before any continuation can play out: the trade is structurally
+        # dead on arrival. Both 2026-07 losses had exactly this geometry
+        # (LEVI entered +1.9% above VWAP, CRCL +2.2%, stop 2% — VWAP itself
+        # sat at/below the stop). Professional playbooks phrase it as "don't
+        # chase — buy the first pullback into value"; mechanically that is
+        # this gate + the re-eval queue: an overextended reject is TRANSIENT,
+        # so the signal re-checks every cycle and enters IF AND WHEN price
+        # pulls back toward VWAP with the catalyst still confirmed.
+        # cfg.max_vwap_extension_pct defaults to 1.5 (= stop 2.0 minus margin).
+        # Deliberately INDEPENDENT of require_vwap_confirmation: the geometry
+        # argument holds whenever a VWAP exists, and disabling the
+        # accumulation test must not silently disable the chasing protection.
+        if (
+            vwap is not None and vwap > 0
+            and current_price > vwap * (1 + cfg.max_vwap_extension_pct / 100)
+        ):
+            ext_pct = (current_price - vwap) / vwap * 100
+            return _reject(
+                base, "overextended",
+                f"Price ${current_price:.4f} is {ext_pct:+.2f}% above VWAP "
+                f"${vwap:.4f} (max {cfg.max_vwap_extension_pct}%) — a routine "
+                f"reversion to value would hit the {cfg.stop_loss_pct}% stop; "
+                f"waiting for the first pullback instead of chasing",
+            )
+
         # ── 10.5. Intraday exhaustion (chasing an already-completed round trip) ─
         # day_change_pct only sees distance from YESTERDAY's close;
         # recent_move_pct only sees the last ~5 minutes. Neither can see the
@@ -726,11 +725,11 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         # all the way back to +2.3% by the time this gate would have run —
         # within 15 cents of the exact high of the day, three minutes before
         # the actual peak. Every other gate read clean; the trade faded for
-        # the rest of the session. Requires session_low/session_high from the
-        # same bar pull already spent on RVOL rescue / VWAP above — no extra
-        # credit. Both conditions must hold: the day's range must be large
-        # enough to be a real round trip (not noise), and price must already
-        # sit deep inside the recovered portion of it.
+        # the rest of the session. session_low/session_high come from the same
+        # session-analysis pull as everything else — no extra credit. Both
+        # conditions must hold: the day's range must be large enough to be a
+        # real round trip (not noise), and price must already sit deep inside
+        # the recovered portion of it.
         if (
             cfg.require_exhaustion_check
             and session_low is not None and session_high is not None
@@ -749,15 +748,14 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
                     )
 
         # ── Degraded-data floor: at least ONE participation gate must PASS ───
-        # Each fallback above is individually reasonable (daily bar not rolled →
-        # defer RVOL; no minute bars → skip VWAP; thin early tape → open-price
-        # momentum baseline). Their CONJUNCTION is not: with RVOL unmeasurable
-        # AND VWAP unavailable, "confirmation" has degraded to a single possibly
-        # stale quote. That is exactly how GLASF traded on 2026-07-07 — the one
+        # Each fallback above is individually reasonable (no session volume →
+        # defer RVOL; no VWAP → skip it; thin early tape → open-price momentum
+        # baseline). Their CONJUNCTION is not: with RVOL unmeasurable AND VWAP
+        # unavailable, "confirmation" has degraded to a single possibly stale
+        # quote. That is exactly how GLASF traded on 2026-07-07 — the one
         # candidate with the worst data was the only one that passed, because
         # bad data disabled the gates that would have stopped it. Require
         # positive evidence of participation from at least one source.
-        volume_measured = today_volume is not None or session_volume is not None
         if not volume_measured and not vwap_passed:
             return _reject(
                 base, "insufficient_data",
@@ -790,28 +788,45 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         return None
 
 
+# The bars-based price fallback pulls a full 390-bar session series (1 credit).
+# The monitor calls get_current_price every 5s per open position, so during a
+# quote outage an unthrottled fallback would fire ~12×/min/position — enough
+# to saturate the 55/min Twelvedata token bucket and starve signal
+# confirmation. Throttled per symbol: between attempts the monitor gets None,
+# which it already handles safely (time-stop unaffected; the resting stop
+# keeps protecting the downside broker-side throughout).
+_BARS_FALLBACK_EVERY_SECONDS = 30.0
+_last_bars_fallback: dict[str, float] = {}
+
+
 def get_current_price(t212_ticker: str) -> float | None:
     """
     Fast lookup of the latest price for the open-position monitor.
-    Primary: Finnhub REST quote (real-time, retried).
-    Fallback: most recent Twelvedata 1-min bar close.
-    Returns None if both are unavailable — callers must handle this explicitly.
+    Primary: Finnhub REST quote; fallback Twelvedata /quote — both in fast
+    (single-attempt) mode: at the monitor's 5s cadence the NEXT CYCLE is the
+    retry, and in-call backoff sleeps would overrun the cycle interval.
+    Last resort: most recent Twelvedata 1-min bar close, throttled to one
+    attempt per _BARS_FALLBACK_EVERY_SECONDS per symbol (see above).
+    Returns None if all are unavailable — callers must handle this explicitly.
     """
     symbol = _to_yf_ticker(t212_ticker)
-    quote = get_quote_with_fallback(symbol)
+    quote = get_quote_with_fallback(symbol, fast=True)
     if quote is not None:
         price = float(quote["c"])
         logger.debug("get_current_price [%s]: %.4f", symbol, price)
         return price
-    # Twelvedata fallback: use most recent 1-min bar close
+    now = time.monotonic()
+    if now - _last_bars_fallback.get(symbol, 0.0) < _BARS_FALLBACK_EVERY_SECONDS:
+        return None
+    _last_bars_fallback[symbol] = now
     try:
-        _past, current_bar_price, _spread = get_momentum_baseline(symbol)
-        if current_bar_price is not None:
+        sa = get_session_analysis(symbol, fast=True)
+        if sa is not None and sa.last_price is not None:
             logger.warning(
-                "get_current_price [%s]: Finnhub unavailable — using Twelvedata bar close %.4f",
-                symbol, current_bar_price,
+                "get_current_price [%s]: quotes unavailable — using Twelvedata bar close %.4f",
+                symbol, sa.last_price,
             )
-            return current_bar_price
+            return sa.last_price
     except Exception as exc:
         logger.error("get_current_price [%s]: Twelvedata fallback also failed: %s", symbol, exc)
     logger.error(

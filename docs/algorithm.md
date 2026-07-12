@@ -103,6 +103,7 @@ trades, forward returns on all classified articles, and costed replay.
 | Scored-once | `_scored_articles` session set (v18) | With the 3-min freshness window an article appears in ~3 consecutive fetches; this guarantees exactly one Claude scoring per article per session (failed batches stay eligible for retry) |
 | Roundup | >3 tickers tagged → skip | Market digests have no per-stock catalyst (v11) |
 | Analyst action | headline matches `_ANALYST_ACTION_RE` → skip | `analyst_action` is never in `TRADEABLE_CATALYSTS`. A regex on the raw headline is far cheaper than a Claude call. Catches "reiterates buy", "price target", "upgrades to overweight", "initiates coverage" etc. Added v17.4. |
+| Digest/preview | headline matches `_DIGEST_RE` → skip | v20. Compilations ("Market-Moving News for July 10th", "Stocks To Watch", "Premarket Movers", "Earnings Scheduled For…", listicles) are written ABOUT the market with tickers tagged incidentally. One slid under the >3-ticker roundup filter with exactly 3 tickers on 2026-07-10 and was classified "earnings_beat, 80% conf" for THREE unrelated companies at once — the fabricated catalyst that bought the top of CRCL's 13% parabolic spike (−3.97%). Deterministic title check; no digest reaches Claude. The prompt also gained a "digests are never catalysts" rule as defense in depth (a digest classified fda_approval would still pass the catalyst gate — the regex is the reliable layer). |
 
 ### 3.2 Claude classification
 
@@ -153,10 +154,31 @@ A positive classification only becomes a tradeable signal if **all** pass:
 
 1. **Confidence** ≥ `MIN_SENTIMENT_CONFIDENCE` (default 7/10). This setting
    existed since v1 but was never enforced until v14.
-2. **Catalyst class** in `TRADEABLE_CATALYSTS` (default: earnings_beat,
-   guidance_raise, fda_approval, ma_target, contract_win, product_launch,
-   short_squeeze). Halt/recap/analyst/acquirer/offering classes are recorded
-   but never traded — they are the classes that don't survive our latency.
+2. **Catalyst class** in `TRADEABLE_CATALYSTS` — v20 default:
+   **fda_approval, guidance_raise** only. Pruned 2026-07-10 using the
+   system's own eval loop: forward returns of every positive,
+   not-already-moved, confidence≥0.7 signal over 60 days (avg @5/15/60 min):
+
+   | class          | n   | 5m     | 15m    | 60m    | verdict |
+   |----------------|-----|--------|--------|--------|---------|
+   | fda_approval   | 86  | −0.02  | +0.55  | +1.42  | keep    |
+   | guidance_raise | 9   | +0.38  | +1.15  | +2.97  | keep    |
+   | contract_win   | 152 | −0.42  | −0.84  | −1.34  | removed |
+   | ma_target      | 71  | −0.08  | −0.07  | −0.37  | removed |
+   | earnings_beat  | 33  | −0.74  | −1.13  | −1.60  | removed |
+   | product_launch | 32  | −0.93  | −1.13  | −2.05  | removed |
+   | short_squeeze  | 0   | —      | —      | —      | removed |
+
+   The kept classes are binary regulatory/guidance surprises whose drift
+   BUILDS over 15–60 min — the shape a 1–3 min entry latency captures.
+   Earnings news at this latency gets sold (both July losses were
+   earnings_beat); M&A targets pin to the deal price instantly, leaving
+   nothing to capture. Catalyst magnitude was tested as an alternative
+   filter and does NOT predict returns (magnitude 3/4/5 all averaged
+   negative; magnitude 2 slightly positive) — the magnitude floor stays at
+   2 and was deliberately NOT raised. Every class is still scored and
+   persisted, so a class can be re-enabled the moment fresh forward-return
+   evidence supports it — and only then.
 3. **`already_moved` is false** — the model's own judgement that the move
    pre-dates the article.
 
@@ -164,10 +186,19 @@ A positive classification only becomes a tradeable signal if **all** pass:
 
 ## 4. Stage 2 — Price confirmation (`market/price_check.py`)
 
-Data sources: **quote with fallback** — Finnhub `/quote` (current price, open,
-**previous close**), falling back to Twelvedata `/quote` when Finnhub has no
-coverage; Twelvedata 1-min bars (momentum baseline by timestamp, spread proxy);
-Twelvedata daily bars (20-day ADV, prev-close backup); Twelvedata session VWAP.
+Data sources (v20 consolidation): **quote with fallback** — Finnhub `/quote`
+(current price, open, **previous close**), falling back to Twelvedata
+`/quote` when Finnhub has no coverage — plus **ONE Twelvedata 1-min session
+pull** (`get_session_analysis`: momentum baseline by timestamp, spread proxy,
+session volume, VWAP, session low/high) and **daily stats cached per symbol
+per ET day** (`get_daily_stats`: 20-day ADV, dollar-ADV, prev-close backup —
+immutable intraday, so re-fetching them per retry was pure waste). The old
+plan made three sequential bar calls per confirmation (2–3 credits, re-paid
+by every re-eval retry); a typical confirmation now costs 1 credit and ~2
+HTTP round trips. Consolidating also fixed a long-standing subtle bug: right
+after the open, the momentum baseline ("newest bar ≥5 min old") could match
+YESTERDAY's 15:59 bar, silently treating the overnight gap as 5-minute
+momentum — baseline selection is now restricted to today's session.
 
 **Symbol hygiene (v15):** Benzinga tags carry routing cruft that breaks every
 downstream consumer. `clean_benzinga_symbol()` (in `trading/executor.py`) drops
@@ -236,18 +267,21 @@ Checks run cheapest-first; each rejection records a `reason_code`:
 | 6 | `illiquid` | 20-day ADV × price < **$5M** | **ADV-based on purpose**: spike-day volume explodes and would pass exactly the halt patterns this blocks. Exit slippage depends on the NORMAL book (GOAI: $390k ADV → −18.99% stop fill) |
 | 7 | `low_momentum` | < +0.2% over ~5 min (v15: dead-tape noise floor only) | Just rejects "the catalyst moved nothing"; VWAP does the real work (step 10). Moves below −0.2% log as "tape moving against the signal" (same code) |
 | 8 | `high_momentum` | > +15% over ~5 min | Post-halt spike — halt articles publish AFTER the 30–120% pop. Runs before VWAP to save a credit |
-| 9 | `low_volume` / `high_volume` | RVOL outside [1.5, 20] | See RVOL section (v19.2: daily-bar lag rescued with session minute bars; the "skip when the daily bar hasn't rolled" bypass is gone) |
+| 9 | `low_volume` / `high_volume` | RVOL outside [1.5, 20] | See RVOL section (v20: session minute-bar volume is THE numerator — current, unlike the lagging daily bar the v19.2 "rescue" had to work around) |
 | 10 | `below_vwap` | price < session VWAP (− small tol) | v15: size-neutral accumulation test — see below |
+| 10.2 | `overextended` | price > VWAP × (1 + **1.5%**) | v20: never park the stop on the far side of value. With a 2% stop, an entry >1.5% above VWAP is stopped out by a ROUTINE reversion to value — LEVI entered +1.9% above VWAP, CRCL +2.2%; both dead on arrival. Transient → re-eval queue = first-pullback entry |
 | 10.5 | `exhausted_bounce` | day's range ≥ **5%** AND price recovered ≥ **75%** of it | v19.5: LEVI bought within 15¢ of the day's exact high, 3 min before the peak, after gapping down −7.8% at the open — see below |
-| 11 | `insufficient_data` | no volume measurement AND no VWAP | v19.2: three individually-reasonable fallbacks (open-price baseline, RVOL deferred, VWAP skipped) could stack into approving on a bare stale quote — how GLASF traded. At least one participation measure must positively exist |
+| 11 | `insufficient_data` | no volume measurement AND no VWAP | v19.2: individually-reasonable fallbacks (open-price baseline, RVOL deferred, VWAP skipped) could stack into approving on a bare stale quote — how GLASF traded. At least one participation measure must positively exist |
 
-**Transient vs terminal (v19.2):** `low_volume` and `low_momentum` describe
-the tape AT THIS MINUTE, not the instrument — signals are scored within ~3 min
-of publication, often before participation can exist (VERA's FDA approval was
-rejected on RVOL 0.71 measured the minute the news broke). RTH signals
-rejected with these two codes park in a re-eval queue and re-confirm every
-cycle for 15 minutes; premarket candidates stay pending until the eval window
-closes. Everything else is terminal on first sight.
+**Transient vs terminal (v19.2, extended v20):** `low_volume`, `low_momentum`
+and `overextended` describe the tape AT THIS MINUTE, not the instrument —
+signals are scored within ~3 min of publication, often before participation
+can exist (VERA's FDA approval was rejected on RVOL 0.71 measured the minute
+the news broke), and an extended price pulls back into buyable range within
+minutes on genuine movers. RTH signals rejected with these codes park in a
+re-eval queue and re-confirm every cycle for 15 minutes; premarket candidates
+stay pending until the eval window closes. Everything else is terminal on
+first sight.
 
 ### Momentum confirmation: why VWAP, not a fixed % (v15)
 
@@ -288,6 +322,27 @@ pull); every cheaper gate filters first.
 - Sources: [PEAD (Wikipedia)](https://en.wikipedia.org/wiki/Post%E2%80%93earnings-announcement_drift),
   [VWAP momentum strategy playbook](https://www.snappchart.app/blog/strategy-playbooks/vwap-momentum-trading-strategy),
   [volume confirmation for entries](https://www.quantvps.com/blog/using-volume-analysis-to-confirm-trade-entries-and-exits).
+
+### VWAP extension ceiling — don't chase; buy the first pullback (v20)
+
+`below_vwap` polices one side of value; `overextended` (gate 10.2) polices
+the other. The geometry is mechanical: the stop sits `STOP_LOSS_PCT` (2%)
+below entry. If entry is MORE than that above VWAP, then VWAP itself — the
+level extended stocks routinely revisit even in healthy uptrends — lies
+below the stop, and an ordinary reversion to value ends the trade at a loss
+by construction. Both 2026-07 losses had exactly this shape: LEVI entered
++1.9% above VWAP, CRCL +2.2%, both with the 2% stop, both stopped/timed out
+on nothing more than reversion.
+
+`MAX_VWAP_EXTENSION_PCT` (1.5) is therefore DERIVED (stop minus margin), not
+a tuned magic number, and validation enforces it stays below the stop. The
+reject is **transient**: the re-eval queue re-confirms every cycle for 15
+minutes, so a genuine mover that pulls back toward VWAP with its catalyst
+intact gets entered ON the pullback — the professional "first pullback into
+value" entry, implemented with machinery that already existed. The gate
+evaluates whenever a VWAP exists, **independent of
+`REQUIRE_VWAP_CONFIRMATION`** (v20.1): it is stop geometry, not an
+accumulation test, and turning off the latter must not silently disable it.
 
 ### Intraday exhaustion — has the stock already had its move today? (v19.5)
 
@@ -362,18 +417,19 @@ there's no contradicting evidence. First-pass empirical fit from one day's
 data — revisit as more days of measured `today_volume`/`avg_daily_volume`
 accumulate.
 
-**Daily-bar lag rescue (v19.2):** `today_volume` comes from Twelvedata's daily
-bar, whose volume field trails the live session by several minutes — worst at
-the open, exactly when the gap-and-go eval runs. On 2026-07-07 ZTS read RVOL
-0.07 and AGIO 0.40 minutes after gapping up on real catalysts (AGIO: +11.1%
-gap, FDA catalyst, $44M ADV — a false rejection). When the daily bar is
-missing or reads below `MIN_RVOL`, the gate pulls today's 1-min bars
-(`get_session_volume_and_vwap`, 1 credit, only spent when the gate would
-otherwise fail), takes **max(daily, minute-sum)** — the rescue can only add
-measured participation, never hide it, so the `max_rvol` halt ceiling keeps
-its bite — and re-computes. The same bars are reused for the VWAP gate (no
-second credit). A zero measurement now counts as a measurement: GLASF traded
-on rvol=0.0 through the old "daily bar hasn't rolled → skip the band" bypass.
+**Session volume is the numerator (v20; supersedes the v19.2 rescue):** the
+RVOL numerator was Twelvedata's daily-bar `today_volume`, whose volume field
+trails the live session by minutes — worst at the open, exactly when the
+gap-and-go eval runs (2026-07-07: ZTS read RVOL 0.07 and AGIO 0.40 minutes
+after gapping on real catalysts). v19.2 patched this with a conditional
+"rescue" second fetch of the minute bars. v20 removes the lagging source
+entirely: the session minute-bar sum from the single `get_session_analysis`
+pull IS the numerator, so the lag class of false rejections died with the
+mechanism that worked around it. Known caveat: minute bars can undercount
+the consolidated tape, so RVOL reads slightly conservative — and
+`low_volume` is transient, so a false low re-checks within minutes. A zero
+measurement still counts as a measurement: GLASF traded on rvol=0.0 through
+the old "volume unmeasured → skip the band" bypass, and must never again.
 
 ### Momentum baseline honesty
 
@@ -407,29 +463,58 @@ Size = **minimum** of:
 
 ---
 
-## 6. Stage 4 — Exits (`monitor/position_monitor.py`, every 20s)
+## 6. Stage 4 — Exits (`monitor/position_monitor.py`, every 5s)
 
 The realized win/loss asymmetry was the system's biggest leak: designed
-+5%/−2%, realized **avg win £5.52 vs avg loss £10.37** (INHD "take_profit"
-filled +3.13%; GOAI "stop_loss" filled −18.99%). v14 restructures execution:
++5%/−2%, realized **avg win £5.52 vs avg loss £10.37**. v14 rested the
+take-profit limit at the broker and polled the stop every 20s. **v20 inverts
+that**, because the realized record proved it backwards: ONE resting-TP fill
+in 11 trades, versus stop-side slippage on every fast reversal — VECO −3.4%,
+CRCL −3.97% (falling ~1%/min; the 20s poll alone gave it a 20-second head
+start), GOAI −18.99%, all on −2% triggers. T212 has no OCO and each sell
+order reserves its shares, so only ONE side can rest: it must be the side
+where latency costs capital. A missed TP costs opportunity; a slow stop
+costs money on every single fast reversal.
 
-| Exit | Mechanism | Latency |
+| Exit | Mechanism (v20) | Latency |
 |---|---|---|
-| **Take profit** | **Resting LIMIT sell placed at buy time** (`tp_order_id` on the trade). The exchange fills it the moment price touches target | zero |
-| **Stop loss** | Polled every 20s (was 60s); sells via **bounded limit** at trigger × (1 − 1%) — caps slippage at ~1% instead of chasing a collapsing bid. Unfilled → cancel → retry next cycle at current price. **v19.2: after 3 consecutive unfilled limit attempts the next attempt is a MARKET order** (+ one-per-day `exit_stuck` system_event) — GLASF sat for 5h14m behind 459 limit retries priced off a frozen quote | ≤ 20s |
-| **Time stop** | 60 min after entry, polled; needs no price feed (fires even in a data outage) | ≤ 20s |
+| **Stop loss** | **Resting STOP-MARKET sell placed at buy time** (`stop_order_id` on the trade). The broker executes the instant price touches the trigger. Stop-market, not stop-limit: when it triggers, the book is moving against us — certainty is the point; the ADV liquidity floor bounds expected slippage. If placement fails, the monitor falls back to the old polled stop (bounded limit + v19.2 market escalation after 3 unfilled attempts) | zero |
+| **Breakeven ratchet** | At +2% (1R) the resting stop is cancelled and re-placed at buy × 1.001, once per trade. A trade that has paid one risk unit may mean-revert but must not become a loser. If the replacement can't be placed, an in-process armed flag drives a POLLED breakeven stop — the ratchet only ever tightens protection | zero after arm |
+| **Take profit** | Polled at the monitor cadence; sells via bounded limit at current price × (1 − 1%) after cancelling the resting stop | ≤ 5s |
+| **Time stop** | 60 min after entry, polled; needs no price feed (fires even in a data outage). Kept at 60: the kept catalyst classes' measured drift is still building at the 60-minute horizon | ≤ 5s |
 | **EOD flatten** | ALL positions force-closed 10 min before the close with a market sell, regardless of P&L. Stops don't work overnight; one gap erases a month | — |
 
-**The cancel/fill race** (no OCO on T212): before any stop/time-stop sell, the
-resting TP must be cancelled (it reserves the shares). If the cancel fails
-because the TP filled while cancelling, the trade is recorded as a
-take_profit — never sold twice. Unknown order state (network error) → defer to
-next cycle rather than risk a double exit.
+Monitor cadence is 5s (was 20s): with the stop resting broker-side, the poll
+no longer guards the loss side, but the POLLED side (take-profit) pays the
+full cadence as latency at the exact moment price touches the target. The
+cycle early-outs on a local DB query when flat; broker reconciliation is
+throttled to once per 60s and resting-order status checks to once per 15s
+per trade so the faster loop doesn't multiply API load. The monitor's price
+lookups run the quote chain in fast (single-attempt) mode — the next cycle
+is the retry — and the 390-bar Twelvedata price fallback is throttled to one
+attempt per 30s per symbol so a quote outage can't drain the credit bucket
+that signal confirmation needs (v20.1 review findings).
 
-If a resting TP disappears from the pending-order endpoint, the monitor now
-checks fill detail before closing the DB trade. A missing pending order can be
-a fill, but it can also be a DAY-order expiry/cancel; treating every 404 as a
-profit would corrupt P&L and leave real positions unmanaged.
+The ratchet's armed flag is persisted on the trade row (`ratchet_armed`,
+v20.1): a restart cannot regress an armed position back to the −2% stop, and
+a crash between the ratchet's cancel and re-place self-repairs — the next
+cycle above the trigger places a fresh breakeven stop directly.
+
+**The cancel/fill race** (no OCO on T212): before any polled TP/time-stop/EOD
+sell, the resting stop must be cancelled (it reserves the shares). If the
+cancel fails because the stop filled while cancelling, the trade is recorded
+as a stop_loss — never sold twice. Unknown order state (network error) →
+defer to next cycle rather than risk a double exit. The same race handling
+covers the ratchet's cancel-and-replace.
+
+If a resting order disappears from the pending-order endpoint, the monitor
+checks fill detail before closing the DB trade. A missing pending order can
+be a fill, but it can also be a DAY-order expiry/cancel; treating every 404
+as an exit would corrupt P&L and leave real positions unmanaged.
+
+Legacy trades opened before v20 that still carry a resting TP
+(`tp_order_id`) are managed under the old rules until they close — both
+regimes coexist across the deploy.
 
 The monitor never sells into a closed market (guard + loud error if positions
 somehow survive past the close).
