@@ -282,13 +282,20 @@ class TestGetCurrentPriceDegraded:
         assert pc.get_current_price("AAPL_US_EQ") == 10.5
         assert mock_quote.call_args.kwargs.get("fast") is True
 
+    @patch("market.price_check.time.monotonic")
     @patch("market.price_check.get_session_analysis")
     @patch("market.price_check.get_quote_with_fallback", return_value=None)
-    def test_bars_fallback_throttled_per_symbol(self, _quote, mock_sa):
+    def test_bars_fallback_throttled_per_symbol(self, _quote, mock_sa, mock_mono):
+        # Deterministic clock: don't depend on the host's real monotonic()
+        # baseline (undefined by spec — can start near 0 on a fresh CI
+        # container, which would make an empty _last_bars_fallback dict's
+        # `.get(symbol, 0.0)` default look "recent" and falsely throttle the
+        # very first call).
         import market.price_check as pc
         mock_sa.return_value = _mk_sa()
+        mock_mono.side_effect = [1000.0, 1005.0]  # 5s apart, well under 30s
         assert pc.get_current_price("AAPL_US_EQ") == 10.5  # first: fallback runs
-        assert pc.get_current_price("AAPL_US_EQ") is None  # within 30s: throttled
+        assert pc.get_current_price("AAPL_US_EQ") is None  # 5s later: throttled
         mock_sa.assert_called_once()
 
 
@@ -642,9 +649,16 @@ class TestBrokerReconciliation:
     """Tests for monitor/position_monitor.py::_reconcile_positions"""
 
     def setup_method(self):
-        # v20 throttles reconciliation to once/60s — reset so each test runs it.
+        # v20 throttles reconciliation to once/60s. time.monotonic()'s epoch
+        # is undefined by spec — on some hosts (fresh CI containers) it can
+        # start near 0, so resetting the "last checked" marker to a literal
+        # 0.0 does NOT reliably read as "long enough ago": now - 0.0 can
+        # itself be under 60s, silently re-throttling every test in this
+        # class (observed in CI while passing locally, where uptime keeps
+        # monotonic() large). -inf is "long ago" regardless of the host's
+        # monotonic baseline.
         import monitor.position_monitor as pm
-        pm._last_reconcile_ts = 0.0
+        pm._last_reconcile_ts = float("-inf")
 
     teardown_method = setup_method
 
