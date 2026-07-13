@@ -7,6 +7,45 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v20.2 — 2026-07-14 (zero-trade post-mortem: mega-cap RVOL bypass + regulator taxonomy)
+
+2026-07-13 (the first full session under the v20 catalyst prune) traded
+nothing. Root-caused ticker-by-ticker against `sentiment_scores`/
+`news_signals`/`premarket_candidates` and the full journalctl history: no
+outage, no crash, no risk-gate block — 282 articles scored, only 10 (3.5%)
+carried a tradeable catalyst, and every one was individually and mostly
+*correctly* rejected (3 penny stocks, 1 illiquid, 2 low-confidence, BMRN a
+genuine sell-the-news on the day's highest-confidence signal). One rejection
+exposed a real gap.
+
+### 1. RVOL floor bypass for mega-caps holding VWAP
+BMY ("FDA Accepts NDA For Mezigdomide") drifted +2.1% all session, held VWAP
+essentially the whole way, and was rejected `low_volume` on all 27
+consecutive re-eval cycles — RVOL never exceeded 0.3 against the 1.5 floor,
+because a $752M/day-ADV mega-cap doesn't need anomalous RELATIVE volume to
+move 2%. The VWAP accumulation test (step 10) is explicitly designed to be
+the size-neutral answer to exactly this — but RVOL (step 9) runs first and
+vetoed every cycle before VWAP ever got a look. Same failure class as VERA
+(§ RVOL section, docs/algorithm.md): a stock at the wrong end of the cap
+spectrum for a flat relative-volume bar, just too LARGE instead of too FRESH.
+Fix: above `RVOL_BYPASS_MIN_ADV_DOLLAR` (default $50M, 10× the illiquidity
+floor), a held VWAP substitutes for the RVOL FLOOR only — the 20× ceiling is
+unchanged at any cap size (parabolic volume is still the halt signature).
+Below the ADV$ floor, small/mid-cap behavior — where RVOL is best-validated —
+is untouched.
+
+### 2. fda_approval requires the US FDA specifically
+NVS's Health Canada approval was tagged `catalyst_type=fda_approval` on
+2026-07-13 — harmless that day (dead tape rejected it anyway) but a mistag
+that happens to move on the tape would trade on an edge the 60-day
+forward-return study never measured (§3.3 measured US FDA action only). The
+system prompt now carries an explicit FDA-only carve-out plus a contrastive
+Health-Canada example next to the genuine-approval example.
+
+Tests: 241 passing (5 new — `TestRvolBypass`; 1 new — prompt content guard).
+
+---
+
 ## v20 — 2026-07-10 (first-principles rebuild: trade what's measured, protect the downside at broker speed)
 
 Ground-up critical review of every strategy component, driven by the

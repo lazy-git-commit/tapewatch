@@ -165,6 +165,20 @@ class Settings:
     max_rvol: float = field(
         default_factory=lambda: float(os.getenv("MAX_RVOL", "20.0"))
     )
+    # Size-neutral RVOL floor bypass (v20.2): a stock with ADV$ at or above
+    # this floor doesn't need anomalous RELATIVE volume to make a real move —
+    # its normal book is already enormous in dollar terms, so a held VWAP
+    # (institutions net buying, independent of raw % change) substitutes for
+    # RVOL as evidence of participation. 2026-07-13 post-mortem: BMY (ADV$
+    # $752M) drifted +2.1% all session on RVOL that never exceeded 0.3 and
+    # was rejected low_volume on all 27 consecutive re-eval cycles despite
+    # holding VWAP throughout — the size-neutral VWAP test (step 10) never
+    # got a chance to run because the RVOL floor (step 9) rejects first.
+    # $50M = 10x the illiquidity floor; a first-pass estimate, not yet
+    # validated against multiple days of measured mega-cap data.
+    rvol_bypass_min_adv_dollar: float = field(
+        default_factory=lambda: float(os.getenv("RVOL_BYPASS_MIN_ADV_DOLLAR", "50000000"))
+    )
     # Penny-stock floor. Sub-$5 names carry outsized spread (as % of price),
     # halt frequency, and manipulation risk. Every observed loss in the Jun
     # 8–11 week was on a sub-$5 stock. $5 is the classic institutional cutoff.
@@ -387,6 +401,8 @@ class Settings:
             ("MIN_DAILY_DOLLAR_VOLUME", self.min_daily_dollar_volume >= 0),
             ("MIN_RVOL", self.min_rvol >= 0),
             ("MAX_RVOL", self.max_rvol > self.min_rvol),
+            ("RVOL_BYPASS_MIN_ADV_DOLLAR >= MIN_DAILY_DOLLAR_VOLUME",
+             self.rvol_bypass_min_adv_dollar >= self.min_daily_dollar_volume),
             ("MIN_STOCK_PRICE", self.min_stock_price >= 0),
             ("MAX_SPREAD_PCT", self.max_spread_pct > 0),
             ("OPEN_BLOCK_MINUTES", self.open_block_minutes >= 0),

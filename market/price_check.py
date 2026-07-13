@@ -44,7 +44,17 @@ cheapest checks first so we fail fast and spend fewer API credits):
   9. low_volume /    — RVOL (time-of-day normalized relative volume) within
      high_volume       [cfg.min_rvol, cfg.max_rvol]. See _expected_volume_
                        fraction() for why raw volume ratios are meaningless
-                       without time normalization.
+                       without time normalization. FLOOR ONLY has a
+                       size-neutral bypass (v20.2): ADV$ >= cfg.
+                       rvol_bypass_min_adv_dollar + a held VWAP substitutes
+                       for RVOL — a mega-cap's normal book is already huge
+                       in dollar terms, so it doesn't need anomalous
+                       RELATIVE volume to make a real move (BMY 2026-07-13:
+                       +2.1% all session, RVOL never exceeded 0.3, held VWAP
+                       throughout, rejected on all 27 re-eval cycles because
+                       this gate ran before step 10 ever got a look). The
+                       ceiling has no bypass — parabolic volume is the
+                       halt-pattern signature regardless of cap size.
  10. below_vwap      — price must hold at/above session VWAP (cfg.
                        require_vwap_confirmation). SIZE-NEUTRAL accumulation
                        test: a deep-book large-cap reprices <1% in 5 min but
@@ -639,12 +649,38 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         # got a free pass on the participation gate — GLASF traded on RVOL 0.0
         # while liquid names were being rejected.)
         volume_measured = session_volume is not None
+        vwap = sa.vwap if sa else None
+        if vwap is not None and vwap > 0:
+            base["vwap"] = vwap
         if avg_daily_volume and avg_daily_volume > 0 and volume_measured:
             if rvol < cfg.min_rvol:
-                return _reject(
-                    base, "low_volume",
-                    f"RVOL {rvol:.2f} below {cfg.min_rvol} — price move lacks real "
-                    f"participation (time-normalized vs 20-day avg)",
+                # Size-neutral bypass (v20.2): a mega/large-cap doesn't need
+                # anomalous RELATIVE volume to make a real move — its normal
+                # book is already enormous in dollar terms. A held VWAP
+                # (institutions net buying, independent of raw % change) is
+                # the same size-neutral evidence step 10 uses below, just
+                # consulted here so the RVOL floor can't veto it first. See
+                # cfg.rvol_bypass_min_adv_dollar (2026-07-13: BMY, ADV$ $752M,
+                # +2.1% all session, RVOL never exceeded 0.3, held VWAP
+                # throughout — rejected low_volume on all 27 re-eval cycles).
+                rvol_bypass = (
+                    avg_dollar_volume is not None
+                    and avg_dollar_volume >= cfg.rvol_bypass_min_adv_dollar
+                    and vwap is not None and vwap > 0
+                    and current_price >= vwap * (1 - cfg.vwap_tolerance_pct / 100)
+                )
+                if not rvol_bypass:
+                    return _reject(
+                        base, "low_volume",
+                        f"RVOL {rvol:.2f} below {cfg.min_rvol} — price move lacks real "
+                        f"participation (time-normalized vs 20-day avg)",
+                    )
+                logger.info(
+                    "Price check [%s]: RVOL %.2f below %.1f but ADV$ $%s >= "
+                    "$%s bypass floor and VWAP held ($%.4f) — size-neutral "
+                    "participation confirmed without a relative-volume spike",
+                    symbol, rvol, cfg.min_rvol, f"{avg_dollar_volume:,.0f}",
+                    f"{cfg.rvol_bypass_min_adv_dollar:,.0f}", vwap,
                 )
             if rvol > cfg.max_rvol:
                 return _reject(
@@ -662,11 +698,8 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         # (citations in docs/algorithm.md). The VWAP comes from the same
         # session-analysis pull as everything else (v20) — no extra credit.
         vwap_passed = False
-        vwap = sa.vwap if sa else None
         session_low = sa.session_low if sa else None
         session_high = sa.session_high if sa else None
-        if vwap is not None and vwap > 0:
-            base["vwap"] = vwap
         if cfg.require_vwap_confirmation:
             if vwap is not None and vwap > 0:
                 # Accept at/above VWAP minus a small tolerance (handles a fresh

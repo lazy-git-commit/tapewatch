@@ -402,6 +402,14 @@ class TestCatalystPrune:
             if old is not None:
                 os.environ["TRADEABLE_CATALYSTS"] = old
 
+    def test_fda_approval_prompt_requires_us_regulator(self):
+        # 2026-07-13: NVS (a Health Canada approval) was tagged fda_approval,
+        # diluting the measured edge that TRADEABLE_CATALYSTS pruning rests
+        # on. The prompt must keep an explicit non-US-regulator carve-out.
+        from news.fetcher import _SYSTEM_PROMPT
+        assert "Health Canada" in _SYSTEM_PROMPT
+        assert "US FDA specifically" in _SYSTEM_PROMPT
+
 
 # ── Sentiment scoring tests (forced tool use) ─────────────────────────────────
 
@@ -2531,6 +2539,82 @@ class TestOverextendedGate:
             )
         assert conf is not None and not conf.is_confirmed
         assert conf.reason_code == "overextended"
+
+
+class TestRvolBypass:
+    """
+    v20.2: a mega/large-cap (ADV$ >= cfg.rvol_bypass_min_adv_dollar) doesn't
+    need anomalous RELATIVE volume to make a real move — a held VWAP is the
+    size-neutral substitute for RVOL. 2026-07-13 post-mortem: BMY (ADV$
+    $752M) drifted +2.1% all session, RVOL never exceeded 0.3, held VWAP
+    throughout, and was rejected low_volume on all 27 re-eval cycles because
+    the RVOL floor ran before the VWAP gate ever got a look.
+    """
+
+    _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.0}
+    _MEGACAP_DAILY = (5_000_000, 750_000_000.0, 10.0)  # BMY-scale ADV$
+
+    @staticmethod
+    def _now_et():
+        import pytz
+        et = pytz.timezone("America/New_York")
+        return et.localize(datetime(2026, 7, 10, 10, 0, 0))  # 30 min after open
+
+    def test_megacap_holding_vwap_bypasses_low_rvol(self):
+        # avg_daily_volume 5M x expected_fraction(30min)=0.05 -> expected 250k;
+        # session_volume 50k -> rvol 0.2, well below the 1.5 floor. Price 10.5
+        # holds the default 10.45 VWAP (+0.48%), so the bypass should confirm.
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE,
+            _mk_sa(session_volume=50_000),
+            daily=self._MEGACAP_DAILY,
+        )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+        assert conf.rvol < 1.5
+
+    def test_bypass_does_not_apply_below_adv_floor(self):
+        # Same low RVOL, but ADV$ is the default $10M — far below the $50M
+        # bypass floor. Existing small/mid-cap behavior must be unchanged.
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE,
+            _mk_sa(session_volume=10_000),  # 1M avg x 0.05 = 50k expected -> rvol 0.2
+            daily=_DAILY,
+        )
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "low_volume"
+
+    def test_bypass_does_not_apply_when_vwap_not_held(self):
+        # Mega-cap ADV$, low RVOL, but price sits BELOW VWAP — no evidence of
+        # accumulation, so the RVOL floor must still reject.
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE,
+            _mk_sa(session_volume=50_000, vwap=10.55),  # price 10.5 < vwap 10.55
+            daily=self._MEGACAP_DAILY,
+        )
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "low_volume"
+
+    def test_bypass_does_not_apply_without_vwap(self):
+        # Mega-cap ADV$, low RVOL, but no VWAP available at all — nothing to
+        # substitute for RVOL, so the floor must still reject.
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE,
+            _mk_sa(session_volume=50_000, vwap=None),
+            daily=self._MEGACAP_DAILY,
+        )
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "low_volume"
+
+    def test_rvol_ceiling_still_applies_to_megacaps(self):
+        # The bypass only touches the FLOOR — a parabolic mega-cap is still
+        # the halt-pattern signature regardless of ADV$.
+        conf, _ = _confirm_with(
+            self._now_et(), self._QUOTE,
+            _mk_sa(session_volume=10_000_000),  # 5M x 0.05=250k expected -> rvol 40
+            daily=self._MEGACAP_DAILY,
+        )
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "high_volume"
 
 
 class TestExhaustionGate:

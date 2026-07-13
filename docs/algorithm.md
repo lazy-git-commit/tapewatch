@@ -125,6 +125,16 @@ batched call** per cycle:
 Each article gets four fields: `sentiment`, `confidence` (0–1),
 `catalyst_type` (14-class taxonomy), `already_moved` (bool).
 
+**`fda_approval` means the US FDA specifically (v20.2, 2026-07-13):** a Health
+Canada, EMA, or MHRA approval is `other`, not `fda_approval` — the measured
+60-day forward-return edge (§3.3) was computed for US-regulator action only
+and does not extend to foreign regulators. Found when NVS's Health Canada
+approval was tagged `fda_approval` on 2026-07-13 (harmless that day — dead
+tape rejected it anyway — but a mistag that happens to move on the tape would
+trade on an edge that was never measured). The system prompt now carries an
+explicit carve-out plus a contrastive example right next to the genuine-FDA
+example.
+
 **Every classification — positive, neutral, negative — is persisted to
 `sentiment_scores`** for the eval loop (§9). The model classifies; code decides
 what trades.
@@ -267,7 +277,7 @@ Checks run cheapest-first; each rejection records a `reason_code`:
 | 6 | `illiquid` | 20-day ADV × price < **$5M** | **ADV-based on purpose**: spike-day volume explodes and would pass exactly the halt patterns this blocks. Exit slippage depends on the NORMAL book (GOAI: $390k ADV → −18.99% stop fill) |
 | 7 | `low_momentum` | < +0.2% over ~5 min (v15: dead-tape noise floor only) | Just rejects "the catalyst moved nothing"; VWAP does the real work (step 10). Moves below −0.2% log as "tape moving against the signal" (same code) |
 | 8 | `high_momentum` | > +15% over ~5 min | Post-halt spike — halt articles publish AFTER the 30–120% pop. Runs before VWAP to save a credit |
-| 9 | `low_volume` / `high_volume` | RVOL outside [1.5, 20] | See RVOL section (v20: session minute-bar volume is THE numerator — current, unlike the lagging daily bar the v19.2 "rescue" had to work around) |
+| 9 | `low_volume` / `high_volume` | RVOL outside [1.5, 20] | See RVOL section (v20: session minute-bar volume is THE numerator — current, unlike the lagging daily bar the v19.2 "rescue" had to work around. v20.2: the FLOOR only bypasses to a held-VWAP check above `RVOL_BYPASS_MIN_ADV_DOLLAR` — see below) |
 | 10 | `below_vwap` | price < session VWAP (− small tol) | v15: size-neutral accumulation test — see below |
 | 10.2 | `overextended` | price > VWAP × (1 + **1.5%**) | v20: never park the stop on the far side of value. With a 2% stop, an entry >1.5% above VWAP is stopped out by a ROUTINE reversion to value — LEVI entered +1.9% above VWAP, CRCL +2.2%; both dead on arrival. Transient → re-eval queue = first-pullback entry |
 | 10.5 | `exhausted_bounce` | day's range ≥ **5%** AND price recovered ≥ **75%** of it | v19.5: LEVI bought within 15¢ of the day's exact high, 3 min before the peak, after gapping down −7.8% at the open — see below |
@@ -430,6 +440,40 @@ the consolidated tape, so RVOL reads slightly conservative — and
 `low_volume` is transient, so a false low re-checks within minutes. A zero
 measurement still counts as a measurement: GLASF traded on rvol=0.0 through
 the old "volume unmeasured → skip the band" bypass, and must never again.
+
+### RVOL floor bypass — size-neutral participation for mega-caps (v20.2)
+
+RVOL step 9 runs strictly BEFORE the VWAP accumulation test (step 10) — so
+even though VWAP is explicitly designed to be size-neutral (a deep-book
+large-cap holds VWAP on a real catalyst while barely moving the tape %), it
+never got a chance to prove that for a stock the RVOL floor had already
+killed. This is the same failure class as VERA above, just at the opposite
+end of the cap spectrum: a name too LARGE to spike RVOL, instead of too FRESH
+to have accumulated it yet.
+
+**2026-07-13 post-mortem (BMY):** "FDA Accepts NDA For Mezigdomide" —
+confidence 0.75, magnitude 2 (correctly scored low — an NDA acceptance is a
+much weaker catalyst than an approval). BMY drifted +0.14% → +2.14% → +1.60%
+over the session, a real and sustained move, and held VWAP (10.45→trending)
+essentially the whole way. RVOL never exceeded 0.3 against the 1.5 floor,
+because BMY trades **$752M/day** in ADV$ — a $100B+ mega-cap doesn't need
+1.5× normal relative volume to move 2%; that much dollar volume moving at all
+is already a huge absolute number. The signal was rejected `low_volume` on
+all 27 consecutive re-eval cycles across its 15-minute window (having already
+burned its pre-market gap-and-go window the same way) — VWAP was never
+consulted because RVOL vetoed first every single time.
+
+**Fix:** for `avg_dollar_volume >= cfg.rvol_bypass_min_adv_dollar` (default
+**$50M**, 10× the illiquidity floor — a first-pass estimate, not yet
+validated against multiple days of measured mega-cap data), a held VWAP
+(price at/above VWAP × (1 − `VWAP_TOLERANCE_PCT`), independent of
+`REQUIRE_VWAP_CONFIRMATION` — same precedent as the `overextended` gate)
+substitutes for the RVOL floor. The bypass touches the FLOOR only: the
+20× ceiling still applies at any cap size, because parabolic relative volume
+is the halt-pattern signature regardless of how large the normal book is.
+Below the ADV$ floor, small/mid-cap behavior is completely unchanged — this
+is where RVOL is best-validated (a real catalyst on a thin book produces a
+genuine volume explosion) and where the bypass must NOT fire.
 
 ### Momentum baseline honesty
 

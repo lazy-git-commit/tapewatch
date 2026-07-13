@@ -273,7 +273,7 @@ def _api_error_type(exc: Exception) -> str | None:
 CATALYST_TYPES = [
     "earnings_beat",      # revenue/EPS above estimates
     "guidance_raise",     # raised full-year outlook
-    "fda_approval",       # approval / positive trial / regulatory green light
+    "fda_approval",       # US FDA approval / positive trial / regulatory green light — FDA ONLY, never other regulators (Health Canada, EMA, MHRA -> other)
     "ma_target",          # company is being ACQUIRED (binding offer)
     "ma_acquirer",        # company is the BUYER (usually drops — never traded)
     "contract_win",       # major contract with concrete dollar value
@@ -331,6 +331,10 @@ company than the tagged ticker → neutral.
 STEP 3 — Is the catalyst binding and material?
 - Binding: definitive merger agreement, firm buyout offer, signed contract
   with a dollar value, actual FDA approval. → can be positive.
+- fda_approval means the US FDA specifically. A Health Canada, EMA, MHRA, or
+  other non-US-regulator approval is NOT catalyst_type=fda_approval — this
+  system trades US equities off a US-regulator edge that does not extend to
+  foreign approvals. → catalyst_type=other.
 - Non-binding: LOI, MOU, "exploring strategic alternatives", "in talks",
   early-stage trial commentary. → neutral. These cancel constantly.
 - Dilution: share offerings, ATM programs, warrant exercises announced after
@@ -391,6 +395,9 @@ Examples:
 
 Headline: "Acme Therapeutics Receives FDA Approval For Lead Drug ACM-101"
 → {"sentiment": "positive", "confidence": 0.95, "catalyst_type": "fda_approval", "already_moved": false, "catalyst_magnitude": 5}
+
+Headline: "Acme Receives Health Canada Approval For Lead Drug ACM-101"
+→ {"sentiment": "neutral", "confidence": 0.3, "catalyst_type": "other", "already_moved": false, "catalyst_magnitude": 1}
 
 Headline: "Acme Therapeutics Shares Halted On Circuit Breaker To The Upside"
 → {"sentiment": "neutral", "confidence": 0.2, "catalyst_type": "halt_or_resume", "already_moved": true, "catalyst_magnitude": 1}
