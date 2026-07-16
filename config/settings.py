@@ -340,6 +340,61 @@ class Settings:
         default_factory=lambda: float(os.getenv("MAX_GAP_PCT", "20.0"))
     )
 
+    # ── 24/5 extended-hours trading (v21) ─────────────────────────────────────
+    # T212 supports four sessions (ET): premarket 04:00–09:30, regular
+    # 09:30–16:00, after-hours 16:00–20:00, overnight 20:00–04:00 (Blue Ocean).
+    # Master switch: mirrors whether 24/5 is enabled on the T212 account. When
+    # False the system is exactly its pre-v21 RTH-only self.
+    extended_hours_enabled: bool = field(
+        default_factory=lambda: os.getenv("EXTENDED_HOURS_ENABLED", "true").lower() in ("1", "true", "yes")
+    )
+    # After-hours entries (16:00–20:00 ET). THE reason v21 exists: FDA
+    # decisions and guidance raises overwhelmingly print right after the
+    # close — a window the system used to sleep through entirely.
+    afterhours_trading_enabled: bool = field(
+        default_factory=lambda: os.getenv("AFTERHOURS_TRADING_ENABLED", "true").lower() in ("1", "true", "yes")
+    )
+    # Direct pre-market entries (04:00–09:30 ET). Default OFF: the existing
+    # pre-market scanner + at-open gap-and-go evaluation is the deliberate
+    # pre-market strategy (thin 5am books, wide spreads; the at-open eval
+    # trades the same news with confirmation). Enable only with evidence.
+    premarket_trading_enabled: bool = field(
+        default_factory=lambda: os.getenv("PREMARKET_TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
+    )
+    # Extended-session liquidity floor (ADV$). Extended tape is thin; only
+    # names whose NORMAL book is institutional-depth get considered. $50M
+    # matches T212's own "most liquid NYSE/NASDAQ" eligibility universe and
+    # the v20.2 RVOL-bypass tier.
+    extended_min_adv_dollar: float = field(
+        default_factory=lambda: float(os.getenv("EXTENDED_MIN_ADV_DOLLAR", "50000000"))
+    )
+    # Extended-session participation floor: dollars actually traded in the
+    # session since its start (session volume × price). Replaces the RVOL
+    # band, whose time-of-day curve is calibrated on RTH volume shape and is
+    # meaningless at 17:00. An after-hours catalyst on a $50M+ ADV name that
+    # can't print $500k of tape is not a tradeable reaction.
+    extended_min_session_dollar_volume: float = field(
+        default_factory=lambda: float(os.getenv("EXTENDED_MIN_SESSION_DOLLAR_VOLUME", "500000"))
+    )
+    # Tighter spread proxy ceiling for extended sessions (RTH default is 3.0).
+    extended_max_spread_pct: float = field(
+        default_factory=lambda: float(os.getenv("EXTENDED_MAX_SPREAD_PCT", "1.5"))
+    )
+    # Position-size multiplier for extended-session entries. Half size: the
+    # loss side is POLLED after hours (T212 stop orders execute RTH-only and
+    # the API accepts extendedHours on market orders only), so per-trade risk
+    # is cut at the sizing stage instead.
+    extended_size_factor: float = field(
+        default_factory=lambda: float(os.getenv("EXTENDED_SIZE_FACTOR", "0.5"))
+    )
+    # Force-flatten all positions this many minutes before the after-hours
+    # session ends (19:45 ET by default). Non-negotiable: the overnight
+    # session runs on Blue Ocean, which neither Finnhub nor Twelvedata
+    # carries — a position held past 20:00 would be completely unmonitorable.
+    extended_flatten_buffer_minutes: int = field(
+        default_factory=lambda: int(os.getenv("EXTENDED_FLATTEN_BUFFER_MINUTES", "15"))
+    )
+
     # ── Observability ─────────────────────────────────────────────────────────
     # Alert (system_event + CRITICAL log) when this many consecutive NYSE
     # trading sessions pass with signals flowing but ZERO trades. This is the
@@ -428,6 +483,14 @@ class Settings:
              self.max_vwap_extension_pct < self.stop_loss_pct),
             ("RATCHET_TRIGGER_PCT", self.ratchet_trigger_pct > 0),
             ("RATCHET_LOCK_PCT", 0 <= self.ratchet_lock_pct < self.ratchet_trigger_pct),
+            ("EXTENDED_MIN_ADV_DOLLAR >= MIN_DAILY_DOLLAR_VOLUME",
+             self.extended_min_adv_dollar >= self.min_daily_dollar_volume),
+            ("EXTENDED_MIN_SESSION_DOLLAR_VOLUME", self.extended_min_session_dollar_volume >= 0),
+            ("EXTENDED_MAX_SPREAD_PCT", self.extended_max_spread_pct > 0),
+            ("EXTENDED_SIZE_FACTOR", 0 < self.extended_size_factor <= 1.0),
+            # ≥5 min: the flatten must fire with enough runway for a market
+            # sell + at least one monitor-cycle retry before the venue change.
+            ("EXTENDED_FLATTEN_BUFFER_MINUTES", self.extended_flatten_buffer_minutes >= 5),
         ]
         errors.extend(name for name, ok in numeric_checks if not ok)
         if errors:

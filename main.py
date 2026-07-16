@@ -4,10 +4,14 @@ main.py
 Entry point for the momentum trader.
 
 Scheduled jobs:
-  1. news_cycle       — every minute. During market hours: fetch Benzinga →
-                        Claude sentiment → price confirmation → risk gates →
-                        buy + resting stop-loss (v20). During the pre-market
-                        window: scan news into the at-open watchlist.
+  1. news_cycle       — every minute. In an entry session (regular hours, and
+                        after-hours 16:00–20:00 ET under v21's extended
+                        regime): fetch Benzinga → Claude sentiment → price
+                        confirmation → risk gates → buy (+ resting stop-loss
+                        in RTH — v20; polled both-sides in extended sessions).
+                        During the pre-market window: scan news into the
+                        at-open watchlist. Overnight (Blue Ocean): nothing —
+                        no data coverage, fail closed.
   2. monitor_positions — every cfg.monitor_interval_seconds (default 5s, v20).
                         Notices resting-stop fills, polls take-profit and
                         time-stop, ratchets the stop to breakeven at +1R,
@@ -52,7 +56,10 @@ from storage.database import (
 )
 from news.fetcher import fetch_all_news, NewsItem
 from market.price_check import (
-    confirm_price_signal, is_market_open, is_too_late_to_buy, PriceConfirmation,
+    confirm_price_signal, is_too_late_to_buy, PriceConfirmation,
+)
+from market.sessions import (
+    get_trading_session, is_entry_session, REGULAR, EXTENDED_SESSIONS,
 )
 from trading.executor import (
     buy, sell, build_symbol_map, place_stop_loss, cancel_order,
@@ -353,15 +360,26 @@ def _execute_entry(item: NewsItem, confirmation: PriceConfirmation, fetched_at: 
 
 
 def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id: int) -> bool:
-    """Buy + resting TP + trade record for an already-confirmed, saved signal."""
+    """Buy + resting stop + trade record for an already-confirmed, saved signal."""
+    # v21: extended-session entries route through T212's extendedHours market
+    # orders, at cfg.extended_size_factor size, and get NO resting stop —
+    # T212 stop orders execute in regular hours only, so a stop placed now
+    # would reserve the shares while protecting nothing; the monitor polls
+    # both sides at its 5s cadence instead and flattens before the overnight
+    # handoff.
+    extended = confirmation.session in EXTENDED_SESSIONS
     logger.info(
-        "Signal approved [%s] @ $%.4f — %s",
-        item.ticker, confirmation.current_price, confirmation.reason,
+        "Signal approved [%s] @ $%.4f (session=%s) — %s",
+        item.ticker, confirmation.current_price, confirmation.session,
+        confirmation.reason,
     )
 
     # ── Buy (liquidity-aware sizing via ADV) ──────────────────────────────────
     try:
-        result = buy(item.ticker, confirmation.current_price, confirmation.avg_dollar_volume)
+        result = buy(
+            item.ticker, confirmation.current_price,
+            confirmation.avg_dollar_volume, extended=extended,
+        )
     except Exception as exc:
         logger.error("buy() raised unexpectedly for %s: %s", item.ticker, exc, exc_info=True)
         try:
@@ -400,7 +418,10 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
             item.ticker, result.order_id, exc,
         )
         try:
-            flatten = sell(item.ticker, result.quantity, result.price, "db_record_failed", force_market=True)
+            flatten = sell(
+                item.ticker, result.quantity, result.price, "db_record_failed",
+                force_market=True, extended=extended,
+            )
             if flatten.success:
                 logger.critical(
                     "Emergency flatten succeeded for unrecorded %s position "
@@ -439,8 +460,14 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
     stop_price = result.price * (1 - cfg.stop_loss_pct / 100)
     stop_order_id = (
         place_stop_loss(item.ticker, result.quantity, stop_price)
-        if cfg.resting_stop_enabled else None
+        if cfg.resting_stop_enabled and not extended else None
     )
+    if extended:
+        logger.info(
+            "Trade [%s]: extended session (%s) — no resting stop (T212 stops "
+            "execute RTH-only); monitor polls both sides at %ds cadence",
+            item.ticker, confirmation.session, cfg.monitor_interval_seconds,
+        )
     if stop_order_id:
         try:
             set_stop_order_id(trade_id, stop_order_id)
@@ -526,22 +553,34 @@ def news_cycle() -> None:
     except Exception:
         pass  # liveness reporting must never block trading
 
-    if not is_market_open():
-        # Pre-market window: build the at-open watchlist instead of trading.
-        if in_premarket_window():
-            logger.info("Pre-market window — scanning for overnight catalysts")
-            try:
-                premarket_scan()
-            except Exception as exc:
-                logger.error("premarket_scan failed: %s", exc, exc_info=True)
-        else:
-            logger.info("Market closed — skipping cycle")
+    # ── Session gate (v21) ────────────────────────────────────────────────────
+    # regular            → full pipeline (unchanged).
+    # premarket          → watchlist scan (always); direct entries only when
+    #                      PREMARKET_TRADING_ENABLED (default off — the
+    #                      at-open gap-and-go eval is the pre-market strategy).
+    # afterhours         → full pipeline in the extended regime when enabled:
+    #                      this is where FDA/guidance catalysts actually print.
+    # overnight / closed → nothing. Blue Ocean is invisible to our data
+    #                      providers; no bars → no confirmation → no trade.
+    session = get_trading_session()
+
+    if session == "premarket" and in_premarket_window():
+        logger.info("Pre-market window — scanning for overnight catalysts")
+        try:
+            premarket_scan()
+        except Exception as exc:
+            logger.error("premarket_scan failed: %s", exc, exc_info=True)
+
+    if not is_entry_session(session):
+        if session != "premarket":
+            logger.info("No entries in session=%s — skipping cycle", session)
         return
 
-    if is_too_late_to_buy():
+    if is_too_late_to_buy(session):
         logger.info(
-            "Too close to market close to open new positions (time_stop=%d min) — skipping cycle",
-            cfg.time_stop_minutes,
+            "Too close to the %s session's hard exit boundary to open new "
+            "positions (time_stop=%d min) — skipping cycle",
+            session, cfg.time_stop_minutes,
         )
         return
 
@@ -555,8 +594,12 @@ def news_cycle() -> None:
         return
 
     # ── 1. Pre-market candidates (first 30 min after open only) ──────────────
+    # Regular session only: the gap-and-go evaluation is anchored to the
+    # 09:30 open. In extended sessions there is nothing here to evaluate.
     try:
-        approved, graduated = evaluate_premarket_candidates()
+        approved, graduated = (
+            evaluate_premarket_candidates() if session == REGULAR else ([], [])
+        )
         for cand, conf in approved:
             if was_recently_traded(cand["ticker"]):
                 update_premarket_candidate(cand["id"], "rejected", "24h ticker cooldown")
@@ -778,7 +821,9 @@ def portfolio_snapshot() -> None:
     (save_snapshot() existed since v1 but nothing ever called it — the
     Grafana panel was empty from day one.)
     """
-    if not is_market_open():
+    # v21: snapshot during extended sessions too — with 24/5 positions the
+    # portfolio value moves outside RTH.
+    if get_trading_session() not in ("regular", "premarket", "afterhours"):
         return
     try:
         summary = get_account_summary()

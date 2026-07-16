@@ -31,6 +31,15 @@ _T212_LIVE = "https://live.trading212.com/api/v0"
 # so "SUNE_US_EQ" 404s while the instrument lives as "JCS_US_EQ".
 # Built once at startup from the instruments metadata endpoint.
 _symbol_to_t212: dict[str, str] = {}
+
+# ── Extended-hours limit-order capability latch (v21) ─────────────────────────
+# T212's public API documents `extendedHours` on MARKET orders; community
+# reports say the LIMIT endpoint rejects it with HTTP 400 ("Invalid payload").
+# The API is in beta and this may change, so instead of hardcoding the
+# limitation we feature-detect: the first extended-session limit sell tries
+# the flag; a 400 latches False for the rest of the process (a restart
+# re-probes, picking up any T212-side improvement). None = untested.
+_extended_limit_supported: bool | None = None
 # Inverse of the above (T212 code → exchange shortName), rebuilt together with
 # it. Used by t212_to_symbol() so price checks query the real exchange symbol.
 _t212_to_symbol: dict[str, str] = {}
@@ -370,6 +379,7 @@ def calculate_quantity(
     ticker: str,
     price: float,
     avg_dollar_volume: float | None = None,
+    size_factor: float = 1.0,
 ) -> tuple[float | None, str | None]:
     """
     Risk-based position sizing. Returns (quantity, error_reason).
@@ -435,7 +445,9 @@ def calculate_quantity(
         adv_cap_gbp = (avg_dollar_volume * (cfg.max_adv_participation_pct / 100)) / fx
         constraints.append(adv_cap_gbp)
 
-    max_spend_gbp = min(constraints)
+    # v21: extended-session entries are scaled down (default 0.5×) — the loss
+    # side is polled out there (no resting stop), so risk is cut at sizing.
+    max_spend_gbp = min(constraints) * max(0.0, min(1.0, size_factor))
     if max_spend_gbp <= 0:
         return None, "position size computed as zero"
 
@@ -568,16 +580,34 @@ def place_stop_loss(ticker: str, quantity: float, stop_price: float) -> str | No
         return None
 
 
-def buy(ticker: str, price: float, avg_dollar_volume: float | None = None) -> OrderResult:
-    quantity, err = calculate_quantity(ticker, price, avg_dollar_volume)
+def buy(
+    ticker: str,
+    price: float,
+    avg_dollar_volume: float | None = None,
+    extended: bool = False,
+) -> OrderResult:
+    """
+    Market buy. `extended=True` (v21) routes the order into T212's extended
+    sessions (`extendedHours` flag — supported on market orders), sizes it at
+    cfg.extended_size_factor, and VERIFIES the fill: an extended-hours order
+    that doesn't fill promptly is queued (instrument not 24/5-eligible, or a
+    book too thin to cross) — it is cancelled rather than left to execute
+    blind at some future price, and the buy reports failure.
+    """
+    size_factor = cfg.extended_size_factor if extended else 1.0
+    quantity, err = calculate_quantity(ticker, price, avg_dollar_volume, size_factor)
     if quantity is None:
         return OrderResult(
             success=False, ticker=ticker, quantity=0,
             price=price, order_id=None, error=err or "Could not calculate position size",
         )
 
+    payload: dict = {"quantity": quantity, "ticker": ticker}
+    if extended:
+        payload["extendedHours"] = True
+
     try:
-        order = _post("/equity/orders/market", {"quantity": quantity, "ticker": ticker})
+        order = _post("/equity/orders/market", payload)
     except Exception as exc:
         exc_str = str(exc)
         # T212 rejects orders when our quantity has more decimal places than the
@@ -623,7 +653,8 @@ def buy(ticker: str, price: float, avg_dollar_volume: float | None = None) -> Or
                     "Retrying BUY %s with precision=%d → quantity=%s",
                     ticker, allowed, quantity,
                 )
-                order = _post("/equity/orders/market", {"quantity": quantity, "ticker": ticker})
+                payload["quantity"] = quantity
+                order = _post("/equity/orders/market", payload)
             except Exception as retry_exc:
                 logger.error("BUY failed for %s after precision retry: %s", ticker, retry_exc)
                 return OrderResult(
@@ -640,6 +671,44 @@ def buy(ticker: str, price: float, avg_dollar_volume: float | None = None) -> Or
     try:
         order_id = str(order.get("id", ""))
         fill = _fetch_fill(order_id)
+
+        # ── Extended-hours fill verification (v21) ───────────────────────────
+        # In RTH a market order's fill is a certainty and a missing fill dict
+        # is just slow bookkeeping. Extended-hours market orders can instead
+        # sit QUEUED (instrument not 24/5-eligible → T212 parks the order for
+        # the next RTH open; or no crossable liquidity). A queued buy filling
+        # blind at tomorrow's open is exactly the "gap-and-crap at auction
+        # price" trap this system refuses by design — cancel it and fail the
+        # entry rather than own an unconfirmed fill.
+        if extended and fill is None:
+            status = get_order_status(order_id)
+            if status not in ("FILLED", "GONE"):
+                if cancel_order(order_id):
+                    logger.warning(
+                        "BUY [%s] extended-hours order %s unfilled (status=%s) — "
+                        "cancelled; instrument may not be 24/5-eligible",
+                        ticker, order_id, status,
+                    )
+                    return OrderResult(
+                        success=False, ticker=ticker, quantity=quantity,
+                        price=price, order_id=order_id,
+                        error=f"extended-hours buy unfilled (status={status}) — cancelled",
+                    )
+                # Cancel failed — re-check for the cancel/fill race before
+                # deciding anything.
+                status = get_order_status(order_id)
+                if status not in ("FILLED", "GONE"):
+                    return OrderResult(
+                        success=False, ticker=ticker, quantity=quantity,
+                        price=price, order_id=order_id,
+                        error=(
+                            f"extended-hours buy in unresolved state ({status}) — "
+                            "cancel failed; manual broker check required"
+                        ),
+                    )
+            # Filled/gone after all — pick up the fill details now.
+            fill = _fetch_fill(order_id)
+
         filled_price, net_gbp, fx_rate, fees_gbp = _parse_fill(fill)
         actual_price = filled_price if filled_price is not None else price
         # Fill-vs-signal sanity check. A large gap means the quote that
@@ -674,7 +743,15 @@ def buy(ticker: str, price: float, avg_dollar_volume: float | None = None) -> Or
         )
 
 
-def sell(ticker: str, quantity: float, price: float, reason: str, *, force_market: bool = False) -> OrderResult:
+def sell(
+    ticker: str,
+    quantity: float,
+    price: float,
+    reason: str,
+    *,
+    force_market: bool = False,
+    extended: bool = False,
+) -> OrderResult:
     """
     Close a position with BOUNDED slippage.
 
@@ -699,31 +776,64 @@ def sell(ticker: str, quantity: float, price: float, reason: str, *, force_marke
         cancelling) → re-check status; if FILLED treat as success.
       - Limit placement itself rejected → fall back to a market order.
         An exit we can always execute matters more than slippage protection.
+
+    extended=True (v21): the order carries T212's `extendedHours` flag so it
+    executes on the extended tape. The bounded-limit attempt is kept IF the
+    API accepts the flag on limit orders (feature-detected once per process —
+    see _extended_limit_supported); otherwise the sell goes straight to a
+    market order. Extended MARKET sells do NOT assume a fill the way RTH
+    market sells do: the thin extended book can leave even a market order
+    pending, so the status poll runs for them too, and an unfilled order is
+    cancelled for the monitor to retry — never left queued into a session we
+    can't see.
     """
+    global _extended_limit_supported
     limit_price = _round_price(price * (1 - cfg.sell_limit_slack_pct / 100))
     order_id: str | None = None
     used_market_fallback = force_market or reason == "eod_flatten"
+    if extended and _extended_limit_supported is False:
+        used_market_fallback = True  # limit+extendedHours known-rejected; skip the dead attempt
+    market_payload: dict = {"quantity": -quantity, "ticker": ticker}
+    if extended:
+        market_payload["extendedHours"] = True
     try:
         if used_market_fallback:
-            order = _post("/equity/orders/market", {"quantity": -quantity, "ticker": ticker})
+            order = _post("/equity/orders/market", market_payload)
             order_id = str(order.get("id", ""))
         else:
             try:
-                order = _post("/equity/orders/limit", {
+                limit_payload = {
                     "quantity": -quantity,
                     "ticker": ticker,
                     "limitPrice": limit_price,
                     "timeValidity": "DAY",
-                })
+                }
+                if extended:
+                    limit_payload["extendedHours"] = True
+                order = _post("/equity/orders/limit", limit_payload)
                 order_id = str(order.get("id", ""))
+                if extended and _extended_limit_supported is None:
+                    _extended_limit_supported = True
+                    logger.info(
+                        "T212 accepted extendedHours on a limit order — bounded-"
+                        "slippage exits available in extended sessions",
+                    )
             except Exception as limit_exc:
-                # Limit rejected (precision, instrument restrictions, ...) —
-                # fall back to market so the position is never stuck unmanaged.
+                # Limit rejected (precision, instrument restrictions, or the
+                # extendedHours flag on the limit endpoint) — fall back to
+                # market so the position is never stuck unmanaged.
+                if extended and _extended_limit_supported is None and "HTTP 400" in str(limit_exc):
+                    _extended_limit_supported = False
+                    logger.warning(
+                        "T212 rejected extendedHours on a limit order (HTTP 400) — "
+                        "extended-session exits will use market orders for the "
+                        "rest of this process",
+                    )
                 logger.warning(
                     "SELL limit placement failed for %s (%s) — falling back to market order",
                     ticker, limit_exc,
                 )
-                order = _post("/equity/orders/market", {"quantity": -quantity, "ticker": ticker})
+                order = _post("/equity/orders/market", market_payload)
                 order_id = str(order.get("id", ""))
                 used_market_fallback = True
 
@@ -735,8 +845,12 @@ def sell(ticker: str, quantity: float, price: float, reason: str, *, force_marke
 
         # ── Wait for the fill ────────────────────────────────────────────────
         # Poll status first (fast, definitive), then fetch fill details.
-        filled = used_market_fallback  # market orders: assume fill, fetch details
-        if not used_market_fallback:
+        # RTH market orders: assume fill, fetch details. Everything else —
+        # limit orders, and ANY extended-session order (v21) — must be seen
+        # to fill: the extended book can leave even a market order pending.
+        assume_filled = used_market_fallback and not extended
+        filled = assume_filled
+        if not assume_filled:
             for _ in range(10):  # up to ~20s
                 time.sleep(2)
                 status = get_order_status(order_id)
@@ -750,16 +864,18 @@ def sell(ticker: str, quantity: float, price: float, reason: str, *, force_marke
                     return OrderResult(
                         success=False, ticker=ticker, quantity=quantity,
                         price=price, order_id=order_id,
-                        error=f"limit sell {status}",
+                        error=f"{'market' if used_market_fallback else 'limit'} sell {status}",
                     )
 
         if not filled:
             # Book never reached our limit — cancel and let the monitor retry.
             if cancel_order(order_id):
                 logger.warning(
-                    "SELL [%s] limit $%.4f unfilled after 20s — cancelled, monitor "
+                    "SELL [%s] %s unfilled after 20s — cancelled, monitor "
                     "will retry next cycle at current price",
-                    ticker, limit_price,
+                    ticker,
+                    "market (extended)" if used_market_fallback
+                    else f"limit ${limit_price:.4f}",
                 )
                 return OrderResult(
                     success=False, ticker=ticker, quantity=quantity,

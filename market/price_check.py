@@ -85,11 +85,15 @@ import time
 import requests
 import pandas as pd
 import pandas_market_calendars as mcal
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 import pytz
 from config.settings import cfg
 from market.finnhub_bars import get_finnhub_quote
+from market.sessions import (
+    get_trading_session, session_bounds, minutes_until_session_end,
+    EXTENDED_SESSIONS, REGULAR, AFTERHOURS, PREMARKET,
+)
 from market.twelvedata_bars import (
     get_twelvedata_quote, get_session_analysis, get_daily_stats,
 )
@@ -300,12 +304,31 @@ def minutes_until_close() -> float | None:
         return None
 
 
-def is_too_late_to_buy() -> bool:
+def is_too_late_to_buy(session: str = REGULAR) -> bool:
     """
-    Return True if we are within TIME_STOP_MINUTES of today's market close.
-    Uses the calendar's actual close time so early-close days are handled correctly.
-    Returns False outside of market hours — is_market_open() handles that.
+    Return True if it is too close to the current session's hard exit
+    boundary to open a new position.
+
+    regular    — within TIME_STOP_MINUTES of today's close (calendar-aware,
+                 so early-close days are handled correctly).
+    afterhours — within TIME_STOP_MINUTES of the extended flatten time
+                 (session end − EXTENDED_FLATTEN_BUFFER_MINUTES): a position
+                 opened later could neither run its time stop nor be exited
+                 on a venue we can see (overnight = Blue Ocean, no data).
+    premarket  — never too late: positions carry into RTH, where the time
+                 stop and the EOD flatten manage them normally.
+
+    Returns False outside the named session — the session gate in
+    main.news_cycle handles that.
     """
+    if session == PREMARKET:
+        return False
+    if session == AFTERHOURS:
+        mins_left = minutes_until_session_end(AFTERHOURS)
+        if mins_left is None:
+            return False
+        tradeable_left = mins_left - cfg.extended_flatten_buffer_minutes
+        return tradeable_left <= cfg.time_stop_minutes
     try:
         now_utc = pd.Timestamp.now("UTC")
         today = now_utc.strftime("%Y-%m-%d")
@@ -392,6 +415,10 @@ class PriceConfirmation:
     # exhausted_bounce | insufficient_data | no_price_data
     reason_code: str
     vwap: float | None = None       # session VWAP at confirmation (v15)
+    session: str = REGULAR          # trading session at confirmation (v21) —
+                                    # drives extended-hours order routing,
+                                    # half-sizing and the no-resting-stop
+                                    # regime downstream
 
 
 def _reject(base: dict, code: str, reason: str) -> "PriceConfirmation":
@@ -434,6 +461,17 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
     """
     symbol = _to_yf_ticker(t212_ticker)
 
+    # ── Session context (v21) ─────────────────────────────────────────────────
+    # Extended sessions (premarket/afterhours) run a stricter gate variant:
+    # session-anchored bars, no RVOL band (RTH curve doesn't apply), higher
+    # liquidity floor, tighter spread. Overnight never reaches this function
+    # (main.news_cycle gates on session), but if it somehow did, the anchored
+    # bar pull would return nothing and the signal would defer — fail closed.
+    session = get_trading_session()
+    extended = session in EXTENDED_SESSIONS
+    bounds = session_bounds(session) if extended else None
+    anchor_utc = bounds[0] if bounds else None
+
     try:
         # ── Current price + previous close (Finnhub → Twelvedata fallback) ──
         quote = get_quote_with_fallback(symbol, fast=fast)
@@ -455,12 +493,17 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         quote_prev_close = float(quote.get("pc") or 0) or None
         day_move_pct = ((current_price - open_price) / open_price) * 100
 
-        # ── Time since open ───────────────────────────────────────────────────
+        # ── Time since session start ─────────────────────────────────────────
         now_et = datetime.now(_ET)
-        market_open_et = now_et.replace(
-            hour=_MARKET_OPEN[0], minute=_MARKET_OPEN[1], second=0, microsecond=0
-        )
-        minutes_since_open = (now_et - market_open_et).total_seconds() / 60
+        if extended and anchor_utc is not None:
+            minutes_since_open = (
+                datetime.now(timezone.utc) - anchor_utc
+            ).total_seconds() / 60
+        else:
+            market_open_et = now_et.replace(
+                hour=_MARKET_OPEN[0], minute=_MARKET_OPEN[1], second=0, microsecond=0
+            )
+            minutes_since_open = (now_et - market_open_et).total_seconds() / 60
 
         # Template for every PriceConfirmation built before later data arrives.
         base = dict(
@@ -470,15 +513,20 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             day_move_pct=day_move_pct, day_change_pct=None,
             recent_move_pct=0.0, current_volume=0, avg_volume=0,
             rvol=0.0, avg_dollar_volume=None, spread_proxy_pct=None,
+            session=session,
         )
 
         # ── 1. Opening block ─────────────────────────────────────────────────
         # Costs nothing to check; rejects before any Twelvedata credit is spent.
+        # Applies at every session boundary: the 09:30 opening auction AND the
+        # first minutes after 16:00, where closing-auction unwind and MOC spill
+        # print noise that looks like momentum.
         if minutes_since_open < cfg.open_block_minutes:
             return _reject(
                 base, "opening_block",
-                f"Opening auction block: {minutes_since_open:.1f} min since open "
-                f"(block lasts {cfg.open_block_minutes} min to avoid auction noise)",
+                f"Session-start block: {minutes_since_open:.1f} min since "
+                f"{session} session start (block lasts {cfg.open_block_minutes} "
+                f"min to avoid auction/boundary noise)",
             )
 
         # ── 2. Penny stock floor ─────────────────────────────────────────────
@@ -494,13 +542,52 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         # low/high all come from the same 390-bar series. The old plan fetched
         # them across three sequential calls (2-3 credits + round trips per
         # confirmation, re-paid on every re-eval retry).
-        sa = get_session_analysis(symbol, fast=fast)
+        # v21: extended sessions pull prepost bars ANCHORED at the session
+        # start, so every aggregate measures the post-boundary regime only —
+        # for an after-hours catalyst the accumulation test runs against the
+        # after-hours VWAP, not a full-day VWAP dominated by pre-news RTH tape.
+        sa = get_session_analysis(
+            symbol, fast=fast, include_extended=extended, anchor_utc=anchor_utc,
+        )
 
         past_price = sa.past_price if sa else None
         spread_proxy_pct = sa.spread_proxy_pct if sa else None
         base["spread_proxy_pct"] = spread_proxy_pct
 
+        # ── Extended-session price freshness (v21) ───────────────────────────
+        # Outside RTH the quote sources update irregularly (Finnhub can serve
+        # the 16:00 official close for minutes after a catalyst starts moving
+        # the extended tape). When the newest anchored bar is FRESHER than the
+        # quote's own data timestamp, the bar close is the better "now" price.
+        if extended and sa is not None and sa.last_price and sa.newest_bar_utc:
+            quote_ts = quote.get("t")
+            bar_epoch = sa.newest_bar_utc.timestamp()
+            if not quote_ts or bar_epoch > float(quote_ts):
+                logger.info(
+                    "Price check [%s]: %s bar close %.4f is fresher than the "
+                    "quote (%.4f) — using bar price",
+                    symbol, session, sa.last_price, current_price,
+                )
+                current_price = sa.last_price
+                base["current_price"] = current_price
+                base["day_move_pct"] = (
+                    ((current_price - open_price) / open_price) * 100
+                    if open_price else 0.0
+                )
+
         if past_price is None:
+            if extended:
+                # No open-auction price exists as a fallback baseline in an
+                # extended session, and a catalyst that is genuinely moving
+                # the extended tape prints bars within minutes. Defer — the
+                # retry/re-eval queues are the retry.
+                logger.info(
+                    "Price check [%s]: no %s-session momentum window yet — "
+                    "deferring (bars will exist within minutes if the "
+                    "catalyst is real)",
+                    symbol, session,
+                )
+                return None
             # Early-session fallback: not enough today-bars for a momentum
             # window in the first ~15 min; the official open is a fair baseline.
             if minutes_since_open < 15 and open_price and open_price > 0:
@@ -522,12 +609,15 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
 
         # ── 3. Spread proxy ──────────────────────────────────────────────────
         # No bid/ask feed on our data plan, so the latest 1-min bar's range is
-        # the proxy. Permissive default — only the truly untradeable get cut.
-        if spread_proxy_pct is not None and spread_proxy_pct > cfg.max_spread_pct:
+        # the proxy. Permissive default in RTH — only the truly untradeable get
+        # cut. Extended sessions use the tighter ceiling: a wide extended-hours
+        # bar is the thin-book signature, and every exit out here is polled.
+        spread_ceiling = cfg.extended_max_spread_pct if extended else cfg.max_spread_pct
+        if spread_proxy_pct is not None and spread_proxy_pct > spread_ceiling:
             return _reject(
                 base, "wide_spread",
                 f"Spread proxy {spread_proxy_pct:.2f}% (last bar range) exceeds "
-                f"{cfg.max_spread_pct}% — effective spread would eat the edge",
+                f"{spread_ceiling}% ({session}) — effective spread would eat the edge",
             )
 
         # ── Daily stats: ADV + prev close (cached per symbol per day) ────────
@@ -601,11 +691,18 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             )
 
         # ── 6. Liquidity floor (ADV-based) ───────────────────────────────────
-        if avg_dollar_volume is not None and avg_dollar_volume < cfg.min_daily_dollar_volume:
+        # Extended sessions demand the institutional-depth floor: the tape is
+        # a fraction of RTH depth, every exit is polled (no resting stop), so
+        # only names whose NORMAL book is enormous are worth touching.
+        liquidity_floor = (
+            max(cfg.min_daily_dollar_volume, cfg.extended_min_adv_dollar)
+            if extended else cfg.min_daily_dollar_volume
+        )
+        if avg_dollar_volume is not None and avg_dollar_volume < liquidity_floor:
             return _reject(
                 base, "illiquid",
                 f"Liquidity filter: avg daily dollar volume ${avg_dollar_volume:,.0f} "
-                f"< ${cfg.min_daily_dollar_volume:,.0f} — normal book too thin for a "
+                f"< ${liquidity_floor:,.0f} ({session}) — normal book too thin for a "
                 f"clean exit",
             )
 
@@ -652,7 +749,23 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         vwap = sa.vwap if sa else None
         if vwap is not None and vwap > 0:
             base["vwap"] = vwap
-        if avg_daily_volume and avg_daily_volume > 0 and volume_measured:
+        if extended:
+            # RVOL's time-of-day curve is calibrated on the RTH volume shape —
+            # at 17:00 it has no meaning. The extended participation test is
+            # ABSOLUTE: dollars actually printed in this session since its
+            # start. Transient (low_volume) — the re-eval queue re-checks as
+            # the post-catalyst tape builds.
+            if volume_measured:
+                session_dollars = current_volume * current_price
+                if session_dollars < cfg.extended_min_session_dollar_volume:
+                    return _reject(
+                        base, "low_volume",
+                        f"{session} session has printed only "
+                        f"${session_dollars:,.0f} since the session start "
+                        f"(< ${cfg.extended_min_session_dollar_volume:,.0f}) — "
+                        f"no real extended-hours participation yet",
+                    )
+        elif avg_daily_volume and avg_daily_volume > 0 and volume_measured:
             if rvol < cfg.min_rvol:
                 # Size-neutral bypass (v20.2): a mega/large-cap doesn't need
                 # anomalous RELATIVE volume to make a real move — its normal
@@ -799,17 +912,21 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
 
         # ── All conditions met — signal confirmed ─────────────────────────────
         adv_str = f" | adv$={avg_dollar_volume:,.0f}" if avg_dollar_volume else ""
+        participation_str = (
+            f"| {session} ${current_volume * current_price:,.0f} printed "
+            if extended else f"| RVOL {rvol:.1f} "
+        )
         reason = (
             f"+{recent_move_pct:.2f}% in ~{cfg.momentum_lookback_minutes} min "
-            f"| RVOL {rvol:.1f} "
+            f"{participation_str}"
             f"| day {day_change_pct:+.2f}% vs prev close"
             f"{adv_str}"
         ) if day_change_pct is not None else (
-            f"+{recent_move_pct:.2f}% | RVOL {rvol:.1f}{adv_str}"
+            f"+{recent_move_pct:.2f}% {participation_str}{adv_str}"
         )
         logger.info(
-            "Price check [%s]: recent=%+.2f%% day_chg=%s rvol=%.1f adv$=%s — APPROVED",
-            symbol, recent_move_pct,
+            "Price check [%s]: session=%s recent=%+.2f%% day_chg=%s rvol=%.1f adv$=%s — APPROVED",
+            symbol, session, recent_move_pct,
             f"{day_change_pct:+.2f}%" if day_change_pct is not None else "n/a",
             rvol,
             f"${avg_dollar_volume:,.0f}" if avg_dollar_volume else "n/a",
@@ -843,6 +960,12 @@ def get_current_price(t212_ticker: str) -> float | None:
     Returns None if all are unavailable — callers must handle this explicitly.
     """
     symbol = _to_yf_ticker(t212_ticker)
+    # v21: outside RTH the position monitor still needs live prices. The
+    # quote chain is tried first regardless (its staleness guard rejects a
+    # frozen 16:00 close); the bars fallback must pull prepost bars in an
+    # extended session or it would return the RTH close as "current".
+    session = get_trading_session()
+    extended = session in EXTENDED_SESSIONS
     quote = get_quote_with_fallback(symbol, fast=True)
     if quote is not None:
         price = float(quote["c"])
@@ -853,7 +976,7 @@ def get_current_price(t212_ticker: str) -> float | None:
         return None
     _last_bars_fallback[symbol] = now
     try:
-        sa = get_session_analysis(symbol, fast=True)
+        sa = get_session_analysis(symbol, fast=True, include_extended=extended)
         if sa is not None and sa.last_price is not None:
             logger.warning(
                 "get_current_price [%s]: quotes unavailable — using Twelvedata bar close %.4f",

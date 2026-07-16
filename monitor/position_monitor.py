@@ -38,6 +38,15 @@ Exit architecture (v20 — INVERTED from v14):
   don't work overnight, and one earnings gap through a held position can
   erase a month of wins.
 
+  EXTENDED SESSIONS (v21) — with cfg.extended_hours_enabled, positions are
+  also managed through premarket/after-hours: sells carry the extendedHours
+  flag (market-first — see executor._extended_limit_supported) and VERIFY
+  their fill, the ratchet arms the polled breakeven only, and everything is
+  force-closed cfg.extended_flatten_buffer_minutes before 20:00 ET — the
+  overnight session runs on Blue Ocean, which our data providers don't
+  carry, so nothing may be held past it. Extended entries have NO resting
+  stop (T212 stops execute RTH-only): the monitor polls BOTH sides.
+
   LEGACY (pre-v20) trades that still carry a resting TP (tp_order_id) are
   managed under the old rules until they close — both regimes coexist
   during the deploy transition.
@@ -54,7 +63,11 @@ import logging
 import time as _time
 from datetime import datetime, timezone
 import pytz
-from market.price_check import get_current_price, is_market_open, minutes_until_close
+from market.price_check import get_current_price, minutes_until_close
+from market.sessions import (
+    get_trading_session, minutes_until_session_end, is_manage_session,
+    REGULAR, AFTERHOURS,
+)
 from trading.executor import (
     sell, get_order_status, cancel_order, _fetch_fill, _parse_fill,
     get_broker_positions, place_stop_loss,
@@ -358,7 +371,9 @@ def _cancel_resting_before_sell(trade: dict) -> bool:
     return False
 
 
-def _maybe_ratchet_stop(trade: dict, current_price: float | None) -> None:
+def _maybe_ratchet_stop(
+    trade: dict, current_price: float | None, allow_resting: bool = True
+) -> None:
     """
     Move the resting stop to breakeven once the position is up
     cfg.ratchet_trigger_pct — once per trade.
@@ -418,7 +433,13 @@ def _maybe_ratchet_stop(trade: dict, current_price: float | None) -> None:
                 )
                 return
 
-    new_order_id = place_stop_loss(trade["ticker"], trade["quantity"], breakeven)
+    # v21: outside RTH a stop order would not execute until the next regular
+    # session — placing one is worse than useless (it reserves the shares the
+    # polled exit needs). allow_resting=False arms the POLLED breakeven only.
+    new_order_id = (
+        place_stop_loss(trade["ticker"], trade["quantity"], breakeven)
+        if allow_resting else None
+    )
     if new_order_id:
         try:
             set_stop_order_id(trade_id, new_order_id)
@@ -432,11 +453,18 @@ def _maybe_ratchet_stop(trade: dict, current_price: float | None) -> None:
             cancel_order(new_order_id)
             new_order_id = None
     if not new_order_id:
-        logger.error(
-            "Monitor [%s] trade=%d: breakeven stop placement FAILED — falling back "
-            "to POLLED breakeven stop",
-            trade["ticker"], trade_id,
-        )
+        if allow_resting:
+            logger.error(
+                "Monitor [%s] trade=%d: breakeven stop placement FAILED — falling back "
+                "to POLLED breakeven stop",
+                trade["ticker"], trade_id,
+            )
+        else:
+            logger.info(
+                "Monitor [%s] trade=%d: extended session — breakeven ratchet armed "
+                "as a POLLED stop (resting stops don't execute out here)",
+                trade["ticker"], trade_id,
+            )
     # Arm LAST, and durably: from here the polled threshold is breakeven even
     # across restarts, whether or not the resting re-place succeeded.
     try:
@@ -523,26 +551,54 @@ def monitor_positions() -> None:
     # error would make every DB-open trade look like a phantom).
     _reconcile_positions(open_trades)
 
-    # ── Market-hours guard ────────────────────────────────────────────────────
-    # Selling into a closed market queues orders blind into the next open.
-    # With the EOD flatten below this should never trigger; if it does, shout.
-    if not is_market_open():
+    # ── Session guard (v21) ──────────────────────────────────────────────────
+    # Positions are managed in regular hours and — when the master 24/5
+    # switch is on — in the premarket/afterhours sessions too (extended
+    # sells carry the extendedHours flag). Selling into overnight/closed
+    # would queue orders blind into a venue we can't see; with the flatten
+    # logic below this should never trigger — if it does, shout.
+    session = get_trading_session()
+    if not is_manage_session(session):
         logger.error(
-            "monitor_positions: %d position(s) OPEN while market is CLOSED — "
-            "EOD flatten was missed (service down at close?). Positions carry "
-            "overnight gap risk and will be closed at the next open.",
-            len(open_trades),
+            "monitor_positions: %d position(s) OPEN in session=%s — the "
+            "flatten was missed (service down at the boundary?). Positions "
+            "carry unmonitored gap risk and will be closed when a manageable "
+            "session next opens.",
+            len(open_trades), session,
         )
         return
+    extended_session = session != REGULAR
 
-    # ── EOD flatten window? ───────────────────────────────────────────────────
-    mins_to_close = minutes_until_close()
-    eod_flatten = mins_to_close is not None and mins_to_close <= cfg.eod_flatten_minutes
-    if eod_flatten:
-        logger.info(
-            "── EOD flatten: %.1f min to close — force-closing %d position(s) ──",
-            mins_to_close, len(open_trades),
+    # ── Flatten window? ──────────────────────────────────────────────────────
+    # Regular hours: EOD flatten before the bell (resting stops die at the
+    # close; overnight gaps are uncapped). After-hours (v21): flatten before
+    # the 20:00 handoff to the overnight session — Blue Ocean prices are
+    # invisible to both data providers, so nothing may be held past it.
+    # Premarket positions carry into RTH (data and management are continuous).
+    flatten_now = False
+    flatten_reason = "eod_flatten"
+    if session == REGULAR:
+        mins_to_close = minutes_until_close()
+        flatten_now = mins_to_close is not None and mins_to_close <= cfg.eod_flatten_minutes
+        if flatten_now:
+            logger.info(
+                "── EOD flatten: %.1f min to close — force-closing %d position(s) ──",
+                mins_to_close, len(open_trades),
+            )
+    elif session == AFTERHOURS:
+        mins_left = minutes_until_session_end(AFTERHOURS)
+        flatten_now = (
+            mins_left is not None
+            and mins_left <= cfg.extended_flatten_buffer_minutes
         )
+        if flatten_now:
+            flatten_reason = "afterhours_flatten"
+            logger.info(
+                "── After-hours flatten: %.1f min to the overnight handoff — "
+                "force-closing %d position(s) (no data coverage past 20:00 ET) ──",
+                mins_left, len(open_trades),
+            )
+    eod_flatten = flatten_now
 
     logger.info(
         "── Position monitor: %d open position(s) ──────────────────",
@@ -616,7 +672,7 @@ def monitor_positions() -> None:
 
         # ── 2. Decide whether to exit ────────────────────────────────────────
         if eod_flatten:
-            should_exit, reason = True, "eod_flatten"
+            should_exit, reason = True, flatten_reason
             current_price = get_current_price(ticker) or buy_price
         else:
             try:
@@ -640,7 +696,7 @@ def monitor_positions() -> None:
             # the ratchet's cancel and re-place — it places a fresh breakeven
             # stop directly.
             try:
-                _maybe_ratchet_stop(trade, current_price)
+                _maybe_ratchet_stop(trade, current_price, allow_resting=not extended_session)
             except Exception as exc:
                 logger.error(
                     "monitor_positions: ratchet failed for trade %d (%s): %s",
@@ -676,7 +732,8 @@ def monitor_positions() -> None:
         try:
             result = sell(
                 ticker, quantity, sell_price, reason,
-                force_market=(reason == "eod_flatten" or escalate),
+                force_market=(reason in ("eod_flatten", "afterhours_flatten") or escalate),
+                extended=extended_session,
             )
         except Exception as exc:
             logger.error(

@@ -7,6 +7,70 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21 — 2026-07-16 (24/5 extended-hours trading)
+
+The user enabled T212's 24/5 trading on the account. v21 accommodates it —
+selectively. The four T212 sessions (ET): premarket 04:00–09:30, regular
+09:30–16:00, after-hours 16:00–20:00, overnight 20:00–04:00 (Blue Ocean).
+
+### What is traded and what is not
+- **After-hours (ON by default)** — the prize. FDA decisions and guidance
+  raises overwhelmingly print 16:00–17:30 ET; the system used to sleep
+  through all of them (the article was >3 min stale by the next morning and
+  the premarket scanner only looks back so far). `news_cycle` now runs the
+  full pipeline through the after-hours session.
+- **Pre-market direct entries (OFF by default)** — the existing scanner +
+  at-open gap-and-go evaluation stays the pre-market strategy; 4am books are
+  thin and the at-open path trades the same news with confirmation.
+  `PREMARKET_TRADING_ENABLED=true` turns direct entries on if evidence ever
+  supports it.
+- **Overnight (NEVER)** — Blue Ocean prices are not carried by Finnhub or
+  Twelvedata. No bars → no confirmation → no trade (the standing fail-closed
+  contract), and the monitor force-flattens everything by 19:45 ET
+  (`EXTENDED_FLATTEN_BUFFER_MINUTES`) so nothing is ever held into a venue we
+  cannot see.
+
+### The extended-hours regime (all in market/sessions.py + gate variants)
+Extended sessions are a DIFFERENT market and get a stricter gate set:
+- **Session-anchored analysis** — one prepost 1-min pull anchored at the
+  session boundary. VWAP/momentum/exhaustion all measure the post-catalyst
+  regime only: for a 16:05 guidance raise the accumulation test runs against
+  the after-hours VWAP (a full-day VWAP is dominated by pre-news RTH tape and
+  would auto-reject every legitimate after-hours mover as overextended).
+- **RVOL band replaced** by an absolute participation floor
+  (`EXTENDED_MIN_SESSION_DOLLAR_VOLUME`, $500k printed in-session): the RVOL
+  time-of-day curve is calibrated on RTH volume shape and means nothing at
+  17:00. Transient reject — the re-eval queue re-checks as the tape builds.
+- **Institutional-depth only**: ADV$ ≥ `EXTENDED_MIN_ADV_DOLLAR` ($50M).
+- **Tighter spread proxy** (`EXTENDED_MAX_SPREAD_PCT` 1.5 vs 3.0).
+- **Half size** (`EXTENDED_SIZE_FACTOR` 0.5).
+- **No resting stop**: T212 stop orders execute in RTH only, and the public
+  API accepts `extendedHours` on MARKET orders only (community-reported; the
+  executor feature-detects per process — `_extended_limit_supported` — so if
+  T212 ever accepts the flag on limit orders, bounded-slippage exits come
+  back automatically). The monitor polls BOTH sides at its 5s cadence.
+  Extended market sells verify their fill (a queued sell is cancelled and
+  retried, never left to execute blind); extended buys that don't fill
+  promptly are cancelled — a queued buy filling at the next open would be the
+  gap-and-crap trap with extra steps.
+- **Session-start block**: the same 5-min opening block applies after 16:00
+  (closing-auction unwind noise).
+- **Breakeven ratchet** arms the POLLED breakeven in extended sessions
+  (placing a resting stop out here would reserve shares while protecting
+  nothing).
+
+`scripts/probe_t212_extended_hours.py` verifies the T212 demo API's actual
+extendedHours support (run it on the VM; never-fill orders, cancelled
+immediately, demo only).
+
+Known residual risks, accepted deliberately: (a) the polled loss side after
+hours has up to ~5s + sell latency — mitigated by deep-book eligibility, half
+size, and the tight spread gate; (b) quote sources can briefly serve the
+16:00 close after a catalyst — confirmation uses the fresher of quote vs
+newest anchored bar, and the monitor's staleness guard rejects frozen quotes.
+
+---
+
 ## v20.2 — 2026-07-14 (zero-trade post-mortem: mega-cap RVOL bypass + regulator taxonomy)
 
 2026-07-13 (the first full session under the v20 catalyst prune) traded

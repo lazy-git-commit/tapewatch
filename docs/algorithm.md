@@ -930,3 +930,79 @@ backtest can never reproduce a stale-quote entry or a lag-rescued RVOL.
   modestly optimistic vs live.
 - **Earnings calendar awareness** — the system can currently buy a stock
   minutes before its own earnings release.
+
+## 12. 24/5 extended-hours trading (v21, `market/sessions.py`)
+
+T212's 24/5 offering splits the day into four sessions (ET): premarket
+04:00–09:30, regular 09:30–16:00, after-hours 16:00–20:00, overnight
+20:00–04:00. `market/sessions.py` classifies the current instant from the
+NYSE calendar (early closes shift the after-hours window with the close:
+13:00 close → after-hours 13:00–17:00 ET). Session policy:
+
+| Session | Entries | Why |
+|---|---|---|
+| regular | always | unchanged pre-v21 pipeline |
+| afterhours | `AFTERHOURS_TRADING_ENABLED` (default on) | FDA/guidance catalysts print 16:00–17:30; previously slept through |
+| premarket | `PREMARKET_TRADING_ENABLED` (default off) | scanner + at-open gap-and-go already trades this news with confirmation; 4am books are thin |
+| overnight | never | Blue Ocean venue — no Finnhub/Twelvedata coverage; no bars → no confirmation → no trade |
+
+### The extended regime, gate by gate
+
+Extended sessions reuse the standard pipeline with these variants
+(`confirm_price_signal` branches on the session):
+
+- **Anchored session analysis** — one prepost 1-min pull (960 bars), every
+  aggregate restricted to bars at/after the session boundary. The
+  accumulation test runs against the after-hours VWAP; a full-day VWAP is
+  dominated by the pre-news RTH tape and would reject every legitimate
+  after-hours mover as `overextended` by construction.
+- **Session-start block** — the 5-min `opening_block` applies at 16:00 too
+  (closing-auction unwind noise).
+- **RVOL band → absolute participation floor** — the RVOL time-of-day curve
+  is RTH volume shape; meaningless at 17:00. Instead: dollars printed
+  in-session ≥ `EXTENDED_MIN_SESSION_DOLLAR_VOLUME` ($500k). Transient
+  (`low_volume`) — re-eval queue re-checks as the tape builds.
+- **Liquidity floor raised** to `EXTENDED_MIN_ADV_DOLLAR` ($50M ADV$): only
+  institutional-depth names, matching T212's own 24/5 eligibility universe
+  ("most liquid NYSE/NASDAQ securities").
+- **Spread proxy ceiling tightened** to `EXTENDED_MAX_SPREAD_PCT` (1.5%).
+- **No open-price momentum fallback** — there is no auction print to fall
+  back to; no anchored bars yet → defer, never confirm on a bare quote.
+- **Price freshness** — quote sources can serve the 16:00 close for minutes
+  after a catalyst; confirmation uses the fresher of the quote and the
+  newest anchored bar close.
+
+### Extended execution (why the v20 exit inversion pauses out here)
+
+T212 stop orders execute in regular hours only, and the public API accepts
+`extendedHours` on MARKET orders only (the executor feature-detects the
+limit-order case per process via `_extended_limit_supported` and will use
+bounded-slippage limit exits automatically the day T212 accepts the flag;
+`scripts/probe_t212_extended_hours.py` checks the current state on demand).
+Consequences, all deliberate:
+
+- **No resting stop on extended entries** — it would reserve the shares
+  while protecting nothing until the next RTH open. The monitor polls BOTH
+  sides at its 5s cadence — the pre-v20 regime, accepted here because the
+  eligibility gates (deep book, tight spread, half size) bound what a 5s
+  poll can cost, unlike the thin small-caps that motivated v20.
+- **Half-size entries** (`EXTENDED_SIZE_FACTOR` 0.5) — risk cut at sizing
+  since the loss side is polled.
+- **Extended buys verify their fill** — an extended-hours market order that
+  doesn't fill promptly is queued (not 24/5-eligible, or an uncrossable
+  book); it is cancelled and the entry fails, because a queued buy filling
+  at the next open is the gap-and-crap trap with extra steps.
+- **Extended sells verify their fill** — never assumed filled; unfilled →
+  cancelled → monitor retries next cycle (stuck-exit escalation unchanged).
+- **After-hours flatten** — everything force-closed
+  `EXTENDED_FLATTEN_BUFFER_MINUTES` (15) before 20:00 ET. Non-negotiable:
+  past 20:00 the tape moves on a venue we cannot see. Premarket positions
+  (if ever enabled) carry into RTH instead — data and management are
+  continuous across 09:30, and the EOD flatten covers them.
+- **Ratchet** arms the polled breakeven only (no resting re-place) in
+  extended sessions.
+
+RTH behavior is byte-for-byte unchanged when `EXTENDED_HOURS_ENABLED=false`,
+and the EOD flatten before the 16:00 bell still applies to every RTH
+position regardless — holding an RTH position into the after-hours book is a
+different (unmeasured) trade and stays out of scope.

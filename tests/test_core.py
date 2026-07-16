@@ -1639,10 +1639,10 @@ class TestPremarketGraduation:
     @patch("main.evaluate_premarket_candidates")
     @patch("main._risk_gates_pass", return_value=(True, ""))
     @patch("main.is_too_late_to_buy", return_value=False)
-    @patch("main.is_market_open", return_value=True)
+    @patch("main.get_trading_session", return_value="regular")
     @patch("main.touch_heartbeat")
     def test_news_cycle_hands_off_graduated_candidates(
-        self, _hb, _mo, _late, _gates, mock_eval, mock_exec, _traded
+        self, _hb, _session, _late, _gates, mock_eval, mock_exec, _traded
     ):
         # news_cycle must route graduated candidates through _execute_entry
         # with an unconfirmed, transient-coded PriceConfirmation so they land

@@ -294,6 +294,7 @@ def _get_time_series(
     retries: int = 3,
     retry_delay: float = 1.5,
     fast: bool = False,
+    prepost: bool = False,
 ) -> list[dict] | None:
     """
     Call Twelvedata /time_series. Returns the 'values' list (newest first) or None.
@@ -331,6 +332,11 @@ def _get_time_series(
         "outputsize": outputsize,
         "apikey": cfg.twelvedata_api_key,
     }
+    if prepost:
+        # Extended-hours bars (04:00–20:00 ET). Covers T212's premarket and
+        # after-hours sessions; the overnight session (Blue Ocean) is NOT in
+        # this feed — by design the system stays blind (and flat) there.
+        params["prepost"] = "true"
     _record_credit_use()
     attempts = 1 if fast else retries
     last_exc: Exception | None = None
@@ -575,9 +581,18 @@ class SessionAnalysis:
     last_price: float | None        # close of the newest TODAY bar
     session_low: float | None       # min(low) of today's bars
     session_high: float | None      # max(high) of today's bars
+    newest_bar_utc: datetime | None = None  # timestamp of the newest bar used
+                                    # (v21: extended-session callers compare it
+                                    # against the quote's own timestamp and use
+                                    # whichever price is fresher)
 
 
-def get_session_analysis(symbol: str, fast: bool = False) -> SessionAnalysis | None:
+def get_session_analysis(
+    symbol: str,
+    fast: bool = False,
+    include_extended: bool = False,
+    anchor_utc: datetime | None = None,
+) -> SessionAnalysis | None:
     """
     One 1-min-bars pull (1 credit) → SessionAnalysis for TODAY's session.
 
@@ -610,9 +625,25 @@ def get_session_analysis(symbol: str, fast: bool = False) -> SessionAnalysis | N
     gate: LEVI gapped −7.8% and clawed back to +2.3% by entry; endpoint
     measures couldn't see the round trip).
 
+    include_extended / anchor_utc (v21, extended-hours trading):
+      include_extended=True requests prepost bars (04:00–20:00 ET) and widens
+      the pull to 960 bars so a full extended day fits. anchor_utc, when set,
+      restricts EVERY aggregate (VWAP, volume, low/high, momentum baseline,
+      last price) to bars at/after that instant. This is what makes the
+      after-hours gates measure the POST-CATALYST regime: for a 16:05 guidance
+      raise, the accumulation test must compare price against the after-hours
+      VWAP — the full-day VWAP is dominated by the pre-news RTH tape and would
+      reject every legitimate after-hours mover as "overextended".
+
     Returns None when bar data is unavailable or today has no bars yet.
     """
-    values = _get_time_series(symbol, interval="1min", outputsize=390, fast=fast)
+    values = _get_time_series(
+        symbol,
+        interval="1min",
+        outputsize=960 if include_extended else 390,
+        fast=fast,
+        prepost=include_extended,
+    )
     if values is None or len(values) < 1:
         return None
 
@@ -636,6 +667,8 @@ def get_session_analysis(symbol: str, fast: bool = False) -> SessionAnalysis | N
         bar_dt = _parse_bar_time(bar)
         if bar_dt is None or bar_dt.astimezone(_ET).date() != now_et_date:
             continue
+        if anchor_utc is not None and bar_dt < anchor_utc:
+            continue  # pre-anchor regime — excluded from every aggregate
         try:
             high = float(bar["high"])
             low = float(bar["low"])
@@ -690,6 +723,7 @@ def get_session_analysis(symbol: str, fast: bool = False) -> SessionAnalysis | N
         last_price=last_price,
         session_low=session_low,
         session_high=session_high,
+        newest_bar_utc=newest_time,
     )
 
 
