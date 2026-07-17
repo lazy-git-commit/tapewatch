@@ -164,14 +164,26 @@ def init_db() -> None:
                 ADD COLUMN IF NOT EXISTS ratchet_armed INTEGER NOT NULL DEFAULT 0
             """)
             # session (v21.1): which trading session the entry fired in
-            # (regular / premarket / afterhours). NULL for pre-v21.1 rows;
-            # backfilled read-side from buy_time when reporting. Persisting it
-            # explicitly — rather than always deriving from buy_time — makes
-            # "is after-hours actually profitable?" a first-class GROUP BY and
-            # matches how exit_reason is already stored on the row.
+            # (regular / premarket / afterhours). Persisting it explicitly —
+            # rather than always deriving from buy_time — makes "is after-hours
+            # actually profitable?" a first-class GROUP BY and matches how
+            # exit_reason is already stored on the row.
             cur.execute("""
                 ALTER TABLE trades
                 ADD COLUMN IF NOT EXISTS session TEXT
+            """)
+            # One-time backfill (v21.2): every pre-v21.1 row was a regular-hours
+            # entry (extended-hours trading didn't exist before 2026-07-17), so
+            # stamp them instead of re-deriving session from buy_time in every
+            # report query — the read-side CASE used fixed 09:30/16:00
+            # boundaries that disagreed with the calendar-aware session model
+            # on early-close days and had no overnight bucket. The date guard
+            # keeps this idempotent AND leaves any post-v21.1 NULL visible:
+            # a NULL session on a new row is a bug worth seeing, not a value
+            # to paper over.
+            cur.execute("""
+                UPDATE trades SET session = 'regular'
+                WHERE session IS NULL AND buy_time < '2026-07-17'
             """)
             # catalyst_type on signals: which catalyst class Claude assigned.
             cur.execute("""

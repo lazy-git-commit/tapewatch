@@ -70,7 +70,7 @@ from market.sessions import (
 )
 from trading.executor import (
     sell, get_order_status, cancel_order, _fetch_fill, _parse_fill,
-    get_broker_positions, place_stop_loss, recently_filled,
+    get_broker_positions, place_stop_loss,
 )
 from storage.database import (
     get_open_trades, close_trade, set_tp_order_id, set_stop_order_id,
@@ -111,13 +111,20 @@ _sell_fail_counts: dict[int, int] = {}  # trade_id → consecutive failed sell a
 _RECONCILE_EVERY_SECONDS = 60.0
 _last_reconcile_ts = 0.0
 
-# Grace window (v21.1): a buy that fills between the open-trades snapshot and
-# the broker-portfolio fetch looks like an orphan until open_trade() commits.
-# Skip the orphan CRITICAL for any ticker that filled a buy within this window.
-# Generous relative to the sub-second race so a slow DB commit can't leak the
-# false alert; far shorter than the 60s reconcile cadence, so a genuine orphan
-# (manual trade, truly-failed open_trade) still surfaces on the next pass.
-_ORPHAN_GRACE_SECONDS = 30.0
+# Two-pass divergence confirmation (v21.2, replaces the v21.1 grace window):
+# a buy that fills mid-cycle looks like an orphan (broker-open, DB-flat) until
+# open_trade() commits, and a sell that fills mid-cycle looks like a phantom
+# (DB-open, broker-flat) until close_trade() commits. Both races resolve in
+# seconds; both real divergences persist. So a divergence only fires CRITICAL
+# when it survives TWO consecutive reconcile passes (60s apart) — a commit
+# that hasn't landed after a full reconcile interval has failed, and a real
+# orphan/phantom cannot clear itself. Unlike the v21.1 time-since-fill window
+# (which suppressed the alert for a genuinely-failed open_trade too, and knew
+# nothing about the phantom side), this distinguishes the two cases by
+# observation rather than by a tuned timeout, and needs no executor coupling.
+# The sets are replaced wholesale each pass, so they self-prune.
+_suspect_orphans: set[str] = set()    # tickers unmatched last pass
+_suspect_phantoms: set[int] = set()   # trade ids unmatched last pass
 
 # ── Resting-order status-check throttle (v20.1) ──────────────────────────────
 # Checking the resting order's status is bookkeeping (noticing a fill /
@@ -491,10 +498,14 @@ def _reconcile_positions(db_open_trades: list[dict]) -> None:
     identical to "broker has no positions" — auto-closing on that would
     flatten real positions. Alerting and letting a human decide is safer.
 
+    A divergence seen for the FIRST time is logged INFO and remembered; only
+    a divergence that survives two consecutive passes fires CRITICAL (v21.2 —
+    see the _suspect_* comment above for why).
+
     Throttled to once per _RECONCILE_EVERY_SECONDS: the 5s monitor cadence
     (v20) exists for exit latency, not for multiplying portfolio calls.
     """
-    global _last_reconcile_ts
+    global _last_reconcile_ts, _suspect_orphans, _suspect_phantoms
     now = _time.monotonic()
     if now - _last_reconcile_ts < _RECONCILE_EVERY_SECONDS:
         return
@@ -502,16 +513,27 @@ def _reconcile_positions(db_open_trades: list[dict]) -> None:
 
     broker_positions = get_broker_positions()
     if broker_positions is None:
-        # API failure — skip this cycle rather than false-alerting.
+        # API failure — skip this cycle rather than false-alerting. Suspect
+        # sets are left as-is: confirmation resumes on the next good pass.
         return
 
     db_tickers = {trade["ticker"] for trade in db_open_trades}
     broker_tickers = set(broker_positions.keys())
 
     # Phantom: DB says open, broker says flat.
+    phantoms_now: set[int] = set()
     for trade in db_open_trades:
         ticker = trade["ticker"]
         if ticker not in broker_tickers:
+            phantoms_now.add(trade["id"])
+            if trade["id"] not in _suspect_phantoms:
+                logger.info(
+                    "Reconcile: trade %d (%s qty=%.4f) is open in DB but not in "
+                    "the broker portfolio — could be a close_trade() still "
+                    "committing after a sell fill; confirming next pass.",
+                    trade["id"], ticker, trade["quantity"],
+                )
+                continue
             logger.critical(
                 "RECONCILIATION: trade %d (%s qty=%.4f) is OPEN in DB but NOT in "
                 "broker portfolio — possible missed close_trade() after a sell. "
@@ -519,18 +541,19 @@ def _reconcile_positions(db_open_trades: list[dict]) -> None:
                 "truly flat, or investigate if the sell failed silently.",
                 trade["id"], ticker, trade["quantity"],
             )
+    _suspect_phantoms = phantoms_now
 
     # Orphan: broker says open, DB says flat.
+    orphans_now: set[str] = set()
     for ticker, qty in broker_positions.items():
         if ticker not in db_tickers:
-            # A buy that just filled hasn't necessarily committed its trade row
-            # yet — the reconcile ran against an earlier snapshot. Suppress the
-            # alert inside the grace window; a real orphan re-surfaces next pass.
-            if recently_filled(ticker, _ORPHAN_GRACE_SECONDS):
+            orphans_now.add(ticker)
+            if ticker not in _suspect_orphans:
                 logger.info(
-                    "Reconcile: broker holds %.4f of %s with no DB row, but a buy "
-                    "filled <%.0fs ago — trade row still committing, not an orphan.",
-                    qty, ticker, _ORPHAN_GRACE_SECONDS,
+                    "Reconcile: broker holds %.4f of %s with no DB row — could "
+                    "be an open_trade() still committing after a buy fill; "
+                    "confirming next pass.",
+                    qty, ticker,
                 )
                 continue
             logger.critical(
@@ -540,6 +563,7 @@ def _reconcile_positions(db_open_trades: list[dict]) -> None:
                 "orphan, or add a DB record if it was a manual entry.",
                 qty, ticker,
             )
+    _suspect_orphans = orphans_now
 
 
 def monitor_positions() -> None:
@@ -558,16 +582,20 @@ def monitor_positions() -> None:
         logger.error("monitor_positions: failed to fetch open trades from DB: %s", exc)
         return
 
-    if not open_trades:
-        return
-
     # ── Broker reconciliation (throttled) ─────────────────────────────────────
     # The DB is the system's source of truth for position management, but it
     # can drift from the broker after a DB write failure or a kill -9.
     # Phantom (DB-open, broker-flat) and orphan (broker-open, DB-flat)
-    # divergences are logged CRITICAL; never auto-reconciled (a transient API
-    # error would make every DB-open trade look like a phantom).
+    # divergences fire CRITICAL after two consecutive sightings; never
+    # auto-reconciled (a transient API error would make every DB-open trade
+    # look like a phantom). Runs BEFORE the flat-DB early-out (v21.2): the
+    # single most dangerous orphan shape — the only position's open_trade()
+    # failed after its buy filled — leaves the DB empty, and skipping
+    # reconciliation there would make exactly that orphan invisible forever.
     _reconcile_positions(open_trades)
+
+    if not open_trades:
+        return
 
     # ── Session guard (v21) ──────────────────────────────────────────────────
     # Positions are managed in regular hours and — when the master 24/5

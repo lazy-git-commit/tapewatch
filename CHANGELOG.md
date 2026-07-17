@@ -7,6 +7,61 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.2 — 2026-07-17 (reconciliation done right; code-review findings)
+
+A same-day high-effort review of v21.1 found that its orphan-alert fix traded
+one failure mode for two subtler ones. This release replaces the mechanism and
+clears the review's remaining findings. No entry/exit-behavior change.
+
+### Reconciliation: two-pass confirmation replaces the 30s grace window
+- **The v21.1 flaw**: `recently_filled()` suppressed the orphan CRITICAL for
+  30s after any fill — which also suppressed it when `open_trade()` had
+  *genuinely failed* after the fill (the exact case the alert exists for),
+  while logging "not an orphan" about a real one. It also did nothing for the
+  mirror-image race on the sell side (phantom: sell filled, `close_trade()`
+  still committing).
+- **The v21.2 rule**: a divergence (orphan or phantom) fires CRITICAL only
+  when it survives **two consecutive reconcile passes** (60s apart); the first
+  sighting logs INFO "confirming next pass". A commit race cannot survive a
+  full pass; a real divergence cannot clear itself — the cases are separated
+  by observation, not by a tuned timeout. Covers both sides, needs no
+  executor coupling (the `note_buy_filled`/`recently_filled` tracker and its
+  unbounded per-ticker dict are deleted), and is restart-safe by construction.
+- **Reconcile now runs before the flat-DB early-out.** Pre-v21.2, an orphan
+  whose failed `open_trade()` was the *only* position left the trades table
+  empty — and the monitor's flat-DB early-out then skipped reconciliation
+  entirely, making precisely that orphan invisible until an unrelated trade
+  opened. Cost: one portfolio call per 60s while flat.
+
+### Session column: backfill once, stop deriving thrice
+- One-time idempotent migration stamps `session='regular'` on every pre-v21.1
+  row (`buy_time < '2026-07-17'` — extended-hours trading did not exist
+  before then). The three Grafana panels that each carried a private
+  ~350-char ET-hour CASE fallback now read `COALESCE(session, 'unknown')`:
+  the CASE copies used fixed 09:30/16:00 boundaries that disagreed with the
+  calendar-aware session model on early-close days, had no overnight bucket,
+  and would have drifted independently. A future `'unknown'` row means an
+  entry path skipped the session stamp — visible, not papered over.
+
+### Small fixes from the same review
+- Panel 23's description named an exit_reason `stop` that the code never
+  writes; corrected to `stop_loss`.
+- `docs/algorithm.md` now documents the reconciliation rules and the
+  2026-07-16 spurious-CRITICAL incident that motivated them (the v21.1
+  change had violated the repo's own keep-algorithm.md-updated rule).
+- The reconciliation tests exercise the public API only (no more poking
+  `executor._recent_fill_ts` internals) and cover both benign races, both
+  confirmed divergences, and the flat-DB reconcile path.
+- **Deploy-blocking test flakiness fixed**: the price-check gate tests mocked
+  `pc.datetime` but not `get_trading_session()`, which reads the real wall
+  clock — between 16:00 and 20:00 ET the entire gate suite silently ran the
+  extended-regime variant against RTH fixtures and failed (18 tests). Since
+  the deploy pipeline gates on pytest, **deploys pushed during US after-hours
+  would have failed CI on unrelated changes.** The shared `_confirm_with`
+  helper now pins the session to `regular`.
+
+---
+
 ## v21.1 — 2026-07-17 (observability catch-up for v21)
 
 v21 shipped the 24/5 trading logic but left three surfaces stale — this closes

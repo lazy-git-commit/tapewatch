@@ -531,9 +531,39 @@ costs money on every single fast reversal.
 Monitor cadence is 5s (was 20s): with the stop resting broker-side, the poll
 no longer guards the loss side, but the POLLED side (take-profit) pays the
 full cadence as latency at the exact moment price touches the target. The
-cycle early-outs on a local DB query when flat; broker reconciliation is
-throttled to once per 60s and resting-order status checks to once per 15s
-per trade so the faster loop doesn't multiply API load. The monitor's price
+exit loop early-outs on a local DB query when flat, but broker
+reconciliation runs FIRST, before that early-out (v21.2) — throttled to once
+per 60s, with resting-order status checks throttled to once per 15s per
+trade so the faster loop doesn't multiply API load.
+
+**Broker/DB reconciliation** compares DB-open trades against the live
+portfolio and pages the operator (CRITICAL) on divergence — phantom
+(DB-open, broker-flat: a missed `close_trade()`) or orphan (broker-open,
+DB-flat: a failed `open_trade()` after a buy fill, or a manual trade). Two
+rules, each bought by an incident:
+
+- **Two-pass confirmation (v21.2).** A divergence fires CRITICAL only when it
+  survives two consecutive reconcile passes (60s apart); the first sighting
+  logs INFO ("confirming next pass"). Motivation: the reconcile compares a
+  DB snapshot taken at cycle start against a broker portfolio fetched later,
+  so every entry whose `open_trade()` was still committing looked like an
+  orphan — a spurious CRITICAL fired on every single trade of 2026-07-16,
+  training the operator to ignore CRITICALs. A commit race resolves within
+  one pass; a real orphan/phantom cannot clear itself — persistence across
+  passes is what separates them. (v21.1 briefly used a 30s time-since-fill
+  grace window instead; it was replaced because it also suppressed the alert
+  when `open_trade()` had genuinely failed — the exact case the alert
+  exists for — and knew nothing about the phantom-side race.) Worst-case
+  alert latency is ~2 minutes, acceptable for a manual-review page.
+- **Reconcile runs even when the DB is flat (v21.2).** The single most
+  dangerous orphan shape — the only open position's `open_trade()` failed
+  after its buy filled — leaves the trades table empty; the pre-v21.2 code
+  early-outed on the empty DB before reconciling, making exactly that orphan
+  invisible until some unrelated trade opened.
+
+Never auto-reconciles: a transient portfolio-endpoint timeout is
+indistinguishable from "broker is flat", and auto-closing on that would
+flatten real positions. The monitor's price
 lookups run the quote chain in fast (single-attempt) mode — the next cycle
 is the retry — and the 390-bar Twelvedata price fallback is throttled to one
 attempt per 30s per symbol so a quote outage can't drain the credit bucket

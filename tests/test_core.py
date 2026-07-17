@@ -667,11 +667,10 @@ class TestBrokerReconciliation:
         # monotonic baseline.
         import monitor.position_monitor as pm
         pm._last_reconcile_ts = float("-inf")
-        # v21.1 grace tracker lives in the executor module; clear it so a fill
-        # noted by one test can't suppress an orphan alert in another.
-        import trading.executor as ex
-        with ex._recent_fill_lock:
-            ex._recent_fill_ts.clear()
+        # v21.2 two-pass confirmation state: clear so a suspect recorded by one
+        # test can't promote a first sighting to CRITICAL in another.
+        pm._suspect_orphans = set()
+        pm._suspect_phantoms = set()
 
     teardown_method = setup_method
 
@@ -680,59 +679,84 @@ class TestBrokerReconciliation:
                 "buy_price": 100.0, "buy_time": "2026-06-17T13:00:00+00:00",
                 "tp_order_id": None, "mode": "demo"}
 
+    @staticmethod
+    def _run_pass(db_trades):
+        """One reconcile pass, defeating the 60s throttle between calls."""
+        import monitor.position_monitor as pm
+        pm._last_reconcile_ts = float("-inf")
+        pm._reconcile_positions(db_trades)
+
     @patch("monitor.position_monitor.get_broker_positions")
-    def test_phantom_position_logged(self, mock_broker, caplog):
-        """DB-open trade not present in broker portfolio → CRITICAL log."""
+    def test_phantom_two_passes_logged(self, mock_broker, caplog):
+        """DB-open trade absent from broker on two consecutive passes →
+        CRITICAL; the first sighting alone is only INFO (v21.2)."""
         import logging
         mock_broker.return_value = {}  # broker has nothing
-        from monitor.position_monitor import _reconcile_positions
-        with caplog.at_level(logging.CRITICAL, logger="monitor.position_monitor"):
-            _reconcile_positions([self._trade(42, "AAPL_US_EQ")])
+        with caplog.at_level(logging.INFO, logger="monitor.position_monitor"):
+            self._run_pass([self._trade(42, "AAPL_US_EQ")])
+            assert not any(r.levelno >= logging.CRITICAL for r in caplog.records)
+            assert any("confirming next pass" in r.message for r in caplog.records)
+            self._run_pass([self._trade(42, "AAPL_US_EQ")])
         assert any("RECONCILIATION" in r.message and "AAPL_US_EQ" in r.message
                    and "OPEN in DB but NOT in broker" in r.message
                    for r in caplog.records)
 
     @patch("monitor.position_monitor.get_broker_positions")
-    def test_orphan_position_logged(self, mock_broker, caplog):
-        """Broker holds position not in DB → CRITICAL log."""
+    def test_orphan_two_passes_logged(self, mock_broker, caplog):
+        """Broker position with no DB row on two consecutive passes →
+        CRITICAL; the first sighting alone is only INFO (v21.2)."""
         import logging
-        mock_broker.return_value = {"TSLA_US_EQ": 5.0}  # broker has it, DB doesn't
-        from monitor.position_monitor import _reconcile_positions
-        with caplog.at_level(logging.CRITICAL, logger="monitor.position_monitor"):
-            _reconcile_positions([])  # no DB trades
+        mock_broker.return_value = {"TSLA_US_EQ": 5.0}
+        with caplog.at_level(logging.INFO, logger="monitor.position_monitor"):
+            self._run_pass([])  # no DB trades — reconcile must still run
+            assert not any(r.levelno >= logging.CRITICAL for r in caplog.records)
+            assert any("confirming next pass" in r.message for r in caplog.records)
+            self._run_pass([])
         assert any("RECONCILIATION" in r.message and "TSLA_US_EQ" in r.message
                    and "broker holds" in r.message
                    for r in caplog.records)
 
     @patch("monitor.position_monitor.get_broker_positions")
-    def test_orphan_within_grace_window_not_logged(self, mock_broker, caplog):
-        """A buy that just filled hasn't committed its DB row yet — the orphan
-        CRITICAL must be suppressed inside the grace window (v21.1)."""
+    def test_orphan_resolved_between_passes_not_logged(self, mock_broker, caplog):
+        """The benign entry race: buy filled, open_trade() committed between
+        passes. The DB row is visible on the second pass → never CRITICAL."""
         import logging
-        import trading.executor as ex
         mock_broker.return_value = {"NVDA_US_EQ": 3.0}
-        ex.note_buy_filled("NVDA_US_EQ")  # filled just now
-        from monitor.position_monitor import _reconcile_positions
         with caplog.at_level(logging.INFO, logger="monitor.position_monitor"):
-            _reconcile_positions([])  # DB row not yet visible
+            self._run_pass([])  # snapshot race: row not committed yet
+            self._run_pass([self._trade(7, "NVDA_US_EQ", qty=3.0)])  # committed
         assert not any("RECONCILIATION" in r.message for r in caplog.records)
-        assert any("still committing" in r.message for r in caplog.records)
 
     @patch("monitor.position_monitor.get_broker_positions")
-    def test_orphan_after_grace_window_logged(self, mock_broker, caplog):
-        """A fill older than the grace window is a genuine orphan → CRITICAL."""
+    def test_phantom_resolved_between_passes_not_logged(self, mock_broker, caplog):
+        """The benign exit race: sell filled, close_trade() committed between
+        passes. The trade is gone from the DB on the second pass → never
+        CRITICAL (the v21.1 grace window never covered this side)."""
         import logging
-        import time as _time
-        import trading.executor as ex
+        mock_broker.return_value = {}
+        with caplog.at_level(logging.INFO, logger="monitor.position_monitor"):
+            self._run_pass([self._trade(9, "AMD_US_EQ")])  # close committing
+            self._run_pass([])  # closed
+        assert not any("RECONCILIATION" in r.message for r in caplog.records)
+
+    @patch("monitor.position_monitor.touch_heartbeat")
+    @patch("monitor.position_monitor.get_open_trades")
+    @patch("monitor.position_monitor.get_broker_positions")
+    def test_reconcile_runs_when_db_flat(self, mock_broker, mock_trades,
+                                         _mock_hb, caplog):
+        """monitor_positions must reconcile even with zero open trades — a
+        failed open_trade() on the only position leaves the DB empty, and
+        pre-v21.2 the flat early-out made that orphan invisible forever."""
+        import logging
         import monitor.position_monitor as pm
-        mock_broker.return_value = {"NVDA_US_EQ": 3.0}
-        # Backdate the fill beyond the grace window.
-        with ex._recent_fill_lock:
-            ex._recent_fill_ts["NVDA_US_EQ"] = _time.monotonic() - (pm._ORPHAN_GRACE_SECONDS + 5)
-        from monitor.position_monitor import _reconcile_positions
-        with caplog.at_level(logging.CRITICAL, logger="monitor.position_monitor"):
-            _reconcile_positions([])
-        assert any("RECONCILIATION" in r.message and "NVDA_US_EQ" in r.message
+        mock_broker.return_value = {"ORCL_US_EQ": 4.0}
+        mock_trades.return_value = []
+        with caplog.at_level(logging.INFO, logger="monitor.position_monitor"):
+            pm._last_reconcile_ts = float("-inf")
+            pm.monitor_positions()
+            pm._last_reconcile_ts = float("-inf")
+            pm.monitor_positions()
+        assert any("RECONCILIATION" in r.message and "ORCL_US_EQ" in r.message
                    for r in caplog.records)
 
     @patch("monitor.position_monitor.get_broker_positions")
@@ -2456,11 +2480,19 @@ _DAILY = (1_000_000, 10_000_000.0, 10.0)  # (avg_daily_volume, adv$, prev_close)
 
 def _confirm_with(monkey_now_et, quote, sa, daily=_DAILY):
     """Run confirm_price_signal with all data dependencies mocked (v20 seams:
-    one session-analysis pull + cached daily stats)."""
+    one session-analysis pull + cached daily stats).
+
+    The session is pinned to "regular": get_trading_session() reads the REAL
+    wall clock (pd.Timestamp.now), not the mocked pc.datetime — unpinned, the
+    whole suite silently switched to the extended-regime gate variant whenever
+    it ran 16:00–20:00 ET and failed on fixtures built for RTH (v21.2; the
+    deploy pipeline runs pytest, so this made deploys time-of-day dependent).
+    """
     import market.price_check as pc
     fake_dt = MagicMock()
     fake_dt.now.side_effect = lambda tz=None: monkey_now_et
     with patch.object(pc, "datetime", fake_dt), \
+         patch.object(pc, "get_trading_session", return_value="regular"), \
          patch.object(pc, "get_quote_with_fallback", return_value=quote), \
          patch.object(pc, "get_session_analysis", return_value=sa) as mock_sa, \
          patch.object(pc, "get_daily_stats", return_value=daily):
