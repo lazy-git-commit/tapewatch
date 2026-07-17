@@ -7,6 +7,46 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.1 — 2026-07-17 (observability catch-up for v21)
+
+v21 shipped the 24/5 trading logic but left three surfaces stale — this closes
+them. No trading-behavior change.
+
+### Trades are now session-tagged
+- New `trades.session` column (idempotent `ADD COLUMN IF NOT EXISTS`), persisted
+  at entry from `confirmation.session`. Without it, "is after-hours actually
+  profitable?" — the question the whole v21 build exists to answer — was
+  unanswerable: every panel lumped RTH and extended P&L together. Older rows are
+  bucketed read-side from `buy_time` in ET, so history isn't blank.
+
+### Grafana caught up to v21
+- **Open Trades** and **Trade History** now show a `session` column.
+- New **P&L by Session** panel (n / win-rate / avg-P&L / total-P&L per session) —
+  the go/no-go readout for extended-hours trading.
+- New **Exit Reason Distribution** panel — surfaces `afterhours_flatten` vs
+  `eod_flatten` vs `time_stop` vs `stop`; a high `afterhours_flatten` count means
+  entries are firing too late in the after-hours window to work the trade.
+
+### README caught up to v20+v21
+- The flow diagram still described a 20s monitor with a resting *take-profit* and
+  a polled stop (inverted since v20) and claimed the system "skips cycles outside
+  NYSE market hours" (contradicted by v21's after-hours pipeline). Rewritten:
+  5s monitor, resting *stop* / polled TP, the session gate, and the extended-hours
+  settings added to the config table. Also corrected the pre-v20 catalyst-taxonomy
+  line (only `fda_approval`/`guidance_raise` are tradeable).
+
+### Reconciliation no longer cries wolf on every entry
+- The monitor's broker/DB reconciliation runs on a snapshot taken at cycle start;
+  a buy that fills before `open_trade()` commits looked like an orphan and fired a
+  spurious `CRITICAL` on *every* trade (all of 2026-07-16). The executor now records
+  each fill's timestamp (`note_buy_filled` / `recently_filled`, thread-safe) and the
+  reconcile suppresses the orphan alert inside a 30s grace window — far shorter than
+  the 60s reconcile cadence, so a genuine orphan still surfaces next pass. A CRITICAL
+  that fires on every trade trains the operator to ignore CRITICALs; that's the real
+  cost removed.
+
+---
+
 ## v21 — 2026-07-16 (24/5 extended-hours trading)
 
 The user enabled T212's 24/5 trading on the account. v21 accommodates it —

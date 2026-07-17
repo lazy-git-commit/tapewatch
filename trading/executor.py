@@ -15,6 +15,7 @@ the portfolio's total value, capped to available cash.
 import base64
 import logging
 import math
+import threading
 import time
 import requests
 from dataclasses import dataclass
@@ -22,6 +23,31 @@ from config.settings import cfg
 from market.twelvedata_bars import get_gbp_usd_rate
 
 logger = logging.getLogger(__name__)
+
+# ── Recent-fill grace tracker (v21.1) ─────────────────────────────────────────
+# The position monitor's broker/DB reconciliation runs on a snapshot of open
+# trades taken at the top of the cycle. A buy that fills between that snapshot
+# and the broker-portfolio fetch looks like an "orphan" (broker holds it, DB
+# doesn't) and fired a spurious CRITICAL on *every* entry (observed for every
+# trade on 2026-07-16). The buy path records each fill's monotonic timestamp
+# here; the reconcile consults recently_filled() and skips the orphan alert
+# inside the grace window. A CRITICAL that cries wolf on every trade trains the
+# operator to ignore CRITICALs — the real cost this removes.
+_recent_fill_ts: dict[str, float] = {}
+_recent_fill_lock = threading.Lock()
+
+
+def note_buy_filled(ticker: str) -> None:
+    """Record that `ticker` just filled a buy (called from the buy path)."""
+    with _recent_fill_lock:
+        _recent_fill_ts[ticker] = time.monotonic()
+
+
+def recently_filled(ticker: str, within_seconds: float) -> bool:
+    """True if a buy for `ticker` filled within the last `within_seconds`."""
+    with _recent_fill_lock:
+        ts = _recent_fill_ts.get(ticker)
+    return ts is not None and (time.monotonic() - ts) < within_seconds
 
 _T212_DEMO = "https://demo.trading212.com/api/v0"
 _T212_LIVE = "https://live.trading212.com/api/v0"
@@ -730,6 +756,9 @@ def buy(
             ticker, quantity, actual_price,
             net_gbp or 0, fx_rate or 0, fees_gbp or 0, order_id,
         )
+        # Mark the fill so the monitor's reconciliation doesn't misread the
+        # not-yet-committed DB row as an orphan (v21.1).
+        note_buy_filled(ticker)
         return OrderResult(
             success=True, ticker=ticker, quantity=quantity,
             price=actual_price, order_id=order_id, error=None,

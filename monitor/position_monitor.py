@@ -70,7 +70,7 @@ from market.sessions import (
 )
 from trading.executor import (
     sell, get_order_status, cancel_order, _fetch_fill, _parse_fill,
-    get_broker_positions, place_stop_loss,
+    get_broker_positions, place_stop_loss, recently_filled,
 )
 from storage.database import (
     get_open_trades, close_trade, set_tp_order_id, set_stop_order_id,
@@ -110,6 +110,14 @@ _sell_fail_counts: dict[int, int] = {}  # trade_id → consecutive failed sell a
 # multiply T212 API load.
 _RECONCILE_EVERY_SECONDS = 60.0
 _last_reconcile_ts = 0.0
+
+# Grace window (v21.1): a buy that fills between the open-trades snapshot and
+# the broker-portfolio fetch looks like an orphan until open_trade() commits.
+# Skip the orphan CRITICAL for any ticker that filled a buy within this window.
+# Generous relative to the sub-second race so a slow DB commit can't leak the
+# false alert; far shorter than the 60s reconcile cadence, so a genuine orphan
+# (manual trade, truly-failed open_trade) still surfaces on the next pass.
+_ORPHAN_GRACE_SECONDS = 30.0
 
 # ── Resting-order status-check throttle (v20.1) ──────────────────────────────
 # Checking the resting order's status is bookkeeping (noticing a fill /
@@ -515,6 +523,16 @@ def _reconcile_positions(db_open_trades: list[dict]) -> None:
     # Orphan: broker says open, DB says flat.
     for ticker, qty in broker_positions.items():
         if ticker not in db_tickers:
+            # A buy that just filled hasn't necessarily committed its trade row
+            # yet — the reconcile ran against an earlier snapshot. Suppress the
+            # alert inside the grace window; a real orphan re-surfaces next pass.
+            if recently_filled(ticker, _ORPHAN_GRACE_SECONDS):
+                logger.info(
+                    "Reconcile: broker holds %.4f of %s with no DB row, but a buy "
+                    "filled <%.0fs ago — trade row still committing, not an orphan.",
+                    qty, ticker, _ORPHAN_GRACE_SECONDS,
+                )
+                continue
             logger.critical(
                 "RECONCILIATION: broker holds %.4f of %s but NO open trade in DB "
                 "— possible failed open_trade() after a buy fill, or manual trade. "

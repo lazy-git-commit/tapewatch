@@ -12,34 +12,51 @@ Benzinga news (via massive.com) — breaking US equity news with tickers
           • roundup articles skipped (>3 tickers = market digest, no catalyst)
           • T212 symbol map: Benzinga shortName → correct T212 ticker code
 Claude Haiku — expert momentum day trader classifier
-                     earnings beats / FDA / M&A / contract wins → positive (0.8–1.0)
-                     analyst PT raises / "Maintains" ratings    → neutral  (ignored)
-                     earnings misses / guidance cuts            → negative (ignored)
+                     scores every article (14-class catalyst taxonomy)
+                     only fda_approval / guidance_raise are tradeable by default
+                     (the classes measured profitable on forward returns — the
+                      rest are scored and stored for the eval loop, not traded)
+       ↓
+Session gate — which of T212's 24/5 sessions are we in? (ET)
+                     regular    09:30–16:00  → full pipeline (always)
+                     afterhours 16:00–20:00  → full pipeline, stricter gates
+                     premarket  04:00–09:30  → scanner + at-open gap-and-go
+                     overnight  20:00–04:00  → stand aside (data-blind, fail-closed)
        ↓
 Price confirmation — Finnhub quote + Twelvedata fallback/bars
-                     blocks first 5 minutes after open (auction noise)
+                     blocks first 5 minutes after the session start (auction noise)
                      price ≥ $5 and not already extended vs prev close
                      timestamp-based momentum + time-normalized RVOL
                      ADV liquidity floor + spread proxy
                      VWAP confirmation (is the stock being accumulated?)
+                     (extended sessions: session-anchored VWAP/volume, an
+                      absolute participation floor instead of RVOL, half size)
        ↓
 Buy order (Trading 212 API — demo or live)
   auto-retries once if T212 rejects for quantity precision mismatch
+  extended sessions carry the extendedHours flag and verify the fill
        ↓
-Position monitor (every 20s) — Finnhub quote + Twelvedata fallback
-  → Resting take-profit limit (+5%)  ✅
-  → Stop loss bounded-limit (-2%)    ❌
-  → Time stop (60min)                ⏱️
-  → EOD flatten before close
+Position monitor (every 5s) — Finnhub quote + Twelvedata fallback
+  → Resting stop-loss at the broker (-2%)  ✅ zero-latency loss side (RTH)
+  → Take-profit polled (+5%)               ⏱️
+  → Time stop (60min)                      ⏱️
+  → Breakeven ratchet at +2%
+  → EOD flatten before close; after-hours flatten by 19:45 ET
+  (extended sessions: no resting stop — T212 stops execute RTH-only — so the
+   monitor polls both sides and force-flattens before 20:00 ET)
        ↓
-Trade logged to PostgreSQL (tagged demo or live)
+Trade logged to PostgreSQL (tagged demo or live, with session)
        ↓
 Grafana dashboard — live activity and history
 ```
 
-Polls every minute around the clock. Skips cycles outside NYSE market hours
-(Mon–Fri, 13:30–20:00 UTC = 09:30–16:00 ET). Holidays and early closes are
-handled automatically via `pandas_market_calendars` — no manual configuration needed.
+Polls every minute around the clock. The **session gate** decides what runs:
+regular and after-hours run the full pipeline; pre-market runs the scanner;
+overnight (Blue Ocean ATS — invisible to our data feeds) stands aside by
+construction. Holidays and early closes are handled automatically via
+`pandas_market_calendars` — no manual configuration needed. Extended-hours
+trading is controlled by `EXTENDED_HOURS_ENABLED` / `AFTERHOURS_TRADING_ENABLED`
+(see settings below).
 
 ---
 
@@ -88,6 +105,14 @@ Key settings in `.env`:
 | `STOP_LOSS_PCT` | `2.0` | Sell when down this % |
 | `TIME_STOP_MINUTES` | `60` | Sell after this many minutes regardless |
 | `EOD_FLATTEN_MINUTES` | `10` | Force-close before the bell |
+| `EXTENDED_HOURS_ENABLED` | `true` | Master switch for all 24/5 extended-session behavior |
+| `AFTERHOURS_TRADING_ENABLED` | `true` | Open new positions in the 16:00–20:00 ET session |
+| `PREMARKET_TRADING_ENABLED` | `false` | Direct pre-market entries (off — the at-open gap-and-go trades the same news) |
+| `EXTENDED_MIN_ADV_DOLLAR` | `50000000` | ADV$ floor for extended-session entries (stricter than RTH) |
+| `EXTENDED_MIN_SESSION_DOLLAR_VOLUME` | `500000` | Absolute session-dollar participation floor (replaces RVOL after hours) |
+| `EXTENDED_MAX_SPREAD_PCT` | `1.5` | Spread ceiling for extended sessions (tighter than RTH's 3%) |
+| `EXTENDED_SIZE_FACTOR` | `0.5` | Position-size multiplier in extended sessions (half size) |
+| `EXTENDED_FLATTEN_BUFFER_MINUTES` | `15` | Force-close everything this many minutes before 20:00 ET |
 
 ### 4. Run the tests
 

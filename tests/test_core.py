@@ -667,6 +667,11 @@ class TestBrokerReconciliation:
         # monotonic baseline.
         import monitor.position_monitor as pm
         pm._last_reconcile_ts = float("-inf")
+        # v21.1 grace tracker lives in the executor module; clear it so a fill
+        # noted by one test can't suppress an orphan alert in another.
+        import trading.executor as ex
+        with ex._recent_fill_lock:
+            ex._recent_fill_ts.clear()
 
     teardown_method = setup_method
 
@@ -697,6 +702,37 @@ class TestBrokerReconciliation:
             _reconcile_positions([])  # no DB trades
         assert any("RECONCILIATION" in r.message and "TSLA_US_EQ" in r.message
                    and "broker holds" in r.message
+                   for r in caplog.records)
+
+    @patch("monitor.position_monitor.get_broker_positions")
+    def test_orphan_within_grace_window_not_logged(self, mock_broker, caplog):
+        """A buy that just filled hasn't committed its DB row yet — the orphan
+        CRITICAL must be suppressed inside the grace window (v21.1)."""
+        import logging
+        import trading.executor as ex
+        mock_broker.return_value = {"NVDA_US_EQ": 3.0}
+        ex.note_buy_filled("NVDA_US_EQ")  # filled just now
+        from monitor.position_monitor import _reconcile_positions
+        with caplog.at_level(logging.INFO, logger="monitor.position_monitor"):
+            _reconcile_positions([])  # DB row not yet visible
+        assert not any("RECONCILIATION" in r.message for r in caplog.records)
+        assert any("still committing" in r.message for r in caplog.records)
+
+    @patch("monitor.position_monitor.get_broker_positions")
+    def test_orphan_after_grace_window_logged(self, mock_broker, caplog):
+        """A fill older than the grace window is a genuine orphan → CRITICAL."""
+        import logging
+        import time as _time
+        import trading.executor as ex
+        import monitor.position_monitor as pm
+        mock_broker.return_value = {"NVDA_US_EQ": 3.0}
+        # Backdate the fill beyond the grace window.
+        with ex._recent_fill_lock:
+            ex._recent_fill_ts["NVDA_US_EQ"] = _time.monotonic() - (pm._ORPHAN_GRACE_SECONDS + 5)
+        from monitor.position_monitor import _reconcile_positions
+        with caplog.at_level(logging.CRITICAL, logger="monitor.position_monitor"):
+            _reconcile_positions([])
+        assert any("RECONCILIATION" in r.message and "NVDA_US_EQ" in r.message
                    for r in caplog.records)
 
     @patch("monitor.position_monitor.get_broker_positions")

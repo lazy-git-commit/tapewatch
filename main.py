@@ -410,6 +410,7 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
             buy_net_gbp=result.net_gbp,
             buy_fx_rate=result.fx_rate,
             buy_fees_gbp=result.fees_gbp,
+            session=confirmation.session,
         )
     except Exception as exc:
         logger.error(

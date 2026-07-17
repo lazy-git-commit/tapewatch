@@ -56,7 +56,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ticker, quantity, buy_price, buy_time, ROUND(EXTRACT(EPOCH FROM (NOW() - buy_time::timestamptz)) / 60) AS age_minutes FROM trades WHERE status = 'open' AND mode = '$mode' ORDER BY buy_time DESC",
+          "rawSql": "SELECT ticker, COALESCE(session, CASE WHEN EXTRACT(HOUR FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') < 9 OR (EXTRACT(HOUR FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') = 9 AND EXTRACT(MINUTE FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') < 30) THEN 'premarket' WHEN EXTRACT(HOUR FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') >= 16 THEN 'afterhours' ELSE 'regular' END) AS session, quantity, buy_price, buy_time, ROUND(EXTRACT(EPOCH FROM (NOW() - buy_time::timestamptz)) / 60) AS age_minutes FROM trades WHERE status = 'open' AND mode = '$mode' ORDER BY buy_time DESC",
           "format": "table",
           "refId": "A"
         }
@@ -244,7 +244,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ticker, ROUND(quantity::numeric, 4) AS quantity, buy_time, ROUND(buy_price::numeric, 4) AS buy_price_usd, COALESCE(ROUND(buy_net_gbp::numeric, 2)::text, '\u2014') AS buy_total_gbp, COALESCE(ROUND(buy_fees_gbp::numeric, 2)::text, '\u2014') AS buy_fees_gbp, COALESCE(ROUND(buy_fx_rate::numeric, 4)::text, '\u2014') AS buy_fx_rate, sell_time, ROUND(sell_price::numeric, 4) AS sell_price_usd, ROUND(sell_net_gbp::numeric, 2) AS sell_total_gbp, ROUND(sell_fees_gbp::numeric, 2) AS sell_fees_gbp, ROUND(sell_fx_rate::numeric, 4) AS sell_fx_rate, ROUND(profit_loss::numeric, 2) AS pnl_gbp, ROUND(profit_loss_pct::numeric, 2) AS pnl_pct, exit_reason FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
+          "rawSql": "SELECT ticker, COALESCE(session, CASE WHEN EXTRACT(HOUR FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') < 9 OR (EXTRACT(HOUR FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') = 9 AND EXTRACT(MINUTE FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') < 30) THEN 'premarket' WHEN EXTRACT(HOUR FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') >= 16 THEN 'afterhours' ELSE 'regular' END) AS session, ROUND(quantity::numeric, 4) AS quantity, buy_time, ROUND(buy_price::numeric, 4) AS buy_price_usd, COALESCE(ROUND(buy_net_gbp::numeric, 2)::text, '\u2014') AS buy_total_gbp, COALESCE(ROUND(buy_fees_gbp::numeric, 2)::text, '\u2014') AS buy_fees_gbp, COALESCE(ROUND(buy_fx_rate::numeric, 4)::text, '\u2014') AS buy_fx_rate, sell_time, ROUND(sell_price::numeric, 4) AS sell_price_usd, ROUND(sell_net_gbp::numeric, 2) AS sell_total_gbp, ROUND(sell_fees_gbp::numeric, 2) AS sell_fees_gbp, ROUND(sell_fx_rate::numeric, 4) AS sell_fx_rate, ROUND(profit_loss::numeric, 2) AS pnl_gbp, ROUND(profit_loss_pct::numeric, 2) AS pnl_pct, exit_reason FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
           "format": "table",
           "refId": "A"
         }
@@ -912,6 +912,94 @@
           "format": "table",
           "rawQuery": true,
           "rawSql": "SELECT\n  event_day,\n  event_type,\n  severity,\n  detail,\n  created_at\nFROM system_events\nORDER BY created_at DESC\nLIMIT 50",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "P&L by Session (is after-hours worth trading?)",
+      "description": "The v21 question in one panel: does after-hours actually make money vs regular hours? session comes from the trade row (v21.1+); older rows are bucketed from buy_time in ET. Watch the afterhours row's win-rate and avg-P&L against regular before trusting extended-hours size.",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "total_pnl_gbp"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.displayMode",
+                "value": "color-background"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COALESCE(session, CASE WHEN EXTRACT(HOUR FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') < 9 OR (EXTRACT(HOUR FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') = 9 AND EXTRACT(MINUTE FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') < 30) THEN 'premarket' WHEN EXTRACT(HOUR FROM buy_time::timestamptz AT TIME ZONE 'America/New_York') >= 16 THEN 'afterhours' ELSE 'regular' END) AS session, COUNT(*) AS n, ROUND(100.0 * SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS win_rate_pct, ROUND(AVG(profit_loss_pct)::numeric, 2) AS avg_pnl_pct, ROUND(SUM(profit_loss)::numeric, 2) AS total_pnl_gbp FROM trades WHERE status = 'closed' AND mode = '$mode' GROUP BY 1 ORDER BY total_pnl_gbp DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "Exit Reason Distribution (last 30 days)",
+      "description": "How positions are actually closing. afterhours_flatten (v21) = force-closed at 19:45 ET before the extended session ends; a high count there means entries are firing too late in the after-hours window to work the trade. eod_flatten = the RTH equivalent. stop = resting broker stop hit; time_stop / take_profit = polled exits.",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 59,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT exit_reason, COUNT(*) AS n, ROUND(AVG(profit_loss_pct)::numeric, 2) AS avg_pnl_pct, ROUND(SUM(profit_loss)::numeric, 2) AS total_pnl_gbp FROM trades WHERE status = 'closed' AND mode = '$mode' AND exit_reason IS NOT NULL AND sell_time::timestamptz >= NOW() - INTERVAL '30 days' GROUP BY exit_reason ORDER BY n DESC",
+          "format": "table",
           "refId": "A"
         }
       ]

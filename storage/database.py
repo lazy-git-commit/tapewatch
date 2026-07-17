@@ -163,6 +163,16 @@ def init_db() -> None:
                 ALTER TABLE trades
                 ADD COLUMN IF NOT EXISTS ratchet_armed INTEGER NOT NULL DEFAULT 0
             """)
+            # session (v21.1): which trading session the entry fired in
+            # (regular / premarket / afterhours). NULL for pre-v21.1 rows;
+            # backfilled read-side from buy_time when reporting. Persisting it
+            # explicitly — rather than always deriving from buy_time — makes
+            # "is after-hours actually profitable?" a first-class GROUP BY and
+            # matches how exit_reason is already stored on the row.
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS session TEXT
+            """)
             # catalyst_type on signals: which catalyst class Claude assigned.
             cur.execute("""
                 ALTER TABLE news_signals
@@ -346,6 +356,7 @@ def open_trade(
     buy_net_gbp: float | None = None,
     buy_fx_rate: float | None = None,
     buy_fees_gbp: float | None = None,
+    session: str | None = None,
 ) -> int:
     """Record an opening buy. Returns the trade id."""
     with get_conn() as conn:
@@ -353,12 +364,12 @@ def open_trade(
             cur.execute(
                 """INSERT INTO trades
                    (mode, ticker, signal_id, quantity, buy_price, buy_time, status,
-                    buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp)
-                   VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s)
+                    buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp, session)
+                   VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (cfg.trading_mode, ticker, signal_id, quantity, buy_price,
                  _now_london(),
-                 buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp),
+                 buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp, session),
             )
             row_id = cur.fetchone()["id"]
             # buy_price is in USD (T212 quotes US equities in USD); GBP cash
