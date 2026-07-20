@@ -309,12 +309,16 @@ def is_too_late_to_buy(session: str = REGULAR) -> bool:
     Return True if it is too close to the current session's hard exit
     boundary to open a new position.
 
-    regular    — within TIME_STOP_MINUTES of today's close (calendar-aware,
+    regular    — within ENTRY_CUTOFF_MINUTES of today's close (calendar-aware,
                  so early-close days are handled correctly).
-    afterhours — within TIME_STOP_MINUTES of the extended flatten time
+    afterhours — within ENTRY_CUTOFF_MINUTES of the extended flatten time
                  (session end − EXTENDED_FLATTEN_BUFFER_MINUTES): a position
-                 opened later could neither run its time stop nor be exited
-                 on a venue we can see (overnight = Blue Ocean, no data).
+                 opened later could neither develop before the flatten nor be
+                 exited on a venue we can see (overnight = Blue Ocean, no data).
+
+    ENTRY_CUTOFF_MINUTES is decoupled from the hold (TIME_STOP_MINUTES) as of
+    2026-07-20 — see config.settings.entry_cutoff_minutes. It defaults to the
+    time-stop value, so behavior is unchanged unless it is set explicitly.
     premarket  — never too late: positions carry into RTH, where the time
                  stop and the EOD flatten manage them normally.
 
@@ -328,7 +332,7 @@ def is_too_late_to_buy(session: str = REGULAR) -> bool:
         if mins_left is None:
             return False
         tradeable_left = mins_left - cfg.extended_flatten_buffer_minutes
-        return tradeable_left <= cfg.time_stop_minutes
+        return tradeable_left <= cfg.entry_cutoff_minutes
     try:
         now_utc = pd.Timestamp.now("UTC")
         today = now_utc.strftime("%Y-%m-%d")
@@ -337,12 +341,12 @@ def is_too_late_to_buy(session: str = REGULAR) -> bool:
             return False
         close_utc = sched.iloc[0]["market_close"]
         minutes_to_close = (close_utc - now_utc).total_seconds() / 60
-        return 0 < minutes_to_close <= cfg.time_stop_minutes
+        return 0 < minutes_to_close <= cfg.entry_cutoff_minutes
     except Exception:
         now_et = datetime.now(_ET)
         close_et = now_et.replace(hour=_MARKET_CLOSE[0], minute=_MARKET_CLOSE[1], second=0, microsecond=0)
         minutes_to_close = (close_et - now_et).total_seconds() / 60
-        return 0 < minutes_to_close <= cfg.time_stop_minutes
+        return 0 < minutes_to_close <= cfg.entry_cutoff_minutes
 
 
 def is_market_open() -> bool:

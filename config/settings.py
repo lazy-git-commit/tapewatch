@@ -272,6 +272,21 @@ class Settings:
     time_stop_minutes: int = field(
         default_factory=lambda: int(os.getenv("TIME_STOP_MINUTES", "60"))
     )
+    # How long before a session's hard exit boundary to STOP opening new
+    # positions. Decoupled from time_stop_minutes (2026-07-20): the forward-
+    # return panel showed the guidance_raise/fda_approval edge still building at
+    # 60 min, so the HOLD (time_stop_minutes) wants to grow — but coupling the
+    # entry cutoff to it would collapse the entry window (a 120-min hold would
+    # bar every entry after 14:00 ET). The cutoff only needs enough runway for a
+    # trade to develop before the EOD flatten, not the full hold; a position
+    # opened late simply gets flattened at EOD instead of running its time stop.
+    # Defaults to time_stop_minutes so an unset deployment keeps today's exact
+    # behavior; set ENTRY_CUTOFF_MINUTES explicitly to decouple them.
+    entry_cutoff_minutes: int = field(
+        default_factory=lambda: int(
+            os.getenv("ENTRY_CUTOFF_MINUTES", os.getenv("TIME_STOP_MINUTES", "60"))
+        )
+    )
     # v20 exit inversion: the STOP rests at the broker (zero-latency loss
     # side); the TP is polled by the monitor. Disable only for brokers/modes
     # where stop orders are unavailable — the monitor then polls both sides.
@@ -471,6 +486,7 @@ class Settings:
             ("STOP_LOSS_PCT", self.stop_loss_pct > 0),
             ("TAKE_PROFIT_PCT >= STOP_LOSS_PCT (min 1:1 R:R required)", self.take_profit_pct >= self.stop_loss_pct),
             ("TIME_STOP_MINUTES", self.time_stop_minutes > 0),
+            ("ENTRY_CUTOFF_MINUTES", self.entry_cutoff_minutes > 0),
             ("MONITOR_INTERVAL_SECONDS", self.monitor_interval_seconds > 0),
             ("EOD_FLATTEN_MINUTES", self.eod_flatten_minutes >= 0),
             ("SELL_LIMIT_SLACK_PCT", self.sell_limit_slack_pct >= 0),

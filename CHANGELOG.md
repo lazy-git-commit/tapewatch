@@ -7,6 +7,54 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.3 — 2026-07-20 (exit-horizon investigation: measure the hold, decouple the entry cutoff)
+
+Third straight low/zero-trade day prompted a full funnel + service audit. Verdict:
+**no data vendor is the bottleneck** — Benzinga (267 articles), Claude Haiku (one
+3-min 529, handled), Finnhub, and Twelvedata all performed. The constraint is the
+strategy's *exit horizon*. Of 51 high-confidence positives, only 3 had a tradeable
+catalyst; the standout, IREN (guidance_raise, ADV$ $1.3B), ran +17% and we never
+entered — blocked by `overextended` then `exhausted_bounce`.
+
+### What the backtest found (and overturned)
+- A 12-name intraday A/B (yfinance 1-min, one variable swapped at a time) **falsified
+  the initial hypothesis** that the `overextended` VWAP anchor was the bug: swapping
+  session-VWAP → trailing-15m-VWAP was *worse* (−2.52% vs −0.09%). Anchor left alone.
+- The **+5% take-profit never fired** across 13 entries — these catalysts don't pop,
+  they grind. Lowering it to +3% changed nothing.
+- Extending the **time-stop 60 → 120 min** was the only lever that moved the book,
+  but on that tiny sample it was IREN-dependent (fidelity-questionable), so it was
+  not shipped blind.
+- The **forward-return panel** (hundreds of samples, not 12) settled it: the two
+  tradeable catalysts' edge is **horizon-increasing** — guidance_raise +1.59%/5m →
+  +0.89%/15m → **+3.80%/60m** (83% positive); fda_approval −0.02% → +0.71% →
+  **+1.13%/60m**. The 60-min time-stop clips the edge mid-development. (The panel also
+  re-validated the v20 catalyst pruning: contract_win −0.12%, product_launch −0.29%,
+  earnings_beat −0.28% at 60m — correctly untraded.)
+
+### Shipped
+- **Forward returns now measure 120-min and EOD horizons** (`fwd_return_120m`,
+  `fwd_return_eod`). `update_forward_returns()` is COALESCE-guarded (a NULL recompute
+  never clobbers a measured value); `reset_for_extended_returns()` re-opens recent
+  in-yfinance-window rows once to backfill, self-limiting via `_FWD_RETURN_120M_DEPLOYED`.
+  Maturity guard 65 → 125 min so the 120-min window is complete before finalizing.
+  *This is the measurement that will size the hold on the full panel — deploy this,
+  let a week accrue, then set `TIME_STOP_MINUTES`.*
+- **Entry cutoff decoupled from the hold** (`ENTRY_CUTOFF_MINUTES`, new). Lengthening
+  `TIME_STOP_MINUTES` no longer collapses the entry window: `is_too_late_to_buy()` now
+  gates on the cutoff, not the hold. Unset → falls back to the time-stop value, so
+  behavior is unchanged until both are set. **To activate the longer hold on the VM:**
+  set `TIME_STOP_MINUTES=120` and `ENTRY_CUTOFF_MINUTES=60` in `.env`.
+
+### Deliberately NOT shipped
+- **Breakeven-ratchet trailing.** The 12-name sample was *underpowered* to judge it
+  (almost nothing armed-then-reversed — the pathology it targets), and a live trailing
+  stop adds resting-order churn + cancel/replace races to the gain-protection path for
+  no measured benefit. Deferred until the 120m/EOD panel says whether the ratchet
+  actually clips winners. No change to `RATCHET_*`.
+
+---
+
 ## v21.2 — 2026-07-17 (reconciliation done right; code-review findings)
 
 A same-day high-effort review of v21.1 found that its orphan-alert fix traded

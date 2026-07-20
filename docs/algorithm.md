@@ -83,8 +83,8 @@ trades, forward returns on all classified articles, and costed replay.
                         │  close−10min → EOD flatten (everything)    │
                         └────────────────────────────────────────────┘
 
- nightly 22:30 UTC      forward_returns — fills 5/15/60-min returns for
-                        every Claude classification (the eval loop)
+ nightly 22:30 UTC      forward_returns — fills 5/15/60/120-min + EOD returns
+                        for every Claude classification (the eval loop)
  daily 08:00 UTC        symbol_map_rebuild — refresh T212 ticker map
 ```
 
@@ -525,7 +525,7 @@ costs money on every single fast reversal.
 | **Stop loss** | **Resting STOP-MARKET sell placed at buy time** (`stop_order_id` on the trade). The broker executes the instant price touches the trigger. Stop-market, not stop-limit: when it triggers, the book is moving against us — certainty is the point; the ADV liquidity floor bounds expected slippage. If placement fails, the monitor falls back to the old polled stop (bounded limit + v19.2 market escalation after 3 unfilled attempts) | zero |
 | **Breakeven ratchet** | At +2% (1R) the resting stop is cancelled and re-placed at buy × 1.001, once per trade. A trade that has paid one risk unit may mean-revert but must not become a loser. If the replacement can't be placed, an in-process armed flag drives a POLLED breakeven stop — the ratchet only ever tightens protection | zero after arm |
 | **Take profit** | Polled at the monitor cadence; sells via bounded limit at current price × (1 − 1%) after cancelling the resting stop | ≤ 5s |
-| **Time stop** | 60 min after entry, polled; needs no price feed (fires even in a data outage). Kept at 60: the kept catalyst classes' measured drift is still building at the 60-minute horizon | ≤ 5s |
+| **Time stop** | `TIME_STOP_MINUTES` after entry (default 60), polled; needs no price feed (fires even in a data outage). **v21.3:** the 60-min forward-return panel showed the kept classes' drift *still climbing* at 60 min (guidance_raise +3.8%/60m, fda_approval +1.1%/60m) — i.e. 60 clips the grind mid-move. The hold is being lengthened toward the horizon the new 120m/EOD forward-return columns are measuring; **the entry cutoff is decoupled** (`ENTRY_CUTOFF_MINUTES`) so a longer hold doesn't shrink the entry window | ≤ 5s |
 | **EOD flatten** | ALL positions force-closed 10 min before the close with a market sell, regardless of P&L. Stops don't work overnight; one gap erases a month | — |
 
 Monitor cadence is 5s (was 20s): with the stop resting broker-side, the poll
@@ -878,8 +878,21 @@ loudly.
 ## 9. The eval loop (`analysis/forward_returns.py`)
 
 Every Claude classification is stored; nightly at 22:30 UTC the job fills in
-what the market actually did 5/15/60 minutes after each article (yfinance —
-retrospective, so delay is irrelevant and no Twelvedata credits are spent).
+what the market actually did 5/15/60/**120 minutes and by the session close
+(EOD)** after each article (yfinance — retrospective, so delay is irrelevant
+and no Twelvedata credits are spent).
+
+**Horizon extension (v21.3):** the 120m/EOD columns were added after the 60-min
+panel showed the two tradeable catalysts' edge still building at 60 min
+(guidance_raise: +1.59%/5m → +0.89%/15m → **+3.80%/60m**, 83% positive;
+fda_approval: −0.02% → +0.71% → **+1.13%/60m**) — the 60-min time-stop was
+exiting before the edge matured. These columns size the hold on the full panel
+instead of a one-week intraday backtest. `update_forward_returns()` is
+COALESCE-guarded (a NULL recompute never clobbers a measured value) and
+`reset_for_extended_returns()` re-opens recent in-window rows once to backfill,
+self-limiting via `_FWD_RETURN_120M_DEPLOYED` like the anchoring repair below.
+The maturity guard moved 65 → 125 min so the 120-min window is complete before
+a row is finalized.
 
 **Anchoring (v18):** returns are measured from `max(publish_time, session
 open)`. yfinance serves RTH bars only, so measuring a pre-market article "from

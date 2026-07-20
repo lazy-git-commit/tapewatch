@@ -2070,6 +2070,68 @@ class TestForwardReturnAnchoring:
             bars, anchor = _bars_and_anchor("ACME", published)
         assert bars is None and anchor is None
 
+    def test_120m_forward_return(self):
+        # 120 bars past the open on the 100→139 ramp: 100 → 112 = +12%.
+        from analysis.forward_returns import _forward_return
+        bars = self._session_bars()
+        r120 = _forward_return(bars, bars.index[0], 120)
+        assert r120 == pytest.approx(12.0, abs=0.1)
+
+    def test_eod_return_measures_to_close(self):
+        # From the open to the session's LAST bar: 100 → 139 = +39%.
+        from analysis.forward_returns import _eod_return
+        bars = self._session_bars()
+        assert _eod_return(bars, bars.index[0]) == pytest.approx(39.0, abs=0.1)
+
+    def test_eod_return_none_when_anchor_past_last_bar(self):
+        import pandas as pd
+        from analysis.forward_returns import _eod_return
+        bars = self._session_bars()
+        after = bars.index[-1] + pd.Timedelta(minutes=5)
+        assert _eod_return(bars, after) is None
+
+
+# ── Entry-cutoff / hold-horizon decoupling (v21.3) ───────────────────────────
+
+class TestEntryCutoffDecoupling:
+    """
+    ENTRY_CUTOFF_MINUTES governs how late a new position may open; it is
+    decoupled from TIME_STOP_MINUTES (the hold) so lengthening the hold does
+    not collapse the entry window. Unset, it falls back to the time-stop value
+    (behavior unchanged).
+    """
+
+    def _settings(self, env: dict):
+        import os
+        from config.settings import Settings
+        # Start from a clean slate for both knobs, then apply the case's env.
+        base = {k: v for k, v in os.environ.items()
+                if k not in ("ENTRY_CUTOFF_MINUTES", "TIME_STOP_MINUTES")}
+        base.update(env)
+        with patch.dict(os.environ, base, clear=True):
+            return Settings()
+
+    def test_defaults_to_time_stop_when_unset(self):
+        s = self._settings({"TIME_STOP_MINUTES": "45"})
+        assert s.entry_cutoff_minutes == 45  # falls back to the hold value
+
+    def test_env_override_decouples_from_hold(self):
+        s = self._settings({"TIME_STOP_MINUTES": "120", "ENTRY_CUTOFF_MINUTES": "60"})
+        assert s.time_stop_minutes == 120
+        assert s.entry_cutoff_minutes == 60  # independent of the longer hold
+
+    def test_is_too_late_uses_entry_cutoff_not_time_stop(self):
+        import market.price_check as pc
+        # tradeable_left = 100 - 15 = 85 min before the afterhours flatten.
+        with patch.object(pc, "minutes_until_session_end", return_value=100), \
+             patch.object(pc.cfg, "extended_flatten_buffer_minutes", 15), \
+             patch.object(pc.cfg, "time_stop_minutes", 120):
+            with patch.object(pc.cfg, "entry_cutoff_minutes", 60):
+                assert pc.is_too_late_to_buy(pc.AFTERHOURS) is False   # 85 > 60
+            with patch.object(pc.cfg, "entry_cutoff_minutes", 90):
+                assert pc.is_too_late_to_buy(pc.AFTERHOURS) is True    # 85 <= 90
+        # time_stop_minutes=120 throughout: the decision tracks the cutoff, not the hold.
+
 
 # ── Precision-retry robustness (trading/executor.py) ─────────────────────────
 

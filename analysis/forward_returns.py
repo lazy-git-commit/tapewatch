@@ -5,9 +5,12 @@ The feedback loop for the Claude news classifier.
 
 Every classification (positive / neutral / negative) is stored in the
 sentiment_scores table at scoring time. This job runs nightly, after the
-close, and fills in what the market actually did in the 5 / 15 / 60 minutes
-after each article published — using free yfinance data, since this is
-retrospective analysis (no Twelvedata credits, no real-time requirement).
+close, and fills in what the market actually did in the 5 / 15 / 60 / 120
+minutes and by the session close (EOD) after each article published — using
+free yfinance data, since this is retrospective analysis (no Twelvedata
+credits, no real-time requirement). The 120m/EOD horizons (added 2026-07-20)
+exist to size the hold: the 60-min panel showed the tradeable-catalyst edge
+still climbing at 60 min, so the time-stop needs measuring past it.
 
 Why this matters more than any individual filter tweak:
   Without measured forward returns there is no way to know whether a prompt
@@ -48,7 +51,7 @@ _ET = pytz.timezone("America/New_York")
 
 from storage.database import (
     get_scores_missing_returns, update_forward_returns,
-    reset_contaminated_forward_returns,
+    reset_contaminated_forward_returns, reset_for_extended_returns,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +99,19 @@ def _forward_return(bars: pd.DataFrame, ts: datetime, minutes: int) -> float | N
     p1 = _price_at_or_after(bars, ts + timedelta(minutes=minutes))
     if p0 is None or p1 is None or p0 <= 0:
         return None
+    return (p1 - p0) / p0 * 100
+
+
+def _eod_return(bars: pd.DataFrame, ts: datetime) -> float | None:
+    """
+    % return from the anchor to the session's LAST bar — how far the catalyst
+    ran by the close, the horizon the EOD flatten actually holds to. yfinance
+    serves RTH bars only, so bars[-1] is the ~16:00 ET print for that session.
+    """
+    p0 = _price_at_or_after(bars, ts)
+    if p0 is None or p0 <= 0 or bars.empty:
+        return None
+    p1 = float(bars["Close"].iloc[-1])
     return (p1 - p0) / p0 * 100
 
 
@@ -166,6 +182,19 @@ def compute_forward_returns(batch_limit: int = 500, max_batches: int = 25) -> in
     except Exception as exc:
         logger.error("Forward returns: contamination repair failed: %s", exc)
 
+    # One-time backfill of the 120m/EOD horizons onto recent already-computed
+    # rows (see reset_for_extended_returns). Self-limiting to rows still inside
+    # yfinance's 1-min window; reprocessed rows won't match again.
+    try:
+        n_ext = reset_for_extended_returns()
+        if n_ext:
+            logger.info(
+                "Forward returns: re-opened %d recent rows to backfill 120m/EOD horizons",
+                n_ext,
+            )
+    except Exception as exc:
+        logger.error("Forward returns: 120m/EOD backfill re-open failed: %s", exc)
+
     total_updated = 0
     for _ in range(max_batches):
         rows = get_scores_missing_returns(limit=batch_limit)
@@ -197,21 +226,25 @@ def _compute_batch(rows: list[dict]) -> int:
             updated += 1
             continue
 
-        # Skip articles published less than ~65 min ago — the 60-min window
-        # hasn't finished printing yet; leave for tomorrow's run.
-        if (datetime.now(timezone.utc) - published).total_seconds() < 65 * 60:
+        # Skip articles published less than ~125 min ago — the 120-min window
+        # hasn't finished printing yet; leave for tomorrow's run. (The nightly
+        # 22:30 UTC run is ~2.5h after the close, so same-day rows are always
+        # matured; this guard only bites on an off-schedule manual run.)
+        if (datetime.now(timezone.utc) - published).total_seconds() < 125 * 60:
             continue
 
         bars, anchor = _bars_and_anchor(symbol, published)
         if bars is None or anchor is None:
-            update_forward_returns(row["id"], None, None, None)
+            update_forward_returns(row["id"], None, None, None, None, None)
             updated += 1
             continue
 
         r5 = _forward_return(bars, anchor, 5)
         r15 = _forward_return(bars, anchor, 15)
         r60 = _forward_return(bars, anchor, 60)
-        update_forward_returns(row["id"], r5, r15, r60)
+        r120 = _forward_return(bars, anchor, 120)
+        reod = _eod_return(bars, anchor)
+        update_forward_returns(row["id"], r5, r15, r60, r120, reod)
         updated += 1
 
     logger.info("Forward returns: computed %d/%d pending rows", updated, len(rows))

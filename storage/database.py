@@ -18,7 +18,7 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.errors
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import pytz
 from config.settings import cfg
@@ -222,6 +222,20 @@ def init_db() -> None:
             cur.execute("""
                 ALTER TABLE sentiment_scores
                 ADD COLUMN IF NOT EXISTS catalyst_magnitude INTEGER
+            """)
+            # Longer-horizon forward returns (added 2026-07-20): the 60-min panel
+            # showed the tradeable-catalyst edge (guidance_raise +3.8%/60m,
+            # fda_approval +1.1%/60m) still CLIMBING at the 60-min mark, so the
+            # 60-min time-stop was clipping it mid-development. These two columns
+            # measure how far the edge actually runs, to size the hold horizon on
+            # a large sample instead of a one-week yfinance backtest.
+            cur.execute("""
+                ALTER TABLE sentiment_scores
+                ADD COLUMN IF NOT EXISTS fwd_return_120m REAL
+            """)
+            cur.execute("""
+                ALTER TABLE sentiment_scores
+                ADD COLUMN IF NOT EXISTS fwd_return_eod REAL
             """)
             # Pre-market watchlist: news scored before the open, evaluated at
             # open + open_block with gap/momentum confirmation. status:
@@ -709,17 +723,74 @@ def reset_contaminated_forward_returns(cutoff: str = _FWD_RETURN_FIX_DEPLOYED) -
             return cur.rowcount
 
 
-def update_forward_returns(score_id: int, r5: float | None, r15: float | None, r60: float | None) -> None:
-    """Fill in the 5/15/60-min forward returns for one scored article."""
+# Deploy date of the 120m/EOD forward-return columns (added 2026-07-20). Rows
+# computed BEFORE this date carry NULL in the new columns because the old job
+# never measured those horizons. reset_for_extended_returns() re-opens the
+# recent (still in yfinance's 1-min window) subset once so they refill with all
+# five horizons; self-limiting exactly like _FWD_RETURN_FIX_DEPLOYED.
+_FWD_RETURN_120M_DEPLOYED = "2026-07-20"
+
+
+def update_forward_returns(
+    score_id: int,
+    r5: float | None,
+    r15: float | None,
+    r60: float | None,
+    r120: float | None = None,
+    reod: float | None = None,
+) -> None:
+    """
+    Fill in the forward returns for one scored article.
+
+    COALESCE-guarded so a recompute that comes back NULL for a horizon (e.g. a
+    transient yfinance miss, or a late-day article whose 120-min window runs
+    past the close) never clobbers a value an earlier run already measured.
+    returns_computed_at is always advanced, so the row leaves the pending set.
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE sentiment_scores
-                   SET fwd_return_5m = %s, fwd_return_15m = %s, fwd_return_60m = %s,
+                   SET fwd_return_5m   = COALESCE(%s, fwd_return_5m),
+                       fwd_return_15m  = COALESCE(%s, fwd_return_15m),
+                       fwd_return_60m  = COALESCE(%s, fwd_return_60m),
+                       fwd_return_120m = COALESCE(%s, fwd_return_120m),
+                       fwd_return_eod  = COALESCE(%s, fwd_return_eod),
                        returns_computed_at = %s
                    WHERE id = %s""",
-                (r5, r15, r60, _now_london(), score_id),
+                (r5, r15, r60, r120, reod, _now_london(), score_id),
             )
+
+
+def reset_for_extended_returns(
+    cutoff: str = _FWD_RETURN_120M_DEPLOYED, lookback_days: int = 25
+) -> int:
+    """
+    One-time backfill of the 120m/EOD columns onto RECENT already-computed rows.
+
+    Only rows scored within the last `lookback_days` are eligible — beyond
+    yfinance's ~30-day 1-min history there is no data to fetch, so re-opening
+    older rows would just churn them to NULL. Clearing returns_computed_at pushes
+    the eligible rows back through the normal nightly path, where they recompute
+    with all five horizons. Self-limiting: reprocessed rows get a fresh
+    returns_computed_at at/after the cutoff and never match this predicate again
+    (so late-day rows whose 120m window is genuinely unavailable are not retried
+    forever). scored_at / returns_computed_at are ISO text; prefix comparison is
+    lexicographically correct.
+    """
+    floor_day = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE sentiment_scores
+                   SET returns_computed_at = NULL
+                   WHERE returns_computed_at IS NOT NULL
+                     AND returns_computed_at < %s
+                     AND fwd_return_120m IS NULL
+                     AND scored_at >= %s""",
+                (cutoff, floor_day),
+            )
+            return cur.rowcount
 
 
 # ── Pre-market candidates (v14) ───────────────────────────────────────────────
