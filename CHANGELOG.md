@@ -7,6 +7,44 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.4 — 2026-07-22 (SMCI miss post-mortem: forward-returns ticker bug, guidance-raise routing)
+
+SMCI's afterhours $60B-order/margin-guidance pop (+7% that session, +18% more
+overnight) never traded. Investigation, not a vendor failure: Benzinga
+delivered the article, Claude scored it sentiment=positive — and the code
+correctly gated it out, because Claude tagged it `catalyst_type=earnings_beat`,
+which v20 pruned from `TRADEABLE_CATALYSTS` on measured evidence. Working as
+designed. Confirmed via `Gate [catalyst]: SMCIl_EQ positive but
+catalyst=earnings_beat not tradeable — skipping` in the logs.
+
+### Bug found and fixed
+- **`analysis/forward_returns.py` derived the yfinance ticker with a naive
+  `ticker.split("_")[0]`** instead of reusing `trading.executor.t212_to_symbol()`
+  (already correct, already used by the live quote path). Any T212 code outside
+  the plain `SYMBOL_US_EQ` shape — `SMCIl_EQ`, the known `FLY1_US_EQ` pattern, ETF
+  `_EQ`-without-`_US` codes — mangled into a nonexistent ticker, yfinance failed
+  ("possibly delisted"), and the row was permanently marked computed with
+  all-NULL returns. Sized: **61 distinct malformed codes, 400+ poisoned
+  `sentiment_scores` rows, 5,021 log errors over the prior 30 days**
+  (`METAl_EQ` alone: 105 rows). Live trading was unaffected — this only
+  blinded the eval loop the v20/v21.3 catalyst-pruning decisions are measured
+  against. Fixed by reuse; `reset_for_ticker_fix()` (self-limiting, cutoff
+  `2026-07-22`, mirrors `reset_for_extended_returns`) backfills the poisoned
+  rows once.
+
+### Also shipped (unvalidated — needs a forward-return measurement period)
+- **Preliminary-results routing fix in the Claude classification prompt**:
+  headlines shaped like "Reports Preliminary Q_ Revenue...; Margins Expected
+  In Range Of X%-Y%" are now routed to `catalyst_type=guidance_raise` instead
+  of defaulting to `earnings_beat` — this is the exact SMCI headline shape.
+  Routing only: sentiment still requires an explicit comparison baseline in
+  the text ("raised from X", "vs. prior guidance") to call a direction, so
+  this specific SMCI article — which never stated the 8.2–8.4% baseline —
+  would likely still have scored neutral. Closes the gap for future cases
+  that do state the comparison. Not a re-opening of `earnings_beat`.
+
+---
+
 ## v21.3 — 2026-07-20 (exit-horizon investigation: measure the hold, decouple the entry cutoff)
 
 Third straight low/zero-trade day prompted a full funnel + service audit. Verdict:

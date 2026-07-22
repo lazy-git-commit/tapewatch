@@ -353,6 +353,22 @@ ma_target, ma_acquirer, contract_win, product_launch, short_squeeze,
 partnership, offering_dilution, halt_or_resume, recap_explainer,
 analyst_action, other.
 
+PRELIMINARY RESULTS / PRE-ANNOUNCEMENTS: a headline shaped like "Company
+Reports Preliminary Q_ Revenue To Be [Above/Near/Below] $XB–$YB Range; ...
+Margins Expected In Range Of A%–B%" (or "Updates Q_ Outlook", "Pre-Announces
+Q_ Results") is the company guiding the market AHEAD of its scheduled
+earnings date — this is a guidance event, not a completed report.
+catalyst_type=guidance_raise, not earnings_beat. Reserve earnings_beat for a
+completed report compared against a stated consensus estimate (headline
+contains "Beats"/"Misses"/"vs. Est"). This distinction is about ROUTING only
+— it does not relax STEP 3's evidence bar: without an explicit comparison
+point in the text ("vs. prior guidance of X", "raised from Y", "Beats Z
+Est"), you cannot tell whether a bare figure is a raise or a cut, so
+sentiment stays neutral/low-confidence exactly as it would for any other
+unanchored number. Getting the type right just means a LATER article with
+the missing comparison (or a same-day follow-up load — see SAME-TICKER
+CONTEXT) is no longer misrouted into a bucket this system never trades.
+
 Confidence calibration (0.0–1.0):
 - 0.8–1.0: unambiguous, binding, material, first-report catalyst
   (earnings beat with numbers, FDA approval, definitive M&A as target)
@@ -416,6 +432,18 @@ Headline: "Acme Signs Non-Binding LOI To Merge With Beta Corp"
 
 Headline: "SmallCorp Wins $45M DoD Contract (Annual Revenue ~$120M)"
 → {"sentiment": "positive", "confidence": 0.85, "catalyst_type": "contract_win", "already_moved": false, "catalyst_magnitude": 4}
+
+Headline: "Acme Corp Reports Preliminary Q4 Revenue To Be Near Low End Of
+$900M-$950M Range; Non-GAAP Gross Margin Expected In Range Of 30%-33%"
+→ {"sentiment": "neutral", "confidence": 0.35, "catalyst_type": "guidance_raise", "already_moved": false, "catalyst_magnitude": 2}
+(A pre-announcement, so catalyst_type=guidance_raise even though nothing here
+is confirmed positive — the margin range has no prior-guidance baseline to
+compare against, so sentiment stays neutral/low-confidence rather than
+guessing. Compare to the next example, which gives the missing baseline.)
+
+Headline: "Acme Corp Raises Q4 Non-GAAP Gross Margin Guidance To 30%-33%,
+Up From Prior 18%-20%"
+→ {"sentiment": "positive", "confidence": 0.85, "catalyst_type": "guidance_raise", "already_moved": false, "catalyst_magnitude": 4}
 
 Classify every article you are given. Use the classify_articles tool."""
 

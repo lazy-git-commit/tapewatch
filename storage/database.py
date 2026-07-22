@@ -793,6 +793,53 @@ def reset_for_extended_returns(
             return cur.rowcount
 
 
+# Deploy date of the forward_returns ticker-symbol fix (2026-07-22): the
+# nightly job used to derive the yfinance symbol with a naive
+# `ticker.split("_")[0]`, which mangles any T212 code that isn't the plain
+# SYMBOL_US_EQ shape (FLY1_US_EQ, SMCIl_EQ, ETF "_EQ"-without-"_US" codes,
+# ...) into a nonexistent ticker — yfinance then fails ("possibly delisted")
+# and the row is permanently marked computed with all-NULL returns. Found via
+# the 2026-07-22 SMCI investigation: 61 distinct malformed ticker codes, 400+
+# poisoned rows, 5,000+ log errors over the prior 30 days. The fix reuses
+# trading.executor.t212_to_symbol (already correct, already used by the live
+# quote path) instead of reimplementing the split here.
+_TICKER_FIX_DEPLOYED = "2026-07-22"
+
+
+def reset_for_ticker_fix(
+    cutoff: str = _TICKER_FIX_DEPLOYED, lookback_days: int = 25
+) -> int:
+    """
+    One-time repair for the naive-symbol-split bug: null out returns_computed_at
+    for rows whose forward returns are ALL NULL (the failure signature — a
+    malformed symbol never got a single bar back from yfinance) and were
+    computed before the fix deployed, so the nightly job recomputes them with
+    the corrected t212_to_symbol mapping. Rows whose no-data outcome is
+    genuine (real delisting, OTC, too-recent IPO) simply fail again — harmless,
+    and self-limiting: recomputed rows carry a fresh returns_computed_at at/after
+    the cutoff and never match this predicate again. Only rows scored within
+    lookback_days are eligible — beyond yfinance's ~30-day 1-min window there is
+    no data to recover regardless of the symbol fix.
+    """
+    floor_day = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE sentiment_scores
+                   SET returns_computed_at = NULL
+                   WHERE returns_computed_at IS NOT NULL
+                     AND returns_computed_at < %s
+                     AND fwd_return_5m IS NULL
+                     AND fwd_return_15m IS NULL
+                     AND fwd_return_60m IS NULL
+                     AND fwd_return_120m IS NULL
+                     AND fwd_return_eod IS NULL
+                     AND scored_at >= %s""",
+                (cutoff, floor_day),
+            )
+            return cur.rowcount
+
+
 # ── Pre-market candidates (v14) ───────────────────────────────────────────────
 
 def is_premarket_candidate_seen(article_id: str, ticker: str) -> bool:

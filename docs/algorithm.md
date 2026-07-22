@@ -906,6 +906,18 @@ nightly (batched, up to 12,500 rows) — the old single 500-row pass fell
 ~500 rows/day behind and was quietly heading for permanent-NULL territory
 once rows aged past yfinance's ~30-day 1-min history window.
 
+**Ticker resolution (v21.4):** the job used to derive the yfinance symbol with
+a naive `ticker.split("_")[0]`, which mangles any T212 code outside the plain
+`SYMBOL_US_EQ` shape (`SMCIl_EQ`, the known `FLY1_US_EQ` pattern, ETF
+`_EQ`-without-`_US` codes) into a ticker that doesn't exist — yfinance fails
+("possibly delisted") and the row is permanently marked computed with
+all-NULL returns. Found via the 2026-07-22 SMCI post-mortem: 61 malformed
+codes, 400+ poisoned rows, 5,021 log errors over the prior 30 days — the eval
+loop's blind spot, not a live-trading bug (`market/price_check.py` already
+used the correct `t212_to_symbol()`). Fixed by reusing that same resolver;
+`reset_for_ticker_fix()` backfills the poisoned rows once, self-limiting via
+`_TICKER_FIX_DEPLOYED` like the two repairs above it.
+
 This converts prompt engineering from guesswork into measurement:
 
 ```sql

@@ -52,7 +52,9 @@ _ET = pytz.timezone("America/New_York")
 from storage.database import (
     get_scores_missing_returns, update_forward_returns,
     reset_contaminated_forward_returns, reset_for_extended_returns,
+    reset_for_ticker_fix,
 )
+from trading.executor import t212_to_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +197,22 @@ def compute_forward_returns(batch_limit: int = 500, max_batches: int = 25) -> in
     except Exception as exc:
         logger.error("Forward returns: 120m/EOD backfill re-open failed: %s", exc)
 
+    # One-time repair of rows poisoned by the naive-symbol-split bug (any T212
+    # code that isn't the plain SYMBOL_US_EQ shape — FLY1_US_EQ, SMCIl_EQ, the
+    # ETF _EQ-without-_US codes, ...) resolved to a garbage yfinance ticker and
+    # got permanently marked computed with all-NULL returns. Self-limiting:
+    # only rows fully NULL and computed before this fix's deploy date.
+    try:
+        n_fix = reset_for_ticker_fix()
+        if n_fix:
+            logger.warning(
+                "Forward returns: reset %d rows poisoned by the naive-symbol-split "
+                "bug — recomputing with t212_to_symbol",
+                n_fix,
+            )
+    except Exception as exc:
+        logger.error("Forward returns: ticker-fix backfill re-open failed: %s", exc)
+
     total_updated = 0
     for _ in range(max_batches):
         rows = get_scores_missing_returns(limit=batch_limit)
@@ -214,7 +232,12 @@ def _compute_batch(rows: list[dict]) -> int:
     """Process one batch of pending rows; returns the number updated."""
     updated = 0
     for row in rows:
-        symbol = str(row["ticker"]).split("_")[0]  # AAPL_US_EQ → AAPL
+        # t212_to_symbol handles the common AAPL_US_EQ shape AND the T212
+        # quirk codes a naive split mangles (FLY1_US_EQ, SMCIl_EQ, ...) —
+        # those silently poisoned ~400 rows / 5k+ yfinance errors/month
+        # (observed 2026-07-22) before this was reused from trading.executor
+        # instead of reimplemented here.
+        symbol = t212_to_symbol(str(row["ticker"]))
         try:
             published = datetime.fromisoformat(str(row["published_at"]).replace("Z", "+00:00"))
             if published.tzinfo is None:

@@ -2091,6 +2091,63 @@ class TestForwardReturnAnchoring:
         assert _eod_return(bars, after) is None
 
 
+class TestForwardReturnsTickerResolution:
+    """
+    Found via the 2026-07-22 SMCI investigation: _compute_batch used to derive
+    the yfinance symbol with a naive `ticker.split("_")[0]`, which mangles any
+    T212 code that isn't the plain SYMBOL_US_EQ shape (FLY1_US_EQ, SMCIl_EQ,
+    ETF "_EQ"-without-"_US" codes, ...) into a ticker that doesn't exist —
+    yfinance then fails and the row is permanently marked computed with
+    all-NULL returns (61 malformed codes / 400+ poisoned rows / 5,000+ log
+    errors over the prior 30 days). Must reuse trading.executor.t212_to_symbol
+    — already correct, already used by the live quote path — instead of
+    reimplementing the split here.
+    """
+
+    def _row(self, ticker: str) -> dict:
+        return {"id": 1, "ticker": ticker, "published_at": "2026-07-01T15:00:00+00:00"}
+
+    def test_compute_batch_resolves_malformed_ticker_via_t212_map(self):
+        import trading.executor as ex
+        from analysis import forward_returns as fr
+
+        saved = ex._t212_to_symbol
+        ex._t212_to_symbol = {"SMCIl_EQ": "SMCI"}
+        captured = {}
+
+        def fake_bars(symbol, day):
+            captured["symbol"] = symbol
+            return None
+
+        try:
+            with patch.object(fr, "_get_intraday_bars", side_effect=fake_bars), \
+                 patch.object(fr, "update_forward_returns"):
+                fr._compute_batch([self._row("SMCIl_EQ")])
+        finally:
+            ex._t212_to_symbol = saved
+        assert captured["symbol"] == "SMCI"
+
+    def test_compute_batch_falls_back_to_split_when_unmapped(self):
+        import trading.executor as ex
+        from analysis import forward_returns as fr
+
+        saved = ex._t212_to_symbol
+        ex._t212_to_symbol = {}
+        captured = {}
+
+        def fake_bars(symbol, day):
+            captured["symbol"] = symbol
+            return None
+
+        try:
+            with patch.object(fr, "_get_intraday_bars", side_effect=fake_bars), \
+                 patch.object(fr, "update_forward_returns"):
+                fr._compute_batch([self._row("AAPL_US_EQ")])
+        finally:
+            ex._t212_to_symbol = saved
+        assert captured["symbol"] == "AAPL"
+
+
 # ── Entry-cutoff / hold-horizon decoupling (v21.3) ───────────────────────────
 
 class TestEntryCutoffDecoupling:
