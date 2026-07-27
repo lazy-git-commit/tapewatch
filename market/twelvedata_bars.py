@@ -204,6 +204,71 @@ def _emit_credit_exhausted_event() -> bool:
         return False
 
 
+# ── Extended-hours (prepost) capability latch — v21.6 ────────────────────────
+# Pre/post-market bars are a PLAN ENTITLEMENT on Twelvedata, not a per-symbol
+# coverage question: below the Pro/Venture tier every prepost=true request
+# returns HTTP 403 with "Pre-market and post-market data are available on the
+# Pro plan …", for every symbol, forever. Before this latch the failure was
+# indistinguishable from "this ticker has no data": each after-hours signal
+# burned 3 retries with backoff, returned None, and — because main.py counts a
+# no-data result as a no-quote strike — permanently blacklisted the ticker for
+# the rest of the process lifetime. On 2026-07-27 that silently removed CDNS,
+# SANM, CLS, KFRC, LOKB, TFII, SJW, SUI, LC (all liquid, all perfectly covered
+# during RTH) from the tradeable universe; 16 such names had accumulated over
+# six days of uptime.
+#
+# So feature-detect ONCE per process and remember. After the latch trips,
+# prepost requests short-circuit before any HTTP call: no credits, no 403
+# storm, no false no-coverage verdict. The system stays fail-closed for
+# extended-hours entries (no bars → no confirmation → no trade) but stops
+# damaging the RTH pipeline on its way there. Mirrors the executor's
+# _extended_limit_supported latch.
+#
+# None = not yet probed, True = plan includes prepost, False = plan does not.
+_prepost_supported: bool | None = None
+_PREPOST_DENIED_MARKER = "pre-market and post-market data are available"
+
+
+def extended_bars_available() -> bool:
+    """False once the plan has been proven not to carry extended-hours bars."""
+    return _prepost_supported is not False
+
+
+def _error_message(resp) -> str:
+    """Best-effort provider error text from a response, never raises."""
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            return str(body.get("message") or body)
+        return str(body)
+    except Exception:
+        return (resp.text or "")[:200]
+
+
+def _note_prepost_denied(detail: str) -> None:
+    """Latch the plan-level prepost denial and record it once, loudly."""
+    global _prepost_supported
+    if _prepost_supported is False:
+        return
+    _prepost_supported = False
+    logger.error(
+        "Twelvedata plan does NOT include pre/post-market data — extended-hours "
+        "bar requests are disabled for this process (no credits will be spent on "
+        "them). Premarket/after-hours ENTRIES cannot be confirmed until the plan "
+        "is upgraded; regular-hours trading is unaffected. Provider said: %s",
+        detail,
+    )
+    try:
+        from storage.database import record_system_event
+        record_system_event(
+            "twelvedata_prepost_unavailable",
+            "prepost=true returns HTTP 403 (plan entitlement) — extended-hours "
+            "bar fetches disabled for this process; RTH unaffected",
+        )
+    except Exception as exc:
+        logger.debug("Could not record prepost-unavailable system_event: %s", exc)
+
+
 def _record_credit_use() -> None:
     """Count one Twelvedata credit and warn (once/day) when approaching the cap.
 
@@ -317,6 +382,14 @@ def _get_time_series(
     is exhausted (credits_exhausted()). This is what stops the 18s-per-call 429
     storm once the budget is spent.
     """
+    # Plan does not carry extended-hours bars (proven earlier this process):
+    # skip before spending a credit or a token on a guaranteed 403.
+    if prepost and _prepost_supported is False:
+        logger.debug(
+            "Twelvedata prepost unavailable on this plan — skipping extended "
+            "bar fetch for %s", symbol,
+        )
+        return None
     if credits_exhausted():
         return None
     if not _claim_minute_token():
@@ -368,14 +441,27 @@ def _get_time_series(
                 )
                 time.sleep(wait)
                 continue
+            # 403 on a prepost request is a PLAN entitlement wall, not a
+            # symbol problem: latch it so we never pay for it again. Checked
+            # before raise_for_status() so the provider's own message survives.
+            if resp.status_code == 403:
+                detail = _error_message(resp)
+                if prepost and _PREPOST_DENIED_MARKER in detail.lower():
+                    _note_prepost_denied(detail)
+                    return None
+                logger.warning("Twelvedata HTTP 403 for %s: %s", symbol, detail)
+                return None
             resp.raise_for_status()
             data = resp.json()
             if data.get("status") == "error":
+                message = str(data.get("message", "unknown"))
+                # Same entitlement wall, should the provider ever serve it as
+                # 200 + status:error rather than a 403.
+                if prepost and _PREPOST_DENIED_MARKER in message.lower():
+                    _note_prepost_denied(message)
+                    return None
                 # API-level errors (bad symbol, no data) — don't retry
-                logger.warning(
-                    "Twelvedata API error for %s: %s",
-                    symbol, data.get("message", "unknown"),
-                )
+                logger.warning("Twelvedata API error for %s: %s", symbol, message)
                 return None
             values = data.get("values", [])
             # Must be a non-empty LIST: a dict/string here would make callers

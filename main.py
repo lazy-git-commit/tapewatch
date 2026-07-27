@@ -59,7 +59,7 @@ from market.price_check import (
     confirm_price_signal, is_too_late_to_buy, PriceConfirmation,
 )
 from market.sessions import (
-    get_trading_session, is_entry_session, REGULAR, EXTENDED_SESSIONS,
+    get_trading_session, is_entry_session, REGULAR, EXTENDED_SESSIONS, _ET,
 )
 from trading.executor import (
     buy, sell, build_symbol_map, place_stop_loss, cancel_order,
@@ -107,7 +107,21 @@ _retry_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"ite
 # overextended joined in v20: "too far above VWAP to place a stop sensibly"
 # is a property of THIS MINUTE's price, not of the catalyst — the re-eval
 # queue converts it into a first-pullback entry (see price_check gate 10.2).
-_TRANSIENT_REJECT_CODES = frozenset({"low_volume", "low_momentum", "overextended"})
+# opening_block joined in v21.6: it is the ONLY gate whose condition is a
+# pure countdown — "N minutes since the session boundary, block lasts
+# cfg.open_block_minutes" is guaranteed false a few minutes later, yet it was
+# terminal, so a catalyst that printed inside the window was discarded
+# outright. Eight signals died this way, four of them in the current
+# tradeable-catalyst set: CDNS ×2 (guidance_raise, conf 0.88/0.85) at 4.0 and
+# 4.1 min into the after-hours boundary on 2026-07-27 — sixty seconds short —
+# plus TXN (2026-07-22) and THRM (2026-07-20). Earnings and guidance print in
+# the first minutes after 16:00 ET, which is exactly the window this gate
+# covers, so terminal handling here forfeits the densest catalyst window of
+# the day. The block itself is sound and unchanged (auction/MOC noise is real);
+# only its permanence was wrong.
+_TRANSIENT_REJECT_CODES = frozenset(
+    {"low_volume", "low_momentum", "overextended", "opening_block"}
+)
 _REEVAL_TTL_MINUTES = 15
 _reeval_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"item", "signal_id", "expires_at"}
 
@@ -120,28 +134,69 @@ _reeval_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"it
 # EGGF/OXAC looped from 15:38 to past 18:00 with zero upside.
 #
 # After _NO_QUOTE_BLACKOUT_RETRIES consecutive no-data retries for a ticker, we
-# add it to this set for the rest of the session. New articles for blacklisted
-# tickers are skipped before price-check (same as a seen-article). The set resets
-# on service restart (it's session-scoped, not persistent — a daily restart
-# gives a clean slate).
-_NO_QUOTE_BLACKOUT_RETRIES = 2   # strikes before permanent session suppression
+# add it to this set. New articles for blacklisted tickers are skipped before
+# price-check (same as a seen-article).
+#
+# Scope (v21.6): the blackout means "no provider carries this instrument", so
+# only a miss in a session where data is genuinely EXPECTED may count toward
+# it. Two rules, both bought by the same incident (2026-07-27):
+#
+#  1. Extended sessions never accrue strikes. Twelvedata serves pre/post bars
+#     only on the Pro tier and Finnhub's free quote freezes at the 16:00 close,
+#     so an after-hours miss is the NORMAL state of the world here and proves
+#     nothing about the ticker. Counting it blacklisted CDNS, SANM, CLS, KFRC,
+#     LOKB, TFII, SJW, SUI and LC — every one a liquid large/mid cap with
+#     perfect RTH coverage — purely for reporting earnings after the bell.
+#  2. The blackout resets on a new ET trading day. The original comment
+#     assumed "a daily restart gives a clean slate", but the service is a
+#     long-running systemd unit: it had gone six days and 16 tickers without a
+#     restart. A per-day reset is what the design always meant, and it bounds
+#     the damage of any future false positive to one session.
+_NO_QUOTE_BLACKOUT_RETRIES = 2   # strikes before session suppression
 _no_quote_ticker_strikes: dict[str, int] = {}   # ticker → consecutive no-data count
 _no_quote_blackout: set[str] = set()            # tickers suppressed for this session
+_no_quote_blackout_day: str | None = None       # ET date the sets above belong to
 
 
-def _queue_retry(item: NewsItem) -> None:
+def _reset_no_quote_blackout_if_new_day() -> None:
+    """Clear the no-quote blackout when the ET trading day rolls over."""
+    global _no_quote_blackout_day
+    today = datetime.now(_ET).strftime("%Y-%m-%d")
+    if _no_quote_blackout_day == today:
+        return
+    if _no_quote_blackout:
+        logger.info(
+            "New trading day (%s) — clearing no-quote blackout (%d ticker(s): %s)",
+            today, len(_no_quote_blackout), ", ".join(sorted(_no_quote_blackout)),
+        )
+    _no_quote_blackout.clear()
+    _no_quote_ticker_strikes.clear()
+    _no_quote_blackout_day = today
+
+
+def _queue_retry(item: NewsItem, count_strike: bool = True) -> None:
     key = (item.article_id, item.ticker)
     _retry_queue[key] = {
         "item": item,
         "expires_at": datetime.now(timezone.utc) + timedelta(minutes=_RETRY_TTL_MINUTES),
     }
+    if not count_strike:
+        # Extended session: missing bars is expected here (see the note above),
+        # so park the signal without moving it toward a blacklist it doesn't
+        # deserve.
+        logger.info(
+            "Signal [%s] parked for retry (no extended-hours price data — not "
+            "counted toward the no-quote blackout) — expires in %d min",
+            item.ticker, _RETRY_TTL_MINUTES,
+        )
+        return
     # Track consecutive no-data strikes for this ticker.
     strikes = _no_quote_ticker_strikes.get(item.ticker, 0) + 1
     _no_quote_ticker_strikes[item.ticker] = strikes
     if strikes >= _NO_QUOTE_BLACKOUT_RETRIES:
         _no_quote_blackout.add(item.ticker)
         logger.warning(
-            "Signal [%s] blacklisted for session — no quote after %d retries "
+            "Signal [%s] blacklisted for today — no quote after %d retries "
             "(no Finnhub/Twelvedata coverage); future articles for this ticker suppressed",
             item.ticker, strikes,
         )
@@ -565,6 +620,10 @@ def news_cycle() -> None:
     #                      providers; no bars → no confirmation → no trade.
     session = get_trading_session()
 
+    # The no-quote blackout is a one-day judgement, not a permanent one — roll
+    # it over before any ticker is tested against it (v21.6).
+    _reset_no_quote_blackout_if_new_day()
+
     if session == "premarket" and in_premarket_window():
         logger.info("Pre-market window — scanning for overnight catalysts")
         try:
@@ -726,8 +785,10 @@ def news_cycle() -> None:
         if confirmation is None:
             # Data outage (not a rejection) — park for retry; the fetcher's
             # freshness filter can't see queue entries, so they survive.
+            # In an extended session missing bars is the expected state, not
+            # evidence the ticker is uncovered — don't let it earn a strike.
             funnel["no_price_data"] += 1
-            _queue_retry(item)
+            _queue_retry(item, count_strike=session not in EXTENDED_SESSIONS)
             continue
 
         # Price data answered — strikes must be CONSECUTIVE to blacklist.

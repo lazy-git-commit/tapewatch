@@ -2523,6 +2523,7 @@ class TestNoQuoteStrikeReset:
         main._retry_queue.clear()
         main._no_quote_ticker_strikes.clear()
         main._no_quote_blackout.clear()
+        main._no_quote_blackout_day = None
 
     teardown_method = setup_method
 
@@ -2548,6 +2549,179 @@ class TestNoQuoteStrikeReset:
         main._note_price_data_ok("ABC_US_EQ")  # a quote answered in between
         main._queue_retry(self._item())
         assert "ABC_US_EQ" not in main._no_quote_blackout
+
+    # ── v21.6: extended-session misses must not blacklist ────────────────────
+    def test_extended_session_misses_never_blacklist(self):
+        # After-hours/premarket bars aren't on our Twelvedata plan and
+        # Finnhub's quote freezes at the close, so a miss out there says
+        # nothing about the ticker. On 2026-07-27 this blacklisted CDNS,
+        # SANM, CLS and six more liquid names for reporting after the bell.
+        import main
+        for _ in range(5):
+            main._queue_retry(self._item(), count_strike=False)
+        assert "ABC_US_EQ" not in main._no_quote_blackout
+        assert "ABC_US_EQ" not in main._no_quote_ticker_strikes
+
+    def test_extended_miss_does_not_advance_a_pending_strike(self):
+        import main
+        main._queue_retry(self._item())                       # RTH miss: strike 1
+        main._queue_retry(self._item(), count_strike=False)   # extended: no-op
+        assert "ABC_US_EQ" not in main._no_quote_blackout
+        assert main._no_quote_ticker_strikes["ABC_US_EQ"] == 1
+
+    def test_signal_is_still_parked_for_retry_without_a_strike(self):
+        # Not counting a strike must not mean dropping the signal.
+        import main
+        main._queue_retry(self._item(), count_strike=False)
+        assert ("a1", "ABC_US_EQ") in main._retry_queue
+
+    # ── v21.6: the blackout is a one-DAY judgement ───────────────────────────
+    def test_blackout_clears_on_new_trading_day(self):
+        # The original code only cleared on process restart; the live service
+        # ran six days and 16 tickers without one.
+        import main
+        main._queue_retry(self._item())
+        main._queue_retry(self._item())
+        assert "ABC_US_EQ" in main._no_quote_blackout
+        main._no_quote_blackout_day = "1999-01-01"   # pretend the day rolled
+        main._reset_no_quote_blackout_if_new_day()
+        assert "ABC_US_EQ" not in main._no_quote_blackout
+        assert not main._no_quote_ticker_strikes
+
+    def test_blackout_survives_within_the_same_day(self):
+        import main
+        main._reset_no_quote_blackout_if_new_day()   # stamps today
+        main._queue_retry(self._item())
+        main._queue_retry(self._item())
+        main._reset_no_quote_blackout_if_new_day()   # same day — no-op
+        assert "ABC_US_EQ" in main._no_quote_blackout
+
+
+class TestPrepostCapabilityLatch:
+    """v21.6: prepost=true is a PLAN entitlement on Twelvedata, not per-symbol
+    coverage. Below the Pro tier every extended-hours request 403s, for every
+    symbol, forever — and the generic retry path made that look like "this
+    ticker has no data", which blacklisted nine liquid names on 2026-07-27.
+    Feature-detect once, then stop paying for it.
+    """
+
+    def setup_method(self):
+        import time as _time
+        import market.twelvedata_bars as td
+        td._prepost_supported = None
+        td._credit_meter = {"date": None, "used": 0}
+        td._meter_latches = {"date": None, "warned": False,
+                             "exhausted_logged": False, "exhausted_emitted": False}
+        td._bucket_tokens = float(td._PER_MINUTE_LIMIT)
+        td._bucket_last_refill = _time.monotonic()
+
+    teardown_method = setup_method
+
+    _DENIED = {
+        "code": 403,
+        "message": ("Pre-market and post-market data are available on the Pro "
+                    "plan (individual) and the Venture plan (business) and above."),
+        "status": "error",
+    }
+
+    def _denied_response(self):
+        resp = MagicMock()
+        resp.status_code = 403
+        resp.json.return_value = self._DENIED
+        return resp
+
+    @patch("market.twelvedata_bars.record_system_event", create=True)
+    @patch("market.twelvedata_bars.requests.get")
+    def test_403_latches_and_returns_none(self, mock_get, _ev):
+        import market.twelvedata_bars as td
+        mock_get.return_value = self._denied_response()
+        assert td._get_time_series("CDNS", "1min", 960, prepost=True) is None
+        assert td._prepost_supported is False
+        assert td.extended_bars_available() is False
+
+    @patch("market.twelvedata_bars.record_system_event", create=True)
+    @patch("market.twelvedata_bars.requests.get")
+    def test_403_is_not_retried(self, mock_get, _ev):
+        # The old path let raise_for_status() throw into the generic handler,
+        # which burned the full 3-attempt backoff on a permanent condition.
+        import market.twelvedata_bars as td
+        mock_get.return_value = self._denied_response()
+        td._get_time_series("CDNS", "1min", 960, prepost=True)
+        assert mock_get.call_count == 1
+
+    @patch("market.twelvedata_bars.record_system_event", create=True)
+    @patch("market.twelvedata_bars.requests.get")
+    def test_subsequent_prepost_calls_skip_http_entirely(self, mock_get, _ev):
+        import market.twelvedata_bars as td
+        mock_get.return_value = self._denied_response()
+        td._get_time_series("CDNS", "1min", 960, prepost=True)
+        mock_get.reset_mock()
+        for sym in ("SANM", "CLS", "KFRC"):
+            assert td._get_time_series(sym, "1min", 960, prepost=True) is None
+        mock_get.assert_not_called()   # no credits, no 403 storm
+
+    @patch("market.twelvedata_bars.record_system_event", create=True)
+    @patch("market.twelvedata_bars.requests.get")
+    def test_rth_requests_unaffected_by_the_latch(self, mock_get, _ev):
+        # The whole point: an extended-hours entitlement wall must not take
+        # regular-hours data down with it.
+        import market.twelvedata_bars as td
+        mock_get.return_value = self._denied_response()
+        td._get_time_series("CDNS", "1min", 960, prepost=True)   # trips latch
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.raise_for_status = MagicMock()
+        ok.json.return_value = {"values": [{"datetime": "2026-07-27 15:59:00",
+                                            "open": "1", "high": "1",
+                                            "low": "1", "close": "1",
+                                            "volume": "10"}]}
+        mock_get.return_value = ok
+        assert td._get_time_series("CDNS", "1min", 390, prepost=False) is not None
+
+    @patch("market.twelvedata_bars.record_system_event", create=True)
+    @patch("market.twelvedata_bars.requests.get")
+    def test_unrelated_403_does_not_latch(self, mock_get, _ev):
+        # A different 403 (bad key, symbol not entitled) is not the prepost
+        # wall and must not disable extended bars process-wide.
+        import market.twelvedata_bars as td
+        resp = MagicMock()
+        resp.status_code = 403
+        resp.json.return_value = {"code": 403, "message": "Invalid API key",
+                                  "status": "error"}
+        mock_get.return_value = resp
+        assert td._get_time_series("CDNS", "1min", 960, prepost=True) is None
+        assert td._prepost_supported is None   # not latched
+        assert td.extended_bars_available() is True
+
+
+class TestOpeningBlockTransient:
+    """v21.6: opening_block is a pure countdown — it is guaranteed to clear
+    within cfg.open_block_minutes — yet it was terminal, so a catalyst that
+    printed inside the window was discarded outright. Earnings and guidance
+    print in the first minutes after 16:00 ET, exactly the window it covers:
+    CDNS (guidance_raise, conf 0.88) died 4.0 min into a 5-min block on
+    2026-07-27, with TXN and THRM before it.
+    """
+
+    def test_main_treats_opening_block_as_transient(self):
+        import main
+        assert "opening_block" in main._TRANSIENT_REJECT_CODES
+
+    def test_scanner_treats_opening_block_as_transient(self):
+        import premarket.scanner as sc
+        assert "opening_block" in sc._TRANSIENT_REJECT_CODES
+
+    def test_genuinely_terminal_codes_stay_terminal(self):
+        # The block is transient because it self-clears on a timer; nothing
+        # else in this list does, and widening the set further would keep
+        # re-checking signals whose rejection is a property of the instrument.
+        import main
+        import premarket.scanner as sc
+        for code in ("penny_stock", "illiquid", "dead_cat", "extended_move",
+                     "wide_spread", "high_momentum", "high_volume",
+                     "below_vwap", "exhausted_bounce", "insufficient_data"):
+            assert code not in main._TRANSIENT_REJECT_CODES
+            assert code not in sc._TRANSIENT_REJECT_CODES
 
 
 class TestPremarketStrikeCleanup:

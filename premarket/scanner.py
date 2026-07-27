@@ -118,10 +118,16 @@ _GAP_PCT_EXPIRE_AFTER = 5
 # pullback of a genuine mover, and a price stretched too far above VWAP
 # (overextended, v20) pulls back into buyable range within minutes on real
 # movers. Candidates rejected with these codes stay pending and re-evaluate
-# every cycle until the eval window closes. Everything else (penny_stock,
-# illiquid, dead_cat, extended_move, wide_spread, high_momentum, high_volume,
-# below_vwap, exhausted_bounce, insufficient_data) is terminal.
-_TRANSIENT_REJECT_CODES = frozenset({"low_volume", "low_momentum", "overextended"})
+# every cycle until the eval window closes. opening_block joined in v21.6 —
+# it is a pure countdown against cfg.open_block_minutes, so it is guaranteed
+# to clear on its own within minutes; treating it as terminal discarded
+# at-open candidates a minute or two short of the line (see the matching note
+# in main.py). Everything else (penny_stock, illiquid, dead_cat,
+# extended_move, wide_spread, high_momentum, high_volume, below_vwap,
+# exhausted_bounce, insufficient_data) is terminal.
+_TRANSIENT_REJECT_CODES = frozenset(
+    {"low_volume", "low_momentum", "overextended", "opening_block"}
+)
 
 
 def _clear_strikes(cand_id: int) -> None:

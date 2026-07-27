@@ -269,7 +269,7 @@ Checks run cheapest-first; each rejection records a `reason_code`:
 
 | # | Code | Rule (defaults) | Motivating incident |
 |---|---|---|---|
-| 1 | `opening_block` | < 5 min after open | GOAI: entire spike in 09:30 bar, bought 09:32 into collapse |
+| 1 | `opening_block` | < 5 min after a session boundary — **TRANSIENT since v21.6** | GOAI: entire spike in 09:30 bar, bought 09:32 into collapse. The block is right; its permanence was not — see below |
 | 2 | `penny_stock` | price < **$5** | Every Jun 8–11 loss was sub-$5 |
 | 3 | `wide_spread` | last-bar range > 3% of price | No bid/ask feed; bar range proxies effective spread |
 | 4 | `dead_cat` | < −3% vs **prev close** | Prev close (not open) so gap-downs count: a stock down 25% overnight but flat since open is still a falling knife |
@@ -714,12 +714,69 @@ permanent-retry loop was found: tickers with zero Finnhub/Twelvedata coverage
 hours — each re-fetch consuming credits and log noise. After 2 **consecutive**
 failed retries (`_NO_QUOTE_BLACKOUT_RETRIES`) a ticker is added to
 `_no_quote_blackout` and suppressed for the rest of the session. Strikes reset
-on service restart (next day) **and on any successful price check for that
-ticker** (v19.1 — before that, strikes were effectively cumulative-per-session:
-two unrelated transient misses hours apart blacklisted a ticker with perfectly
-good coverage). This is distinct from the 24h per-ticker cooldown
-(`main.py::COOLDOWN_HOURS`), which tracks tickers we *traded*, not tickers we
-couldn't price.
+**on any successful price check for that ticker** (v19.1 — before that, strikes
+were effectively cumulative-per-session: two unrelated transient misses hours
+apart blacklisted a ticker with perfectly good coverage). This is distinct from
+the 24h per-ticker cooldown (`main.py::COOLDOWN_HOURS`), which tracks tickers we
+*traded*, not tickers we couldn't price.
+
+**Blackout scoping (v21.6, 2026-07-27):** the blackout asserts something strong
+— "no provider carries this instrument" — and two ways of earning it were
+unsound.
+
+*Extended-session misses no longer accrue strikes.* Our Twelvedata plan
+does not include pre/post-market bars at all (see "Extended-hours entitlement
+wall" below), and Finnhub's free quote freezes at the 16:00 ET close, so a miss
+out there is the expected state of the world and says nothing about the ticker.
+Counting it meant each after-hours earnings release cost two strikes and a
+permanent blacklist: **CDNS, SANM, CLS, KFRC, LOKB, TFII, SJW, SUI and LC** —
+every one a liquid large/mid cap with flawless RTH coverage — were removed from
+the tradeable universe purely for reporting after the bell. `_queue_retry()`
+now takes `count_strike`, and `main.news_cycle` passes `False` in extended
+sessions: the signal is still parked for retry, it just cannot earn a blacklist
+it does not deserve.
+
+*The blackout resets per ET trading day.* The original comment assumed "a daily
+restart gives a clean slate", but this is a long-running systemd unit — the
+live service had gone six days and 16 accumulated tickers with `NRestarts=0`.
+`_reset_no_quote_blackout_if_new_day()` runs at the top of every news cycle,
+implementing what the design always meant and bounding any future false
+positive to a single session.
+
+**Extended-hours entitlement wall (v21.6, 2026-07-27):** Twelvedata serves
+pre/post-market bars only on the Pro (individual) / Venture (business) tiers.
+Below that, **every** `prepost=true` request returns HTTP 403, for every
+symbol, permanently — verified directly: the identical request without
+`prepost` succeeds, so it is the entitlement and not the symbol or
+`outputsize`. Finnhub is no alternative: its free `/quote` timestamp freezes at
+the 16:00 ET close (confirmed live mid-after-hours, `t` = exactly 16:00:00),
+and the v19.2 staleness guard correctly rejects it. **The v21 extended-hours
+entry pipeline has therefore never confirmed a single signal** — 0 of 18 trades
+all-time carry a non-`regular` session tag. The system was fail-closed as
+designed; the defect was that the failure was indistinguishable from per-ticker
+no-coverage, which is what drove the blacklist damage above. The 403 is now
+feature-detected once per process (`_prepost_supported`, exposed as
+`extended_bars_available()`, mirroring the executor's `_extended_limit_supported`
+latch), logged at ERROR, recorded as a `twelvedata_prepost_unavailable`
+system_event, and thereafter short-circuits before any HTTP call — no credits,
+no 3× retry backoff, no 403 storm. An unrelated 403 (bad key, symbol not
+entitled) does not latch. Extended **entries** stay inert until the plan is
+upgraded; extended **position management** is unaffected and still runs.
+
+**`opening_block` is transient (v21.6, 2026-07-27):** it is the only gate whose
+condition is a pure countdown — "N minutes since the session boundary, block
+lasts `OPEN_BLOCK_MINUTES`" is guaranteed false a few minutes later — yet it
+was terminal, so a catalyst printing inside the window was discarded outright
+rather than re-checked. Eight signals died this way, four in the current
+tradeable set: **CDNS ×2** (`guidance_raise`, conf 0.88/0.85) at 4.0 and 4.1
+minutes into a 5-minute block on 2026-07-27 — sixty seconds short — plus TXN
+(07-22) and THRM (07-20). Earnings and guidance print in the first minutes
+after 16:00 ET, precisely the window this gate covers, so terminal handling
+forfeited the densest catalyst window of the day. The block itself is unchanged
+and still correct (auction and MOC-spill noise is real); only its permanence
+was wrong. It now sits in `_TRANSIENT_REJECT_CODES` in both `main.py` and
+`premarket/scanner.py`, which also recovers the 09:30 RTH boundary — a benefit
+that needs no data-plan change.
 
 **Premarket no-coverage expiry (v17.4, 2026-06-29):** The RTH no-quote
 blackout had no counterpart in the pre-market evaluator. Tickers with zero
@@ -1017,7 +1074,19 @@ T212's 24/5 offering splits the day into four sessions (ET): premarket
 04:00–09:30, regular 09:30–16:00, after-hours 16:00–20:00, overnight
 20:00–04:00. `market/sessions.py` classifies the current instant from the
 NYSE calendar (early closes shift the after-hours window with the close:
-13:00 close → after-hours 13:00–17:00 ET). Session policy:
+13:00 close → after-hours 13:00–17:00 ET).
+
+> ⚠️ **Status (v21.6): extended-hours ENTRIES are inert, pending a data-plan
+> upgrade.** Everything below is implemented and tested, but pre/post-market
+> bars are a Twelvedata Pro/Venture entitlement our plan lacks — every
+> `prepost=true` request 403s — and Finnhub's free quote freezes at the 16:00
+> ET close. No extended signal can be confirmed, and none ever has (0 of 18
+> trades all-time are non-`regular`). The capability is latched off on first
+> sight so it costs nothing to leave the flag on. Extended **position
+> management** (out-of-hours exits, the after-hours flatten) is unaffected and
+> does run. See §7 "Extended-hours entitlement wall".
+
+Session policy:
 
 | Session | Entries | Why |
 |---|---|---|
@@ -1037,7 +1106,9 @@ Extended sessions reuse the standard pipeline with these variants
   dominated by the pre-news RTH tape and would reject every legitimate
   after-hours mover as `overextended` by construction.
 - **Session-start block** — the 5-min `opening_block` applies at 16:00 too
-  (closing-auction unwind noise).
+  (closing-auction unwind noise). TRANSIENT since v21.6: the window it covers
+  is exactly when earnings and guidance print, so the signal must survive the
+  countdown rather than be discarded by it.
 - **RVOL band → absolute participation floor** — the RVOL time-of-day curve
   is RTH volume shape; meaningless at 17:00. Instead: dollars printed
   in-session ≥ `EXTENDED_MIN_SESSION_DOLLAR_VOLUME` ($500k). Transient

@@ -7,6 +7,73 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.6 — 2026-07-28 (zero-trade investigation: extended-hours entitlement wall, blackout scoping, opening_block transience)
+
+Investigated a zero-trade session (2026-07-27). Regular hours were **correct
+and uneventful**: exactly one qualifying signal all day (OTLK, `fda_approval`
+conf 0.90) rejected as a $1.17 penny stock, and the premarket candidate ABT
+correctly refused at the open on a tape moving against the signal (−0.25% →
+−0.82%). Nothing to fix there — genuine signal scarcity, gates behaving.
+
+The after-hours session was a different story: **14 qualifying tradeable-catalyst
+signals, none reachable, nine tickers silently removed from the universe.**
+
+### Root cause: Twelvedata pre/post-market data is not on our plan
+Every `prepost=true` request returns HTTP 403 —
+`"Pre-market and post-market data are available on the Pro plan (individual)
+and the Venture plan (business) and above"` — for every symbol, permanently.
+Verified directly against the API: identical requests without `prepost`
+succeed, so it is purely the entitlement, not the symbol or the `outputsize`.
+Finnhub is no help either: its free `/quote` timestamp freezes at the 16:00 ET
+close (confirmed live mid-after-hours, `t` = 16:00:00 exactly), and our own
+20-minute staleness guard correctly rejects it. **The v21 extended-hours entry
+pipeline has therefore never been able to confirm a signal — 0 of 18 trades
+all-time carry a non-`regular` session tag.** The system was fail-closed, as
+designed; what it was not doing was failing *quietly*.
+
+### Fixed
+- **prepost capability latch** (`market/twelvedata_bars.py`): the 403 is now
+  feature-detected once per process and remembered. Subsequent extended-hours
+  bar requests short-circuit before any HTTP call — no credits, no 3× retry
+  backoff, no 403 storm — and a `twelvedata_prepost_unavailable` system_event
+  records it. An unrelated 403 (bad key, symbol not entitled) does not latch.
+- **No-quote blackout scoped to sessions where a miss is informative**
+  (`main.py`): the blackout means "no provider carries this instrument", so an
+  extended-session miss — the *expected* state given the above — no longer
+  accrues a strike. This was the real damage: each after-hours earnings
+  release cost two strikes and a permanent blacklist, taking **CDNS, SANM,
+  CLS, KFRC, LOKB, TFII, SJW, SUI and LC** — all liquid, all perfectly covered
+  during RTH — out of the tradeable universe purely for reporting after the
+  bell. Sixteen such names had accumulated over six days of uptime.
+- **Blackout resets on a new ET trading day** (`main.py`): the original comment
+  assumed "a daily restart gives a clean slate", but the service is a
+  long-running systemd unit — it had gone six days with `NRestarts=0`. A
+  per-day reset is what the design always meant, and it bounds any future
+  false positive to one session.
+- **`opening_block` is now TRANSIENT** (`main.py`, `premarket/scanner.py`): it
+  is the only gate whose condition is a pure countdown — "N minutes since the
+  session boundary, block lasts `OPEN_BLOCK_MINUTES`" is guaranteed false
+  minutes later — yet it was terminal, so a catalyst printing inside the window
+  was discarded outright. Eight signals died this way, four in the current
+  tradeable set: **CDNS ×2** (`guidance_raise`, conf 0.88/0.85) at 4.0 and 4.1
+  minutes into a 5-minute block, sixty seconds short, plus TXN (07-22) and THRM
+  (07-20). Earnings and guidance print in the first minutes after 16:00 ET —
+  precisely this window. The block itself is unchanged and still sound
+  (auction/MOC noise is real); only its permanence was wrong. This also
+  recovers the 09:30 RTH boundary, which needs no plan change to benefit.
+
+### Not changed — operator decision required
+Extended-hours **entries** remain impossible until the Twelvedata plan is
+upgraded to Pro/Venture. With the latch in place, leaving
+`AFTERHOURS_TRADING_ENABLED=true` is now harmless (it self-disables cleanly and
+costs nothing), so this is a pure cost/benefit call, not a bug. Note the eval
+loop measures after-hours articles from the *next* session's open
+(`_bars_and_anchor`), so the measured edge for those catalysts is already an
+RTH-follow-through edge the system can trade today — which is exactly what the
+blackout bug was destroying.
+
+---
+
 ## v21.5 — 2026-07-24 (HOG post-mortem: ratchet settle period, polled-price observability)
 
 Trade review of the last few days' fills found HOG (2026-07-23, -1.52%,
