@@ -574,6 +574,31 @@ v20.1): a restart cannot regress an armed position back to the −2% stop, and
 a crash between the ratchet's cancel and re-place self-repairs — the next
 cycle above the trigger places a fresh breakeven stop directly.
 
+**Ratchet settle period + polled-price observability (v21.5):** HOG
+(2026-07-23) filled 3.6% off its signal price ("book very thin"), and the
+ratchet fired one second later, reading that same noisy post-fill quote as
++3.75%. It cancelled the just-placed −2% resting stop and tried to replace
+it with a breakeven stop — the 4th T212 order call for the position within
+one second (buy, place stop, cancel, replace) — and drew an HTTP 429; the
+replacement never landed. The position was then protected only by the
+polled fallback for the rest of its hold. Independently reconstructed 1-min
+price bars show it sat below the (never-placed) breakeven line for at least
+32 straight minutes; no stop_loss exit fired, and the trade rode out the
+full 60-min time_stop instead of exiting flat. Traced the exit logic and it
+was structurally correct — `stop_order_id` was correctly cleared, the
+breakeven threshold was correctly computed, and an INFO-level log would have
+fired had the polled check seen price below it — which points at a lagging
+live quote on a thin tape (HOG's RVOL was 0.1 that session; it only entered
+via the ADV$ bypass, not a real volume signal) staying just inside the
+20-min staleness cutoff, rather than a code defect. Two fixes: (1) the
+ratchet is not eligible until `_RATCHET_MIN_AGE_SECONDS` (15s) after the
+fill, so a fresh fill's own quote noise can't reach it and can't stack a
+cancel+replace onto the buy's own order burst; (2) `check_exit_conditions`'
+holding-state log — previously DEBUG-only, invisible at the service's INFO
+level — now promotes once per `_PRICE_LOG_EVERY_SECONDS` (60s) per trade to
+INFO, so the price the monitor actually saw during a hold is provable from
+the logs rather than inferred after the fact from an external data source.
+
 **The cancel/fill race** (no OCO on T212): before any polled TP/time-stop/EOD
 sell, the resting stop must be cancelled (it reserves the shares). If the
 cancel fails because the stop filled while cancelling, the trade is recorded

@@ -395,8 +395,12 @@ class TestMonitorExtendedExits(unittest.TestCase):
     def test_extended_ratchet_is_polled_only(self):
         # +2.5% above buy → ratchet trigger; in an extended session it must
         # arm the POLLED breakeven without placing a resting stop order.
+        # buy_time is backdated past the v21.5 ratchet settle period — a
+        # trade this fresh wouldn't be ratchet-eligible at all otherwise.
+        old_buy = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
         sell_mock, _, stop_mock = self._run_monitor(
             AFTERHOURS, mins_left=120.0, price=101.5,
+            trade=_open_trade(buy_time=old_buy),
         )
         sell_mock.assert_not_called()
         stop_mock.assert_not_called()

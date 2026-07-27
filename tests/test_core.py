@@ -108,12 +108,14 @@ class TestExitInversion:
         import monitor.position_monitor as pm
         pm._sell_fail_counts.clear()
         pm._last_status_check.clear()
+        pm._last_price_log.clear()
 
     teardown_method = setup_method
 
     def _trade(self, buy_price=100.0, minutes_ago=10, stop_order_id="stop-1",
-               ratchet_armed=0):
-        buy_time = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+               ratchet_armed=0, seconds_ago=None):
+        age = timedelta(seconds=seconds_ago) if seconds_ago is not None else timedelta(minutes=minutes_ago)
+        buy_time = (datetime.now(timezone.utc) - age).isoformat()
         return {
             "id": 7,
             "ticker": "AAPL_US_EQ",
@@ -180,6 +182,44 @@ class TestExitInversion:
         # Second call is a no-op (once per trade).
         pm._maybe_ratchet_stop(trade, current_price=103.0)
         mock_place.assert_called_once()
+
+    # ── Settle period (v21.5) — HOG, 2026-07-23 ───────────────────────────────
+    @patch("monitor.position_monitor.set_ratchet_armed")
+    @patch("monitor.position_monitor.place_stop_loss", return_value="stop-2")
+    @patch("monitor.position_monitor.cancel_order", return_value=True)
+    def test_ratchet_suppressed_within_settle_period(
+        self, mock_cancel, mock_place, mock_arm
+    ):
+        # A fill's own quote can look like an instant 2%+ move (HOG filled
+        # 3.6% off its signal price, and the ratchet fired 1s later off that
+        # same noisy print). Within the settle window the ratchet must not
+        # touch the resting stop at all, however far above trigger the price
+        # looks.
+        import monitor.position_monitor as pm
+        trade = self._trade(seconds_ago=1)
+        pm._maybe_ratchet_stop(trade, current_price=103.75)  # +3.75% — HOG's own number
+        mock_cancel.assert_not_called()
+        mock_place.assert_not_called()
+        mock_arm.assert_not_called()
+        assert not trade.get("ratchet_armed")
+        assert trade["stop_order_id"] == "stop-1"  # original stop untouched
+
+    @patch("monitor.position_monitor.set_ratchet_armed")
+    @patch("monitor.position_monitor.set_stop_order_id")
+    @patch("monitor.position_monitor.place_stop_loss", return_value="stop-2")
+    @patch("monitor.position_monitor.cancel_order", return_value=True)
+    def test_ratchet_fires_once_settle_period_elapses(
+        self, mock_cancel, mock_place, mock_set, mock_arm
+    ):
+        # Same price, same trade — just old enough now. Confirms the
+        # settle period is a delay, not a permanent block.
+        import monitor.position_monitor as pm
+        trade = self._trade(seconds_ago=pm._RATCHET_MIN_AGE_SECONDS + 1)
+        pm._maybe_ratchet_stop(trade, current_price=103.75)
+        mock_cancel.assert_called_once_with("stop-1")
+        mock_place.assert_called_once()
+        mock_arm.assert_called_once_with(7)
+        assert trade["ratchet_armed"] == 1
 
     @patch("monitor.position_monitor.place_stop_loss", return_value="x")
     def test_ratchet_not_triggered_below_threshold(self, mock_place):
@@ -259,6 +299,71 @@ class TestExitInversion:
         assert _cancel_resting_before_sell(trade) is False  # nothing left to sell
         mock_close.assert_called_once()
         assert mock_close.call_args.args[2] == "stop"
+
+
+class TestPolledPriceObservability:
+    """v21.5: the HOG (2026-07-23) post-mortem found no record anywhere of
+    what price the monitor was comparing against while a position sat past
+    its stop threshold unprotected for 32 minutes — check_exit_conditions'
+    holding state logged only at DEBUG, invisible at the service's INFO
+    level. One holding-log per trade per _PRICE_LOG_EVERY_SECONDS is now
+    promoted to INFO so this is provable from the logs next time.
+    """
+
+    def setup_method(self):
+        import monitor.position_monitor as pm
+        pm._last_price_log.clear()
+
+    teardown_method = setup_method
+
+    def _trade(self):
+        buy_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        return {
+            "id": 42, "ticker": "AAPL_US_EQ", "buy_price": 100.0,
+            "quantity": 5.0, "buy_time": buy_time,
+            "stop_order_id": None, "tp_order_id": None, "ratchet_armed": 0,
+        }
+
+    @patch("monitor.position_monitor.get_current_price", return_value=99.0)
+    def test_first_holding_check_logs_at_info(self, _mock, caplog):
+        import logging
+        from monitor.position_monitor import check_exit_conditions
+        with caplog.at_level(logging.INFO, logger="monitor.position_monitor"):
+            should_exit, _, _ = check_exit_conditions(self._trade())
+        assert should_exit is False
+        assert any(
+            r.levelno == logging.INFO and "holding" in r.message
+            for r in caplog.records
+        )
+
+    @patch("monitor.position_monitor.get_current_price", return_value=99.0)
+    def test_second_holding_check_within_window_is_debug_only(self, _mock, caplog):
+        import logging
+        from monitor.position_monitor import check_exit_conditions
+        trade = self._trade()
+        with caplog.at_level(logging.DEBUG, logger="monitor.position_monitor"):
+            check_exit_conditions(trade)  # primes the throttle at INFO
+            caplog.clear()
+            check_exit_conditions(trade)  # same cycle window — DEBUG only
+        holding = [r for r in caplog.records if "holding" in r.message]
+        assert len(holding) == 1
+        assert holding[0].levelno == logging.DEBUG
+
+    @patch("monitor.position_monitor.get_current_price", return_value=99.0)
+    def test_holding_log_promoted_again_after_window_elapses(self, _mock, caplog):
+        import logging
+        import monitor.position_monitor as pm
+        trade = self._trade()
+        with caplog.at_level(logging.INFO, logger="monitor.position_monitor"):
+            pm.check_exit_conditions(trade)
+            # Force the throttle to look expired without a real sleep.
+            pm._last_price_log[trade["id"]] -= pm._PRICE_LOG_EVERY_SECONDS + 1
+            caplog.clear()
+            pm.check_exit_conditions(trade)
+        assert any(
+            r.levelno == logging.INFO and "holding" in r.message
+            for r in caplog.records
+        )
 
 
 class TestGetCurrentPriceDegraded:

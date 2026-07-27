@@ -7,6 +7,52 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.5 — 2026-07-24 (HOG post-mortem: ratchet settle period, polled-price observability)
+
+Trade review of the last few days' fills found HOG (2026-07-23, -1.52%,
+time_stop) rode out its full 60-minute hold while sitting below its own
+breakeven stop for at least 32 straight minutes with nothing protecting it.
+
+### Root cause
+HOG's buy filled 3.6% off its signal price ("book very thin" — the fill
+warning already existed and fired correctly). One second later the ratchet
+read that same noisy post-fill quote as +3.75%, cancelled the just-placed
+−2% resting stop, and tried to replace it with a breakeven stop — the 4th
+T212 order call for the position within one second (buy, place stop,
+cancel, replace) — and drew an HTTP 429. The replacement never landed, and
+the position was protected only by the polled fallback for the rest of its
+hold. Independently reconstructed 1-min bars show price stayed below the
+never-placed breakeven line for 32+ minutes; no stop_loss exit fired,
+turning what should have been a flat exit into a realized loss. The exit
+logic itself traced out correctly — `stop_order_id` was cleared, the
+threshold was right, an INFO log would have fired had the polled check seen
+price below it — pointing at a lagging live quote on a thin tape (HOG's
+RVOL was 0.1 that session; it only got in via the ADV$ bypass) rather than
+a logic bug, though this couldn't be confirmed directly: nothing logs a
+polled price check that *doesn't* trigger an exit.
+
+### Fixed
+- **Ratchet settle period**: `_maybe_ratchet_stop` is not eligible until
+  `_RATCHET_MIN_AGE_SECONDS` (15s) after the fill. Keeps a fresh fill's own
+  quote noise from reaching the ratchet at all, and keeps the ratchet's
+  cancel+replace from stacking onto the buy's own order burst. Legitimate
+  ratchets are unaffected (SBRA armed 5+ minutes into its trade).
+- **Polled-price observability**: `check_exit_conditions`' holding-state log
+  — previously DEBUG-only, invisible at the service's INFO level — now
+  promotes once per `_PRICE_LOG_EVERY_SECONDS` (60s) per trade to INFO. The
+  price the monitor is actually comparing against during an open position is
+  now provable from the logs instead of reconstructed after the fact from an
+  external data source.
+
+Also reviewed the 2026-07-21 to 07-24 window more broadly: the dead-cat
+guard correctly blocked two guidance_raise headlines (Honeywell, Huntington
+Bancshares) where the stock was already down 5-6% despite Claude scoring the
+headline positive — a real classifier blind spot on mixed-guidance
+headlines ("Raises EPS, Cuts Sales") that the price-confirmation layer
+caught as designed. No changes made there; noted for awareness.
+
+---
+
 ## v21.4 — 2026-07-22 (SMCI miss post-mortem: forward-returns ticker bug, guidance-raise routing)
 
 SMCI's afterhours $60B-order/margin-guidance pop (+7% that session, +18% more

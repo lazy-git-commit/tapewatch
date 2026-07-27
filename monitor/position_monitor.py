@@ -31,7 +31,11 @@ Exit architecture (v20 — INVERTED from v14):
   replacement placement fails the position falls back to a POLLED breakeven
   stop; the armed flag is persisted on the trade row (v20.1) so a restart
   can't regress it, and a crash mid-move self-repairs — the ratchet never
-  weakens protection.
+  weakens protection. Not eligible until _RATCHET_MIN_AGE_SECONDS after the
+  fill (v21.5): a fill's own quote can be noisy enough right after the trade
+  opens to look like an instant 2%+ move (HOG, 2026-07-23), and racing a
+  cancel+replace onto the same order burst as the buy risks a broker rate
+  limit exactly when the position most needs its stop.
 
   EOD FLATTEN — all positions are force-closed cfg.eod_flatten_minutes
   before the bell, regardless of P&L. This is a day-trading system: stops
@@ -103,6 +107,19 @@ _sell_fail_counts: dict[int, int] = {}  # trade_id → consecutive failed sell a
 # ratchet is also crash-recoverable: it only marks armed AFTER the move
 # resolves, so a crash mid-move leaves an un-armed trade that simply
 # re-ratchets on the next cycle where price is still above the trigger.
+#
+# Settle period (v21.5): the ratchet is not eligible until
+# _RATCHET_MIN_AGE_SECONDS after the fill. HOG (2026-07-23) filled 3.6% off
+# its signal price ("book very thin"), and one second later the ratchet read
+# the position as +3.75% off that same noisy print, cancelled the
+# freshly-placed −2% stop, and tried to replace it with a breakeven stop —
+# the 4th T212 order call for this position inside one second, which drew an
+# HTTP 429. The replacement never landed, and the position rode the polled
+# fallback through 32 minutes below its breakeven line to the time-stop
+# instead of exiting flat. A short settle period keeps a fresh fill's own
+# quote noise from reaching the ratchet at all; legitimate ratchets fire well
+# past it (SBRA armed 5+ minutes into its trade).
+_RATCHET_MIN_AGE_SECONDS = 15.0
 
 # ── Reconcile throttle ────────────────────────────────────────────────────────
 # The monitor runs every 5s (v20), but the /equity/portfolio comparison only
@@ -136,6 +153,17 @@ _suspect_phantoms: set[int] = set()   # trade ids unmatched last pass
 # handling). Entries are popped when the trade closes.
 _STATUS_CHECK_EVERY_SECONDS = 15.0
 _last_status_check: dict[int, float] = {}
+
+# ── Polled-price observability (v21.5) ───────────────────────────────────────
+# check_exit_conditions' price/threshold comparison logged only at DEBUG,
+# invisible at the service's INFO level. When HOG (2026-07-23) sat below its
+# breakeven stop for 32 minutes with no resting order and never exited, there
+# was no record of what price the monitor actually saw during that window —
+# no way to tell a lagging quote apart from a logic bug after the fact.
+# Promoting one holding-log per trade per _PRICE_LOG_EVERY_SECONDS to INFO
+# makes that provable next time without spamming a line every 5s cycle.
+_PRICE_LOG_EVERY_SECONDS = 60.0
+_last_price_log: dict[int, float] = {}
 
 
 def _note_sell_failed(trade_id: int, ticker: str) -> bool:
@@ -173,6 +201,28 @@ def _stop_threshold(trade: dict) -> float:
     if trade.get("ratchet_armed"):
         return max(normal, buy_price * (1 + cfg.ratchet_lock_pct / 100))
     return normal
+
+
+def _log_holding(
+    trade_id: int, ticker: str, current_price: float, pct_from_buy: float,
+    take_profit_threshold: float, stop_loss_threshold: float,
+    elapsed_minutes: float,
+) -> None:
+    """Log the polled price/threshold comparison for an open position.
+
+    INFO once per _PRICE_LOG_EVERY_SECONDS per trade, DEBUG every other
+    cycle — see the _last_price_log comment above for why this exists.
+    """
+    now = _time.monotonic()
+    due = now - _last_price_log.get(trade_id, 0.0) >= _PRICE_LOG_EVERY_SECONDS
+    if due:
+        _last_price_log[trade_id] = now
+    (logger.info if due else logger.debug)(
+        "Monitor [%s] trade=%d: holding — price=$%.4f (%+.2f%%) "
+        "TP=$%.4f SL=$%.4f elapsed=%.1f min",
+        ticker, trade_id, current_price, pct_from_buy,
+        take_profit_threshold, stop_loss_threshold, elapsed_minutes,
+    )
 
 
 def check_exit_conditions(
@@ -252,10 +302,8 @@ def check_exit_conditions(
         )
         return True, "stop_loss", current_price
 
-    logger.debug(
-        "Monitor [%s] trade=%d: holding — price=$%.4f (%+.2f%%) "
-        "TP=$%.4f SL=$%.4f elapsed=%.1f min",
-        ticker, trade["id"], current_price, pct_from_buy,
+    _log_holding(
+        trade["id"], ticker, current_price, pct_from_buy,
         take_profit_threshold, stop_loss_threshold, elapsed_minutes,
     )
     return False, "", current_price
@@ -320,6 +368,7 @@ def _close_as_resting_fill(trade: dict, order_id: str, kind: str, fill: dict | N
     )
     _sell_fail_counts.pop(trade["id"], None)
     _last_status_check.pop(trade["id"], None)
+    _last_price_log.pop(trade["id"], None)
 
 
 def _handle_gone_resting_order(trade: dict, order_id: str, kind: str) -> bool:
@@ -407,12 +456,19 @@ def _maybe_ratchet_stop(
     the next cycle price is still above the trigger, by placing a fresh
     breakeven stop directly (no old order to cancel). Protection can dip to
     the polled −2% stop for one cycle, never disappear, never stay regressed.
+
+    Settle period (v21.5): not eligible until _RATCHET_MIN_AGE_SECONDS after
+    the fill — see the module-level comment for the incident that motivated
+    this (a fresh fill's own quote noise looked like an instant 2%+ move).
     """
     trade_id = trade["id"]
     if current_price is None or trade.get("ratchet_armed"):
         return
     if trade.get("tp_order_id"):
         return  # legacy pre-v20 trade — never mix a stop into the TP regime
+    age_seconds = (datetime.now(timezone.utc) - _parse_utc(trade["buy_time"])).total_seconds()
+    if age_seconds < _RATCHET_MIN_AGE_SECONDS:
+        return
     buy_price = trade["buy_price"]
     if current_price < buy_price * (1 + cfg.ratchet_trigger_pct / 100):
         return
@@ -791,6 +847,7 @@ def monitor_positions() -> None:
         if result.success:
             _sell_fail_counts.pop(trade_id, None)
             _last_status_check.pop(trade_id, None)
+            _last_price_log.pop(trade_id, None)
             try:
                 close_trade(
                     trade_id, result.price, reason,
