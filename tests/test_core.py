@@ -2694,6 +2694,42 @@ class TestPrepostCapabilityLatch:
         assert td.extended_bars_available() is True
 
 
+class TestDeployWorkflowAfterhoursDisabled:
+    """v21.6 follow-up: AFTERHOURS_TRADING_ENABLED must ship OFF.
+
+    Nothing on the VM reads config/settings.py's Python default — the deploy
+    workflow rewrites .env from a hardcoded block on every push (see the
+    "Write .env" step in deploy.yml), so that block IS production config.
+    Twelvedata has no pre/post-market data on our plan (every prepost=true
+    request 403s) and Finnhub's quote freezes at the close, so no after-hours
+    signal has ever been confirmable; leaving this flag on again would
+    silently resurrect the no-quote-blackout damage from 2026-07-27 (CDNS,
+    SANM, CLS and six more liquid names blacklisted for reporting after the
+    bell) the moment the entitlement wall is fixed by other means.
+    """
+
+    def _env_block(self) -> str:
+        import pathlib
+        path = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows" / "deploy.yml"
+        return path.read_text(encoding="utf-8")
+
+    def test_afterhours_trading_disabled(self):
+        assert "AFTERHOURS_TRADING_ENABLED=false" in self._env_block()
+        assert "AFTERHOURS_TRADING_ENABLED=true" not in self._env_block()
+
+    def test_extended_hours_master_switch_stays_on(self):
+        # Management of any position that leaks into an extended session must
+        # not be disabled along with entries — see is_manage_session's
+        # docstring in market/sessions.py for why the master switch and the
+        # entry toggle are intentionally decoupled.
+        assert "EXTENDED_HOURS_ENABLED=true" in self._env_block()
+
+    def test_premarket_trading_still_disabled(self):
+        # Unrelated to this incident, but a silent flip here would be just as
+        # invisible — assert the known-good default explicitly.
+        assert "PREMARKET_TRADING_ENABLED=false" in self._env_block()
+
+
 class TestOpeningBlockTransient:
     """v21.6: opening_block is a pure countdown — it is guaranteed to clear
     within cfg.open_block_minutes — yet it was terminal, so a catalyst that

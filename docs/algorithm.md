@@ -1076,22 +1076,29 @@ T212's 24/5 offering splits the day into four sessions (ET): premarket
 NYSE calendar (early closes shift the after-hours window with the close:
 13:00 close → after-hours 13:00–17:00 ET).
 
-> ⚠️ **Status (v21.6): extended-hours ENTRIES are inert, pending a data-plan
-> upgrade.** Everything below is implemented and tested, but pre/post-market
-> bars are a Twelvedata Pro/Venture entitlement our plan lacks — every
-> `prepost=true` request 403s — and Finnhub's free quote freezes at the 16:00
-> ET close. No extended signal can be confirmed, and none ever has (0 of 18
-> trades all-time are non-`regular`). The capability is latched off on first
-> sight so it costs nothing to leave the flag on. Extended **position
-> management** (out-of-hours exits, the after-hours flatten) is unaffected and
-> does run. See §7 "Extended-hours entitlement wall".
+> ⚠️ **Status (v21.6): extended-hours ENTRIES are turned OFF at the config
+> level, pending a data-plan upgrade.** Everything below is implemented and
+> tested, but pre/post-market bars are a Twelvedata Pro/Venture entitlement
+> our plan lacks — every `prepost=true` request 403s — and Finnhub's free
+> quote freezes at the 16:00 ET close. No extended signal was ever
+> confirmable (0 of 18 trades all-time are non-`regular`), so
+> `.github/workflows/deploy.yml` now writes `AFTERHOURS_TRADING_ENABLED=false`
+> (`PREMARKET_TRADING_ENABLED` was already off). `twelvedata_bars` still
+> latches the 403 on first sight (`extended_bars_available()`) as a
+> defense-in-depth backstop, independent of the config toggle. `EXTENDED_
+> HOURS_ENABLED` stays **true**: extended **position management**
+> (out-of-hours exits, the after-hours flatten) is deliberately unaffected —
+> `is_manage_session` manages a position that leaks into the session even
+> with entries off, see its docstring in `market/sessions.py`. See §7
+> "Extended-hours entitlement wall". Flip `AFTERHOURS_TRADING_ENABLED` back
+> to `true` in the deploy workflow once the plan covers prepost data.
 
 Session policy:
 
 | Session | Entries | Why |
 |---|---|---|
 | regular | always | unchanged pre-v21 pipeline |
-| afterhours | `AFTERHOURS_TRADING_ENABLED` (default on) | FDA/guidance catalysts print 16:00–17:30; previously slept through |
+| afterhours | `AFTERHOURS_TRADING_ENABLED` (**OFF as of v21.6** — see status box above) | FDA/guidance catalysts print 16:00–17:30; previously slept through; currently unconfirmable without a Twelvedata plan upgrade |
 | premarket | `PREMARKET_TRADING_ENABLED` (default off) | scanner + at-open gap-and-go already trades this news with confirmation; 4am books are thin |
 | overnight | never | Blue Ocean venue — no Finnhub/Twelvedata coverage; no bars → no confirmation → no trade |
 

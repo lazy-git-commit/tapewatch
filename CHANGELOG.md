@@ -62,15 +62,23 @@ designed; what it was not doing was failing *quietly*.
   (auction/MOC noise is real); only its permanence was wrong. This also
   recovers the 09:30 RTH boundary, which needs no plan change to benefit.
 
-### Not changed — operator decision required
-Extended-hours **entries** remain impossible until the Twelvedata plan is
-upgraded to Pro/Venture. With the latch in place, leaving
-`AFTERHOURS_TRADING_ENABLED=true` is now harmless (it self-disables cleanly and
-costs nothing), so this is a pure cost/benefit call, not a bug. Note the eval
-loop measures after-hours articles from the *next* session's open
-(`_bars_and_anchor`), so the measured edge for those catalysts is already an
-RTH-follow-through edge the system can trade today — which is exactly what the
-blackout bug was destroying.
+### Follow-up (same day): after-hours entries turned off at the config level
+The prepost latch makes leaving `AFTERHOURS_TRADING_ENABLED=true` harmless,
+but harmless isn't the same as honest — the toggle's own name says trading is
+on when it structurally cannot confirm a signal. `.github/workflows/deploy.yml`
+now writes `AFTERHOURS_TRADING_ENABLED=false`, so the config reads as what is
+actually true. `EXTENDED_HOURS_ENABLED` stays `true` on purpose:
+`is_manage_session` (`market/sessions.py`) manages/flattens a position that
+leaks into the session regardless of the entry toggle, so this change cannot
+strand a position without its exit management. All VM config changes go
+through this workflow file + a normal deploy — never a direct `.env` edit on
+the VM, which would be silently overwritten by the next push anyway (see the
+"Write .env" step, which rewrites the whole file from this hardcoded block).
+Re-enable by flipping the flag back once the Twelvedata plan covers prepost
+data. Note the eval loop measures after-hours articles from the *next*
+session's open (`_bars_and_anchor`), so the measured edge for those catalysts
+is already an RTH-follow-through edge the system can trade today — which is
+exactly what the v21.6 blackout-scoping fix above protects.
 
 ---
 
