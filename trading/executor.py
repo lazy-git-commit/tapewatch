@@ -408,10 +408,28 @@ def calculate_quantity(
     if not math.isfinite(price) or price <= 0:
         return None, f"invalid price {price!r} — refusing to size"
 
-    try:
-        data = _get("/equity/account/cash")
-    except Exception as exc:
-        reason = f"T212 cash API failed: {exc}"
+    # One retry on a transient cash-lookup failure (e.g. HTTP 429). This call
+    # runs on every entry's hot path — an already-approved signal (all price/
+    # momentum/liquidity gates passed) was previously lost outright to a
+    # single rate-limit blip here (ITW, 2026-07-28: approved, then died on
+    # exactly this call with zero retries, on a day with only 2 total 429s).
+    # A short sleep is enough for a token-bucket-style limit to clear.
+    data = None
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            data = _get("/equity/account/cash")
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 0:
+                logger.warning(
+                    "calculate_quantity for %s: T212 cash API failed (%s) — retrying once",
+                    ticker, exc,
+                )
+                time.sleep(2)
+    if data is None:
+        reason = f"T212 cash API failed: {last_exc}"
         logger.error("calculate_quantity for %s: %s", ticker, reason)
         return None, reason
 

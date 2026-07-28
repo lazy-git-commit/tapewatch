@@ -7,6 +7,66 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.7 — 2026-07-28 (ITW post-mortem: broker-side retry gaps; Claude empty-batch retry)
+
+Investigated another zero-trade day (2026-07-28, regular hours). Two eligible
+signals (CTS, FELE) correctly failed to confirm real participation and expired
+through the normal 15-min re-eval window — no bug there. A third, ITW
+(`guidance_raise`, confidence 7, +4.3% day gap, VWAP-held RVOL bypass), cleared
+**every** gate, was logged `APPROVED`, and was then lost outright:
+
+```
+calculate_quantity for ITW_US_EQ: T212 cash API failed: HTTP 429 - TooManyRequests
+```
+
+Only 2 total 429s occurred all day — this was one unlucky rate-limit blip
+landing on the one call with zero retry protection, on the hot path of every
+single entry.
+
+### Fixed
+- **Cash-balance lookup retry** (`trading/executor.py::calculate_quantity`):
+  the `/equity/account/cash` call now retries once (2s backoff) on failure
+  before giving up. Mirrors the retry pattern already used elsewhere in this
+  file (`build_symbol_map`) — this call had none.
+- **Pre-broker buy retry** (`main.py::_enter_confirmed`): a `buy()` failure is
+  now retried once **only when it failed before reaching the broker**
+  (`calculate_quantity` error — `order_id is None and quantity == 0` by
+  construction of `buy()`'s early return). A failure after the broker was
+  already contacted is never retried here — that would risk a second live
+  order for the same signal. Previously `buy_failed` was not a transient
+  rejection code and a fully-gated signal had no second chance at all.
+
+### Also found: Claude batch-sentiment scoring returns empty at session boundaries
+Not the cause of today's zero-trade day (the two articles that finally scored
+after this cleared weren't tradeable/edge-positive anyway) but a real latent
+gap found while checking Claude API health: `Batch sentiment: 0/N articles
+scored` fired **8 consecutive cycles** today (07:00–07:07 ET, the
+`PREMARKET_SCAN_START_ET` boundary) and **6 consecutive cycles** the day
+before (16:06–16:12 ET, the regular→afterhours boundary) — both times the
+exact first `news_cycle` tick after a session transition, both times a 200 OK
+forced-`tool_choice` response with a genuinely empty `classifications` list
+(no per-record validation warnings, so not a parsing failure — Claude itself
+returned `[]` for a real, non-empty batch). Because `_mark_scored()` only
+fires on a successful score, the unscored backlog grew every cycle
+(10→11→16→22→21→20→17→11 articles) until it self-recovered, bounded only by
+`max_age_minutes=3.0` aging the oldest out. A real catalyst published in
+either window would have gone unscored and untraded with nothing but a
+WARNING log to show for it.
+
+### Fixed
+- **Empty-classifications retry** (`news/fetcher.py::_batch_score_sentiment`):
+  a well-formed but empty `classifications` list for a non-empty batch now
+  triggers one immediate retry (escalated to ERROR, since this is a real
+  data-loss risk, not routine) before giving up and returning `{}`.
+
+### Not changed — needs more evidence
+Why Claude returns `[]` specifically at session boundaries is unconfirmed —
+plausibly a backlog/complexity edge in the first larger batch after an idle
+gap, or an intermittent forced-tool-use quirk. The retry treats the symptom;
+if this keeps recurring after the retry, the next step is capturing the raw
+`msg` object (not just the parsed result) on an empty response to see what
+the model actually produced.
+
 ## v21.6 — 2026-07-28 (zero-trade investigation: extended-hours entitlement wall, blackout scoping, opening_block transience)
 
 Investigated a zero-trade session (2026-07-27). Regular hours were **correct

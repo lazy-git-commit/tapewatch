@@ -430,18 +430,38 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
     )
 
     # ── Buy (liquidity-aware sizing via ADV) ──────────────────────────────────
-    try:
-        result = buy(
-            item.ticker, confirmation.current_price,
-            confirmation.avg_dollar_volume, extended=extended,
-        )
-    except Exception as exc:
-        logger.error("buy() raised unexpectedly for %s: %s", item.ticker, exc, exc_info=True)
+    # A signal here has already cleared every gate (catalyst, confidence,
+    # price/momentum/VWAP/liquidity) — the broker call is the last step, not
+    # a filter. quantity == 0 with an order_id of None means calculate_quantity
+    # failed BEFORE any order reached T212 (see buy()'s early return) — safe
+    # to retry once, since nothing was placed. A failure with a non-empty
+    # quantity/order_id means the broker was already contacted; retrying that
+    # risks a double order, so it is never retried here.
+    result = None
+    for attempt in range(2):
         try:
-            set_rejection_reason(signal_id, f"buy raised exception: {exc}", "buy_failed")
-        except Exception:
-            pass
-        return False
+            result = buy(
+                item.ticker, confirmation.current_price,
+                confirmation.avg_dollar_volume, extended=extended,
+            )
+        except Exception as exc:
+            logger.error("buy() raised unexpectedly for %s: %s", item.ticker, exc, exc_info=True)
+            try:
+                set_rejection_reason(signal_id, f"buy raised exception: {exc}", "buy_failed")
+            except Exception:
+                pass
+            return False
+
+        if result.success:
+            break
+        pre_broker_failure = result.order_id is None and result.quantity == 0
+        if attempt == 0 and pre_broker_failure:
+            logger.warning(
+                "Buy sizing failed [%s] before reaching the broker (%s) — "
+                "retrying once", item.ticker, result.error,
+            )
+            continue
+        break
 
     if not result.success:
         logger.error("Buy order failed [%s]: %s", item.ticker, result.error)

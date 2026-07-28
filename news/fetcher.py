@@ -610,38 +610,57 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
     # a comfortable margin. Floor at 400 ensures small batches aren't starved.
     max_tokens = max(400, len(articles) * 60 + 64)
     try:
-        msg = _claude.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=max_tokens,
-            temperature=0,  # classifier — sampling noise is pure harm
-            system=[
-                {
-                    "type": "text",
-                    "text": _SYSTEM_PROMPT,
-                    # Cached across cycles (5-min TTL > 1-min cadence) —
-                    # ~90% input-cost cut on the rubric.
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": user_content}],
-            tools=[_CLASSIFY_TOOL],
-            # FORCE the tool call — the model cannot reply with prose.
-            tool_choice={"type": "tool", "name": "classify_articles"},
-        )
-        classifications = None
-        for block in msg.content:
-            if getattr(block, "type", None) == "tool_use":
-                classifications = block.input.get("classifications", [])
-                break
-        if classifications is None:
-            logger.error("Batch sentiment: no tool_use block in Claude response")
-            return {}
-        if not isinstance(classifications, list):
-            logger.error(
-                "Batch sentiment: classifications is %s, not a list — discarding",
-                type(classifications).__name__,
+        # One retry when Claude returns a well-formed but EMPTY classifications
+        # list for a non-empty batch. This is not a parsing failure — the 200 OK
+        # forced-tool-use call legitimately came back with zero entries. Observed
+        # twice at the exact first news_cycle tick after a session boundary
+        # (2026-07-27 16:06-16:12 ET regular→afterhours, 2026-07-28 07:00-07:07 ET
+        # premarket scan start): 6-8 consecutive cycles, each returning [], while
+        # the backlog of unscored articles grew every cycle (since _mark_scored
+        # only fires on a successful score) until it self-recovered. A real
+        # catalyst published in that window would go unscored and untraded with
+        # no evidence beyond a WARNING log. One retry costs one extra call on the
+        # rare empty-batch case and would very likely have shortened both
+        # incidents.
+        for score_attempt in range(2):
+            msg = _claude.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=max_tokens,
+                temperature=0,  # classifier — sampling noise is pure harm
+                system=[
+                    {
+                        "type": "text",
+                        "text": _SYSTEM_PROMPT,
+                        # Cached across cycles (5-min TTL > 1-min cadence) —
+                        # ~90% input-cost cut on the rubric.
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": user_content}],
+                tools=[_CLASSIFY_TOOL],
+                # FORCE the tool call — the model cannot reply with prose.
+                tool_choice={"type": "tool", "name": "classify_articles"},
             )
-            return {}
+            classifications = None
+            for block in msg.content:
+                if getattr(block, "type", None) == "tool_use":
+                    classifications = block.input.get("classifications", [])
+                    break
+            if classifications is None:
+                logger.error("Batch sentiment: no tool_use block in Claude response")
+                return {}
+            if not isinstance(classifications, list):
+                logger.error(
+                    "Batch sentiment: classifications is %s, not a list — discarding",
+                    type(classifications).__name__,
+                )
+                return {}
+            if classifications or score_attempt == 1:
+                break
+            logger.error(
+                "Batch sentiment: Claude returned 0 classifications for a "
+                "%d-article batch — retrying once", len(articles),
+            )
 
         results: dict[str, dict] = {}
         for r in classifications:

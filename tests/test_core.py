@@ -607,6 +607,63 @@ class TestSentimentScoring:
         assert kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
 
 
+# ── Empty-batch retry tests (v21.7 — session-boundary blackout post-mortem) ──
+
+class TestEmptyClassificationsRetry:
+    """
+    Tests for news/fetcher.py::_batch_score_sentiment — one retry when Claude
+    returns a well-formed but EMPTY classifications list for a non-empty batch.
+
+    Observed twice at the exact first news_cycle tick after a session boundary
+    (2026-07-27 16:06-16:12 ET regular→afterhours, 2026-07-28 07:00-07:07 ET
+    premarket scan start): 6-8 consecutive 200-OK forced-tool-use calls each
+    returned []. Because _mark_scored only fires on a successful score, the
+    backlog of unscored articles grew every cycle with no bound but
+    max_age_minutes. A real catalyst published in that window risks going
+    unscored and untraded with nothing but a WARNING in the logs.
+    """
+
+    def _mock_tool_response(self, classifications: list[dict]) -> MagicMock:
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": classifications}
+        msg = MagicMock()
+        msg.content = [block]
+        return msg
+
+    def _article(self, id="1", headline="Earnings beat", teaser="Revenue up"):
+        return {"id": id, "headline": headline, "teaser": teaser}
+
+    @patch("news.fetcher._claude")
+    def test_empty_then_populated_recovers_on_retry(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
+        mock_claude.messages.create.side_effect = [
+            self._mock_tool_response([]),
+            self._mock_tool_response([
+                {"id": "1", "sentiment": "positive", "confidence": 0.9,
+                 "catalyst_type": "guidance_raise", "already_moved": False},
+            ]),
+        ]
+        scores = _batch_score_sentiment([self._article()])
+        assert mock_claude.messages.create.call_count == 2
+        assert scores["1"]["sentiment"] == "positive"
+
+    @patch("news.fetcher._claude")
+    def test_empty_twice_gives_up_and_returns_empty(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
+        mock_claude.messages.create.return_value = self._mock_tool_response([])
+        scores = _batch_score_sentiment([self._article()])
+        assert mock_claude.messages.create.call_count == 2
+        assert scores == {}
+
+    @patch("news.fetcher._claude")
+    def test_genuinely_empty_batch_result_not_retried_when_articles_empty(self, mock_claude):
+        from news.fetcher import _batch_score_sentiment
+        scores = _batch_score_sentiment([])
+        mock_claude.messages.create.assert_not_called()
+        assert scores == {}
+
+
 # ── Same-day same-ticker cross-reference tests (v19.5) ────────────────────────
 
 class TestSameDayTickerCrossReference:
@@ -936,13 +993,57 @@ class TestPositionSizing:
         assert quantity is None
         assert err is not None
 
+    @patch("trading.executor.time.sleep")
     @patch("trading.executor._get")
-    def test_api_failure_returns_none(self, mock_get):
+    def test_api_failure_returns_none(self, mock_get, _mock_sleep):
         from trading.executor import calculate_quantity
         mock_get.side_effect = Exception("HTTP 401")
         quantity, err = calculate_quantity("AAPL_US_EQ", price=100.0)
         assert quantity is None
         assert err is not None
+        # Retried once (see TestCashLookupRetry) before giving up.
+        assert mock_get.call_count == 2
+
+
+# ── Cash-lookup retry tests (v21.7 — ITW post-mortem) ─────────────────────────
+
+class TestCashLookupRetry:
+    """
+    Tests for trading/executor.py::calculate_quantity — one retry on a
+    transient cash-API failure.
+
+    2026-07-28: ITW cleared every gate (catalyst, confidence, price/momentum/
+    VWAP/liquidity), was logged APPROVED, then died outright on a single
+    un-retried HTTP 429 from this exact call — on a day with only 2 total
+    429s all day. The signal was never retried (buy_failed was not a
+    transient rejection code), so a fully-qualified entry was lost to one
+    rate-limit blip.
+    """
+
+    def _mock_cash(self, total=5000.0, free=5000.0):
+        return {"total": total, "free": free, "invested": 0.0}
+
+    @patch("trading.executor.time.sleep")
+    @patch("trading.executor.get_gbp_usd_rate", return_value=1.0)
+    @patch("trading.executor._get")
+    def test_transient_429_recovers_on_retry(self, mock_get, _mock_fx, mock_sleep):
+        from trading.executor import calculate_quantity
+        mock_get.side_effect = [Exception("HTTP 429 - TooManyRequests"), self._mock_cash()]
+        quantity, err = calculate_quantity("ITW_US_EQ", price=100.0)
+        assert err is None
+        assert quantity is not None
+        assert mock_get.call_count == 2
+        mock_sleep.assert_called_once()
+
+    @patch("trading.executor.time.sleep")
+    @patch("trading.executor._get")
+    def test_persistent_failure_still_fails_after_retry(self, mock_get, _mock_sleep):
+        from trading.executor import calculate_quantity
+        mock_get.side_effect = Exception("HTTP 429 - TooManyRequests")
+        quantity, err = calculate_quantity("ITW_US_EQ", price=100.0)
+        assert quantity is None
+        assert "429" in err
+        assert mock_get.call_count == 2
 
 
 # ── Precision retry tests ─────────────────────────────────────────────────────
@@ -2595,6 +2696,96 @@ class TestNoQuoteStrikeReset:
         main._queue_retry(self._item())
         main._reset_no_quote_blackout_if_new_day()   # same day — no-op
         assert "ABC_US_EQ" in main._no_quote_blackout
+
+
+# ── Pre-broker buy retry tests (v21.7 — ITW post-mortem) ──────────────────────
+
+class TestEnterConfirmedBuyRetry:
+    """
+    Tests for main.py::_enter_confirmed — one retry when buy() fails BEFORE
+    reaching the broker (calculate_quantity error: order_id is None and
+    quantity == 0). A failure that already reached the broker (non-empty
+    order_id/quantity) must never be retried here — that would risk placing
+    a second live order for the same signal.
+    """
+
+    def _item(self, ticker="ITW_US_EQ"):
+        import pytz as _pytz
+        from news.fetcher import NewsItem
+        return NewsItem(
+            article_id="a1", ticker=ticker, headline="h", body="", source="s",
+            published_at=datetime.now(_pytz.utc), sentiment="positive",
+            confidence=0.8, catalyst_type="guidance_raise", already_moved=False,
+            catalyst_magnitude=3,
+        )
+
+    def _confirmation(self, ticker="ITW_US_EQ"):
+        from market.price_check import PriceConfirmation
+        from market.sessions import REGULAR
+        return PriceConfirmation(
+            ticker=ticker, symbol="ITW", current_price=297.08, open_price=290.0,
+            prev_close=284.9, day_move_pct=2.4, day_change_pct=4.3,
+            recent_move_pct=0.42, current_volume=100000, avg_volume=95000,
+            rvol=1.0, avg_dollar_volume=397_645_476, spread_proxy_pct=0.1,
+            is_confirmed=True, reason="approved", reason_code="approved",
+            session=REGULAR,
+        )
+
+    def _order_result(self, success, order_id=None, quantity=0, error=None):
+        from trading.executor import OrderResult
+        return OrderResult(
+            success=success, ticker="ITW_US_EQ", quantity=quantity,
+            price=297.08, order_id=order_id, error=error,
+        )
+
+    @patch("main.set_rejection_reason")
+    @patch("main.mark_signal_acted_on")
+    @patch("main.place_stop_loss", return_value=None)
+    @patch("main.open_trade", return_value=1)
+    @patch("main.buy")
+    def test_pre_broker_failure_retried_and_succeeds(
+        self, mock_buy, mock_open_trade, _mock_stop, _mock_acted, _mock_reject,
+    ):
+        import main
+        mock_buy.side_effect = [
+            self._order_result(False, order_id=None, quantity=0,
+                                error="T212 cash API failed: HTTP 429"),
+            self._order_result(True, order_id="o1", quantity=1.5),
+        ]
+        result = main._enter_confirmed(self._item(), self._confirmation(), signal_id=42)
+        assert result is True
+        assert mock_buy.call_count == 2
+        mock_open_trade.assert_called_once()
+
+    @patch("main.set_rejection_reason")
+    @patch("main.buy")
+    def test_pre_broker_failure_gives_up_after_one_retry(
+        self, mock_buy, mock_reject,
+    ):
+        import main
+        mock_buy.return_value = self._order_result(
+            False, order_id=None, quantity=0, error="T212 cash API failed: HTTP 429",
+        )
+        result = main._enter_confirmed(self._item(), self._confirmation(), signal_id=42)
+        assert result is False
+        assert mock_buy.call_count == 2
+        mock_reject.assert_called_once()
+        assert mock_reject.call_args.args[2] == "buy_failed"
+
+    @patch("main.set_rejection_reason")
+    @patch("main.buy")
+    def test_post_broker_failure_is_never_retried(self, mock_buy, mock_reject):
+        # An order_id or nonzero quantity means the broker was already
+        # contacted (e.g. the buy raced a precision-retry then failed on
+        # post-order processing) — retrying here risks a second live order.
+        import main
+        mock_buy.return_value = self._order_result(
+            False, order_id="o1", quantity=1.5, error="BUY post-order processing failed",
+        )
+        result = main._enter_confirmed(self._item(), self._confirmation(), signal_id=42)
+        assert result is False
+        assert mock_buy.call_count == 1
+        mock_reject.assert_called_once()
 
 
 class TestPrepostCapabilityLatch:

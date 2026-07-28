@@ -116,6 +116,20 @@ batched call** per cycle:
   every call after the first.
 - **Forced tool use** (`tool_choice`) — output is schema-validated JSON; no
   string parsing, no truncation recovery.
+- **One retry on an empty result (v21.7, 2026-07-28):** a 200 OK, forced-tool-
+  use response can still legitimately carry an empty `classifications` list
+  for a non-empty batch — observed 8 consecutive cycles at 07:00-07:07 ET
+  (the premarket scan start) and 6 consecutive cycles the day before at
+  16:06-16:12 ET (the regular→afterhours boundary), both times the very first
+  `news_cycle` tick after a session transition, with no per-record validation
+  warnings (so not malformed records — a genuinely empty array). Because
+  `_mark_scored()` only fires on a successful score, an un-retried empty
+  batch regrows the unscored backlog every cycle with no bound but
+  `max_age_minutes` aging the oldest entries out. `_batch_score_sentiment`
+  now retries once immediately (logged at ERROR, not WARNING — this is a
+  data-loss risk, not routine) before giving up and returning `{}`. Root
+  cause of the empty response itself is unconfirmed — plausibly a
+  backlog/complexity edge in the first larger batch after an idle gap.
 - The rubric is a **decision tree**: (1) is this NEW information, or a
   recap/halt article describing a move that already happened? (2) is the tagged
   ticker the actual subject (acquirer-vs-target)? (3) is the catalyst binding
@@ -504,6 +518,20 @@ Size = **minimum** of:
 3. **Liquidity participation: 0.5% of the stock's ADV dollars** — keeps our
    own exit order from moving the price.
 4. Available cash.
+
+**Cash-lookup retry (v21.7, 2026-07-28):** the `/equity/account/cash` call
+that seeds constraint 4 retries once (2s backoff) on failure. Before this, a
+single un-retried failure here was fatal to the whole entry — ITW cleared
+every gate (catalyst, confidence, price/momentum/VWAP/liquidity), was logged
+`APPROVED`, then died outright on one HTTP 429 from this exact call, on a day
+with only 2 total 429s. `main.py::_enter_confirmed` adds a second layer: it
+retries the whole `buy()` call once, but **only** when the failure happened
+before the broker was contacted (`order_id is None and quantity == 0`, which
+`buy()`'s early return guarantees for any `calculate_quantity` failure) — a
+failure that already reached the broker is never retried, since that risks a
+second live order for the same signal. Previously `buy_failed` was not in
+`_TRANSIENT_REJECT_CODES`, so a fully-gated signal had no second chance at
+all once the order attempt failed for any reason.
 
 ---
 
