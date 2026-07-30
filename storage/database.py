@@ -573,23 +573,26 @@ def trading_days_since_last_trade() -> int | None:
     last = row["d"] if row else None
     if last is None:
         return None
-    try:
-        import pandas as pd
-        now_utc = pd.Timestamp.now(tz="UTC")
-        # Look from the day after the last entry through ~2 weeks ahead (covers any
-        # realistic drought + holidays); end-bound generously, then filter by close.
-        start = (last + timedelta(days=1)).isoformat()
-        end = (now_utc.date() + timedelta(days=1)).isoformat()
-        sched = _nyse_calendar().schedule(start_date=start, end_date=end)
-        if sched.empty:
-            return 0
-        # Count only sessions whose close has already passed — a session still in
-        # progress (or yet to open) is not an "elapsed" idle session.
-        closed = sched[sched["market_close"] <= now_utc]
-        return int(len(closed))
-    except Exception as exc:
-        logger.debug("trading_days_since_last_trade: calendar calc failed: %s", exc)
-        return None
+    # No try/except here: a calendar-library failure must propagate rather than
+    # collapse to None, since None already has a legitimate meaning above ("no
+    # trades exist yet") that check_zero_trade_drought() reads as "don't alert."
+    # A silently-swallowed calendar exception would defeat this exact tripwire —
+    # the caller (main.py::check_zero_trade_drought) already wraps this whole
+    # call in a try/except that logs at WARNING and bails, which is the correct
+    # place to handle it.
+    import pandas as pd
+    now_utc = pd.Timestamp.now(tz="UTC")
+    # Look from the day after the last entry through ~2 weeks ahead (covers any
+    # realistic drought + holidays); end-bound generously, then filter by close.
+    start = (last + timedelta(days=1)).isoformat()
+    end = (now_utc.date() + timedelta(days=1)).isoformat()
+    sched = _nyse_calendar().schedule(start_date=start, end_date=end)
+    if sched.empty:
+        return 0
+    # Count only sessions whose close has already passed — a session still in
+    # progress (or yet to open) is not an "elapsed" idle session.
+    closed = sched[sched["market_close"] <= now_utc]
+    return int(len(closed))
 
 
 def get_today_realized_pnl() -> float:

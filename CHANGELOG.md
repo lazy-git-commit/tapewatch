@@ -7,6 +7,88 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.9 — 2026-07-30 (exception-handling audit: 9 misclassification bugs across every module)
+
+Full-codebase audit for one specific bug shape: a real exception (network
+error, HTTP status, malformed response) being swallowed or logged as an
+ordinary business outcome ("no data available") instead of a distinguishable
+failure. This is the exact shape behind three prior incidents (the CDNS/SANM/
+etc. permanent blacklist from a misclassified 403, the ITW zero-retry 429,
+the SMCI/naive-ticker-split forward-returns poisoning). Five parallel
+subagent reviews covered every production module; each finding was verified
+against the actual code before being fixed. Encouragingly, most of the
+codebase already handles this correctly (kill-switch fail-closed, GONE/None
+order-status discipline, the ratchet's exception handling, reconciliation's
+broker-failure-vs-genuinely-flat distinction) — these are the gaps that
+remained.
+
+### Fixed
+- **`storage/database.py::trading_days_since_last_trade`**: a calendar-library
+  exception was caught internally and converted to `None`, which its caller
+  already treats identically to "no trades ever exist" (don't alert) — a
+  calendar regression would have silently defeated the zero-trade-drought
+  tripwire forever. Now propagates to the caller's existing `try/except`,
+  which already logs at WARNING and bails correctly.
+- **`trading/executor.py`**: introduced `T212HTTPError(status_code, body)` —
+  `_get`/`_post`/`_delete` now raise a typed exception instead of a bare
+  `Exception(f"HTTP {code} - {text}")` string, so callers can branch on
+  `.status_code`/`.retryable` instead of substring-matching a formatted
+  message (fragile — misclassifies if a response body happens to contain the
+  same digits). `get_order_status`'s safety-critical GONE/None distinction
+  now checks `exc.status_code == 404` directly. `calculate_quantity`'s cash-
+  lookup retry and a new retry around `buy()`'s actual order-placement POST
+  (previously zero retry at all — more consequential than the already-fixed
+  cash-lookup path) both now skip the retry entirely for non-retryable
+  4xx (401/403/404/400), instead of burning the one retry budget on a
+  failure that will recur identically.
+- **`market/twelvedata_bars.py::get_twelvedata_quote`**: a `status:error`
+  payload was logged at DEBUG with no check for an auth/plan-entitlement
+  message — same shape as the CDNS/SANM incident, this time on the Finnhub-
+  fallback quote path used for exactly the small-cap/no-coverage names most
+  likely to accumulate no-quote strikes. Added a 403 branch and an auth/plan
+  substring check (mirrors `_get_time_series`'s existing prepost-403 handling)
+  plus a missing catch-all `except Exception` (the function's retry loop had
+  none, unlike its sibling).
+- **`market/finnhub_bars.py`**: added an auth-failure latch
+  (`_note_auth_failure`/`finnhub_auth_ok`, mirrors twelvedata_bars.py's
+  prepost-denial latch) — a 401/403 is now recorded once, loudly, with a
+  `system_event`, instead of being logged identically to a per-symbol 404.
+  Without this, a revoked/expired Finnhub key would present as N independent
+  "no coverage" tickers rather than one systemic failure.
+- **`main.py::news_cycle`**: the pre-market candidate batch's `try/except`
+  wrapped the ENTIRE evaluation+execution loop — one candidate's exception
+  silently dropped every candidate queued behind it with no per-candidate DB
+  trace. This is the same shape as the 2026-06-11→07-06 zero-trade drought
+  (a `TypeError` in `_candidate_to_news_item` that used to abort the whole
+  batch). Each candidate is now isolated in its own try/except and gets an
+  explicit `rejected` status write on failure.
+- **`news/fetcher.py::_fetch`**: a 200 OK whose body isn't the expected
+  `{"results"|"articles": [...]}` envelope (schema change, an error wrapped
+  in a 200) previously resolved to zero articles AND called
+  `_note_benzinga_ok()` — meaning the Benzinga outage tripwire could never
+  fire while every cycle silently starved. Now counts as a fetch failure.
+- **`monitor/position_monitor.py::_clear_resting`**: the sole fully-silent
+  `except Exception: pass` found in this file (otherwise well-engineered
+  against this bug class). A failed DB write clearing a resting order id now
+  logs at ERROR instead of leaving the DB/in-memory divergence with zero
+  trace.
+- **`analysis/forward_returns.py`**: (1) `_get_intraday_bars`'s yfinance
+  exception was logged at DEBUG — invisible at production's INFO level, so a
+  Yahoo-side rate limit/block would silently mark every row in a run NULL
+  with no way to tell "genuinely no data" from "the provider is down." Bumped
+  to WARNING and added a consecutive-failure counter/system_event mirroring
+  the Benzinga tripwire. (2) `_compute_batch`'s call to `t212_to_symbol()` —
+  already the site of one repeat ticker-mapping bug (the naive-split bug, the
+  SMCI bug in v21.4) — was unguarded; an exception there would have crashed
+  the entire nightly batch rather than marking one row unresolved.
+
+### Not changed — lower severity, deferred
+A handful of minor log-level/observability nitpicks surfaced (e.g. a fully
+silent heartbeat-write swallow in the monitor, unvalidated sentiment/catalyst
+enum values accepted without a schema-drift warning) that don't fit the
+"exception misclassified as business outcome" pattern this pass targeted —
+left as-is pending a future pass.
+
 ## v21.8 — 2026-07-30 (exit-horizon fix activated: TIME_STOP_MINUTES 60 → 120)
 
 The v21.3 (2026-07-20) forward-return panel showed `guidance_raise` still

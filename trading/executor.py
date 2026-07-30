@@ -222,10 +222,37 @@ def t212_to_symbol(t212_ticker: str) -> str:
     return t212_ticker.split("_")[0]
 
 
+class T212HTTPError(Exception):
+    """
+    A non-2xx response from the T212 API, carrying the status code as a real
+    attribute instead of forcing callers to substring-match a formatted
+    message (`"HTTP 404" in str(exc)`). That pattern is fragile — it
+    misclassifies if the response body itself happens to contain the same
+    digits — and it hid the difference between retryable failures (429, 5xx)
+    and non-retryable ones (401/403 auth, 404 not-found) from every caller
+    that only ever saw a flat string.
+
+    `str(exc)` still renders as "HTTP {code} - {body}" so existing log lines
+    are unaffected; new code should use `.status_code`/`.body` directly.
+    """
+
+    def __init__(self, status_code: int, body: str):
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"HTTP {status_code} - {body}")
+
+    @property
+    def retryable(self) -> bool:
+        """429 (rate limit) and 5xx (server error) are worth retrying; 4xx
+        auth/validation errors (401/403/404/400) will fail identically on
+        retry with the same credentials/request."""
+        return self.status_code == 429 or self.status_code >= 500
+
+
 def _get(path: str) -> dict:
     resp = requests.get(f"{_base_url()}{path}", headers=_auth_header(), timeout=10)
     if not resp.ok:
-        raise Exception(f"HTTP {resp.status_code} - {resp.text}")
+        raise T212HTTPError(resp.status_code, resp.text)
     return resp.json()
 
 
@@ -237,14 +264,14 @@ def _post(path: str, payload: dict) -> dict:
         timeout=10,
     )
     if not resp.ok:
-        raise Exception(f"HTTP {resp.status_code} - {resp.text}")
+        raise T212HTTPError(resp.status_code, resp.text)
     return resp.json()
 
 
 def _delete(path: str) -> dict:
     resp = requests.delete(f"{_base_url()}{path}", headers=_auth_header(), timeout=10)
     if not resp.ok:
-        raise Exception(f"HTTP {resp.status_code} - {resp.text}")
+        raise T212HTTPError(resp.status_code, resp.text)
     # T212 DELETE may return an empty body on success
     try:
         return resp.json()
@@ -422,12 +449,25 @@ def calculate_quantity(
             break
         except Exception as exc:
             last_exc = exc
-            if attempt == 0:
+            # Only retry failures that can plausibly clear on their own (429
+            # rate limit, 5xx, or a network-layer error with no status code
+            # at all). A 401/403/404 will fail identically on retry — the
+            # credentials or endpoint don't change in 2 seconds — so burn no
+            # time on it and fail fast with the real cause still visible.
+            retryable = not isinstance(exc, T212HTTPError) or exc.retryable
+            if attempt == 0 and retryable:
                 logger.warning(
                     "calculate_quantity for %s: T212 cash API failed (%s) — retrying once",
                     ticker, exc,
                 )
                 time.sleep(2)
+            elif attempt == 0:
+                logger.warning(
+                    "calculate_quantity for %s: T212 cash API failed with a "
+                    "non-retryable error (%s) — not retrying",
+                    ticker, exc,
+                )
+                break
     if data is None:
         reason = f"T212 cash API failed: {last_exc}"
         logger.error("calculate_quantity for %s: %s", ticker, reason)
@@ -509,8 +549,8 @@ def get_order_status(order_id: str) -> str | None:
     try:
         item = _get(f"/equity/orders/{order_id}")
         return str(item.get("status", "")).upper() or None
-    except Exception as exc:
-        if "HTTP 404" in str(exc):
+    except T212HTTPError as exc:
+        if exc.status_code == 404:
             # Pending endpoint 404 means "not live on the book", but that can
             # be a fill, cancellation, expiry, or history pagination miss. Check
             # recent order history before making the caller infer too much.
@@ -529,6 +569,12 @@ def get_order_status(order_id: str) -> str | None:
                 logger.warning("get_order_status(%s): history lookup failed after 404: %s", order_id, hist_exc)
                 return None
             return "GONE"
+        # Any other HTTP status (429, 403, 500...) is a real API failure, not
+        # proof the order is gone — surface the status code so it's clear
+        # from the logs which kind of failure this was.
+        logger.warning("get_order_status(%s): HTTP %d — %s", order_id, exc.status_code, exc.body[:200])
+        return None
+    except Exception as exc:
         logger.warning("get_order_status(%s): %s", order_id, exc)
         return None
 
@@ -624,9 +670,33 @@ def buy(
     if extended:
         payload["extendedHours"] = True
 
-    try:
-        order = _post("/equity/orders/market", payload)
-    except Exception as exc:
+    # One retry on a transient failure (429 rate limit / 5xx / network error)
+    # placing the actual order — this is the live order call, not a pre-check,
+    # so losing it outright to a rate-limit blip is strictly worse than the
+    # already-fixed cash-lookup case (v21.7/CHANGELOG). A non-retryable
+    # T212HTTPError (401/403/404/400, including quantity-precision-mismatch)
+    # falls straight through to the existing handling below on the first try.
+    order = None
+    post_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            order = _post("/equity/orders/market", payload)
+            post_exc = None
+            break
+        except Exception as exc:
+            post_exc = exc
+            retryable = not isinstance(exc, T212HTTPError) or exc.retryable
+            if attempt == 0 and retryable:
+                logger.warning(
+                    "BUY %s: order placement failed (%s) — retrying once",
+                    ticker, exc,
+                )
+                time.sleep(2)
+            else:
+                break
+
+    if post_exc is not None:
+        exc = post_exc
         exc_str = str(exc)
         # T212 rejects orders when our quantity has more decimal places than the
         # instrument allows. The error detail carries the maximum allowed

@@ -558,6 +558,21 @@ def _fetch(lookback_minutes: int) -> list[dict]:
             _note_benzinga_failure()
             return []
         data = resp.json()
+        # A 200 OK with a body that isn't the expected envelope shape (schema
+        # change on massive.com's side, an error wrapped in a 200, a paginated
+        # response under a different key) must NOT be treated as "fetched zero
+        # articles this cycle" — that outcome resets _benzinga_consecutive_failures
+        # via _note_benzinga_ok() below, which means the outage tripwire this
+        # function exists to back could never fire while every cycle silently
+        # returns nothing. Only recognized envelope shapes count as success.
+        if not isinstance(data, dict) or ("results" not in data and "articles" not in data):
+            logger.warning(
+                "Benzinga API: unrecognized response shape (keys=%s) — "
+                "treating as a fetch failure, not zero articles",
+                list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+            )
+            _note_benzinga_failure()
+            return []
         articles = data.get("results", data.get("articles", []))
         logger.debug("Benzinga: fetched %d raw articles (lookback=%d min)", len(articles), lookback_minutes)
         _note_benzinga_ok()

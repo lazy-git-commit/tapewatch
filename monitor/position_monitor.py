@@ -327,8 +327,20 @@ def _clear_resting(trade: dict, kind: str) -> None:
             set_stop_order_id(trade["id"], None)
         else:
             set_tp_order_id(trade["id"], None)
-    except Exception:
-        pass
+    except Exception as exc:
+        # A failed DB write here leaves the DB row pointing at an order that
+        # was just cancelled/resolved at the broker, while the in-memory copy
+        # (updated unconditionally below) says otherwise — a real divergence,
+        # not a no-op, and one that used to vanish with no log trace at all.
+        # If the process restarts before the next successful write, the
+        # monitor will re-check this stale order id at the broker and recover
+        # (GONE/cancelled), but that recovery path is undocumented here and
+        # worth being able to find in the logs if it ever needs debugging.
+        logger.error(
+            "Could not clear resting %s order id in DB for trade %d: %s — "
+            "in-memory state now diverges from DB until the next reconcile",
+            kind, trade["id"], exc, exc_info=True,
+        )
     trade["stop_order_id" if kind == "stop" else "tp_order_id"] = None
 
 

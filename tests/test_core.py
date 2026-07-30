@@ -1055,6 +1055,7 @@ class TestBuyPrecisionRetry:
         return {"total": total, "free": free, "invested": 0.0}
 
     def _precision_error(self, allowed: int) -> Exception:
+        from trading.executor import T212HTTPError
         body = (
             f'{{"type":"/api-errors/quantity-precision-mismatch",'
             f'"title":"Error while placing the order",'
@@ -1062,7 +1063,7 @@ class TestBuyPrecisionRetry:
             f'"detail":"invalid quantity precision {allowed}",'
             f'"traceId":"abc"}}'
         )
-        return Exception(f"HTTP 400 - {body}")
+        return T212HTTPError(400, body)
 
     @patch("trading.executor._fetch_fill", return_value=None)
     @patch("trading.executor._post")
@@ -1084,15 +1085,43 @@ class TestBuyPrecisionRetry:
             decimal_places = 0
         assert decimal_places <= 2
 
+    @patch("trading.executor.time.sleep")
     @patch("trading.executor._post")
     @patch("trading.executor._get")
-    def test_non_precision_error_does_not_retry(self, mock_get, mock_post):
-        from trading.executor import buy
+    def test_non_precision_business_rejection_does_not_retry(self, mock_get, mock_post, _sleep):
+        """A non-retryable 4xx (not precision-mismatch, not 429) fails on the first attempt."""
+        from trading.executor import buy, T212HTTPError
         mock_get.return_value = self._mock_cash()
-        mock_post.side_effect = Exception("HTTP 500 - Internal server error")
+        mock_post.side_effect = T212HTTPError(400, '{"detail":"insufficient funds"}')
         result = buy("AAPL_US_EQ", price=100.0)
         assert result.success is False
         assert mock_post.call_count == 1
+
+    @patch("trading.executor.time.sleep")
+    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._post")
+    @patch("trading.executor._get")
+    def test_transient_5xx_on_order_placement_retries_once(self, mock_get, mock_post, _fill, _sleep):
+        """A 500/429 placing the actual order is retried once (v21.9) — this call
+        is the live order, not a pre-check, so losing it to one rate-limit blip
+        is strictly worse than the already-fixed cash-lookup case."""
+        from trading.executor import buy, T212HTTPError
+        mock_get.return_value = self._mock_cash()
+        mock_post.side_effect = [T212HTTPError(500, "Internal server error"), {"id": "99"}]
+        result = buy("AAPL_US_EQ", price=100.0)
+        assert result.success is True
+        assert mock_post.call_count == 2
+
+    @patch("trading.executor.time.sleep")
+    @patch("trading.executor._post")
+    @patch("trading.executor._get")
+    def test_persistent_5xx_on_order_placement_fails_after_one_retry(self, mock_get, mock_post, _sleep):
+        from trading.executor import buy, T212HTTPError
+        mock_get.return_value = self._mock_cash()
+        mock_post.side_effect = T212HTTPError(500, "Internal server error")
+        result = buy("AAPL_US_EQ", price=100.0)
+        assert result.success is False
+        assert mock_post.call_count == 2
 
     @patch("trading.executor._post")
     @patch("trading.executor._get")
@@ -1136,6 +1165,34 @@ class TestSellExecution:
         result = sell("AAPL_US_EQ", quantity=1.0, price=100.0, reason="eod_flatten")
         assert result.success is True
         assert mock_post.call_args[0][0] == "/equity/orders/market"
+
+
+class TestClearRestingLogsOnFailure:
+    """
+    v21.9: _clear_resting's DB write must not fail silently. A failed write
+    here leaves the DB row pointing at an order id that was just
+    cancelled/resolved at the broker while the in-memory trade object says
+    otherwise — a real state divergence, previously swallowed with a bare
+    `except Exception: pass` and zero log trace.
+    """
+
+    def _trade(self):
+        return {"id": 7, "stop_order_id": "old-stop-1", "tp_order_id": None}
+
+    @patch("monitor.position_monitor.set_stop_order_id", side_effect=Exception("db down"))
+    def test_db_failure_is_logged_not_swallowed(self, _mock_set, caplog):
+        import logging
+        from monitor.position_monitor import _clear_resting
+        with caplog.at_level(logging.ERROR, logger="monitor.position_monitor"):
+            _clear_resting(self._trade(), "stop")
+        assert any("db down" in rec.message for rec in caplog.records)
+
+    @patch("monitor.position_monitor.set_stop_order_id", side_effect=Exception("db down"))
+    def test_in_memory_state_still_cleared_despite_db_failure(self, _mock_set):
+        from monitor.position_monitor import _clear_resting
+        trade = self._trade()
+        _clear_resting(trade, "stop")
+        assert trade["stop_order_id"] is None
 
 
 class TestGoneRestingOrderResolution:
@@ -1932,6 +1989,53 @@ class TestPremarketGraduation:
         assert conf_arg.reason_code == "low_momentum"  # transient → re-eval queue
 
 
+class TestPremarketBatchIsolation:
+    """
+    v21.9: a bug that only one candidate's data triggers must not silently
+    drop every candidate queued behind it. Regression for the same SHAPE of
+    bug as TestPremarketCandidateToNewsItem's 2026-06-11 drought (a single
+    unhandled exception used to abort the whole premarket exec loop with one
+    generic log line and no per-candidate DB trace) — this time verifying the
+    loop itself isolates failures per-candidate rather than relying on every
+    possible exception source inside it being pre-emptively fixed.
+    """
+
+    @patch("main.update_premarket_candidate")
+    @patch("main._execute_entry")
+    @patch("main._candidate_to_news_item")
+    @patch("main.evaluate_premarket_candidates")
+    @patch("main.was_recently_traded", return_value=False)
+    @patch("main._risk_gates_pass", return_value=(True, ""))
+    @patch("main.is_too_late_to_buy", return_value=False)
+    @patch("main.get_trading_session", return_value="regular")
+    @patch("main.touch_heartbeat")
+    def test_one_bad_candidate_does_not_block_the_rest(
+        self, _hb, _session, _late, _gates, _traded, mock_eval,
+        mock_to_item, mock_exec, mock_upd,
+    ):
+        import main
+        cand_bad = {"id": 10, "ticker": "BAD_US_EQ"}
+        cand_good = {"id": 11, "ticker": "GOOD_US_EQ"}
+        conf = _mk_conf(reason_code="approved", day_change_pct=5.0)
+        mock_eval.return_value = ([(cand_bad, conf), (cand_good, conf)], [])
+        # The first candidate's conversion raises — simulates a data-shape bug
+        # specific to that one row (e.g. a missing/malformed field).
+        mock_to_item.side_effect = [TypeError("boom"), MagicMock(ticker="GOOD_US_EQ")]
+        mock_exec.return_value = True
+
+        with patch("main.fetch_all_news", return_value=[]):
+            main.news_cycle()
+
+        # The good candidate must still have been processed despite the bad
+        # one raising first.
+        assert mock_exec.called
+        # The bad candidate must be recorded as rejected (not left "pending"
+        # with zero trace of what happened), and the good one as traded.
+        statuses = {call.args[0]: call.args[1] for call in mock_upd.call_args_list}
+        assert statuses.get(10) == "rejected"
+        assert statuses.get(11) == "traded"
+
+
 class TestApplyConfirmation:
     """_apply_confirmation preserves the exact gate verdicts of the old loop."""
 
@@ -2354,6 +2458,103 @@ class TestForwardReturnsTickerResolution:
         assert captured["symbol"] == "AAPL"
 
 
+class TestForwardReturnsTickerMappingCrashIsolation:
+    """
+    v21.9: t212_to_symbol() is exactly the function that has already had one
+    ticker-mapping bug in this module's history (see the class above and
+    CHANGELOG v21.4) — an unguarded call to it must not crash the WHOLE batch
+    (and every batch after it in the run) if it ever raises again for a new/
+    unexpected ticker shape. One bad row should mark itself unresolved and let
+    the rest of the batch proceed.
+    """
+
+    def _row(self, ticker: str, row_id: int = 1) -> dict:
+        return {"id": row_id, "ticker": ticker, "published_at": "2026-07-01T15:00:00+00:00"}
+
+    def test_t212_to_symbol_exception_does_not_abort_batch(self):
+        from analysis import forward_returns as fr
+
+        calls = {"n": 0}
+
+        def raising_mapper(ticker):
+            calls["n"] += 1
+            if ticker == "BAD_US_EQ":
+                raise TypeError("unexpected ticker shape")
+            return "GOOD"
+
+        updated_ids = []
+
+        def fake_update(score_id, *args):
+            updated_ids.append(score_id)
+
+        with patch.object(fr, "t212_to_symbol", side_effect=raising_mapper), \
+             patch.object(fr, "_get_intraday_bars", return_value=None), \
+             patch.object(fr, "update_forward_returns", side_effect=fake_update):
+            n = fr._compute_batch([
+                self._row("BAD_US_EQ", row_id=1),
+                self._row("GOOD_US_EQ", row_id=2),
+            ])
+
+        # Both rows resolved (marked computed), not just the good one — the
+        # bad row's exception must not have killed the second row's processing.
+        assert n == 2
+        assert set(updated_ids) == {1, 2}
+
+
+class TestYfinanceOutageCounter:
+    """
+    v21.9: an exception fetching yfinance bars and a legitimately-empty result
+    (weekend/holiday/delisted ticker) both return None from
+    _get_intraday_bars, and that ambiguity is fine for one ticker-day — but a
+    real yfinance outage (Yahoo-side rate limit/block, API shape change) used
+    to be logged at DEBUG with no counter anywhere, so it would silently mark
+    every row in a run NULL with zero visibility above DEBUG. Mirrors
+    news/fetcher.py's Benzinga outage tripwire.
+    """
+
+    def setup_method(self):
+        from analysis import forward_returns as fr
+        fr._yfinance_consecutive_failures = 0
+
+    teardown_method = setup_method
+
+    @patch("storage.database.record_system_event")
+    def test_event_fires_once_at_threshold(self, mock_evt):
+        from analysis import forward_returns as fr
+        for _ in range(fr._YFINANCE_OUTAGE_THRESHOLD + 3):
+            fr._note_yfinance_failure()
+        assert mock_evt.call_count == 1
+        assert mock_evt.call_args.args[0] == "yfinance_outage"
+
+    @patch("storage.database.record_system_event")
+    def test_success_resets_counter(self, mock_evt):
+        from analysis import forward_returns as fr
+        for _ in range(fr._YFINANCE_OUTAGE_THRESHOLD - 1):
+            fr._note_yfinance_failure()
+        fr._note_yfinance_ok()
+        fr._note_yfinance_failure()
+        mock_evt.assert_not_called()
+
+    def test_empty_dataframe_is_not_counted_as_a_failure(self):
+        """A legitimately empty result (weekend/holiday) must not burn toward
+        the outage tripwire meant for yfinance itself being down."""
+        import pandas as pd
+        from analysis import forward_returns as fr
+        fr._bars_cache.clear()
+        with patch("analysis.forward_returns.yf.Ticker") as mock_ticker:
+            mock_ticker.return_value.history.return_value = pd.DataFrame()
+            fr._get_intraday_bars("AAPL", datetime(2026, 7, 25, tzinfo=timezone.utc))
+        assert fr._yfinance_consecutive_failures == 0
+
+    def test_exception_is_counted_as_a_failure(self):
+        from analysis import forward_returns as fr
+        fr._bars_cache.clear()
+        with patch("analysis.forward_returns.yf.Ticker") as mock_ticker:
+            mock_ticker.return_value.history.side_effect = Exception("rate limited")
+            fr._get_intraday_bars("AAPL", datetime(2026, 7, 25, tzinfo=timezone.utc))
+        assert fr._yfinance_consecutive_failures == 1
+
+
 # ── Entry-cutoff / hold-horizon decoupling (v21.3) ───────────────────────────
 
 class TestEntryCutoffDecoupling:
@@ -2405,12 +2606,13 @@ class TestPrecisionRetryRobustness:
         return {"total": 5000.0, "free": 5000.0, "invested": 0.0}
 
     def _precision_error(self, detail: str) -> Exception:
+        from trading.executor import T212HTTPError
         body = (
             f'{{"type":"/api-errors/quantity-precision-mismatch",'
             f'"title":"Error while placing the order","status":400,'
             f'"detail":"{detail}","traceId":"abc"}}'
         )
-        return Exception(f"HTTP 400 - {body}")
+        return T212HTTPError(400, body)
 
     @patch("trading.executor.get_gbp_usd_rate", return_value=1.25)
     @patch("trading.executor._fetch_fill", return_value=None)
@@ -2560,6 +2762,64 @@ class TestFinnhubFastMode:
         assert get_finnhub_quote("AAPL", fast=True) is None
         assert mock_get.call_count == 1
         mock_sleep.assert_not_called()
+
+
+class TestFinnhubAuthFailureLatch:
+    """
+    v21.9: a 401/403 (revoked/invalid API key) is a SYSTEMIC failure affecting
+    every symbol, not "this ticker has no coverage" — must be latched and
+    logged distinctly from a per-symbol 404/422, mirroring
+    twelvedata_bars.py's prepost-denial latch. Without this, a dead key looks
+    identical to N independent "no Finnhub data" misses.
+    """
+
+    def setup_method(self):
+        import market.finnhub_bars as fh
+        fh._auth_ok = None
+
+    teardown_method = setup_method
+
+    @patch("storage.database.record_system_event")
+    @patch("market.finnhub_bars.requests.get")
+    def test_403_latches_and_emits_system_event(self, mock_get, mock_evt):
+        from market.finnhub_bars import get_finnhub_quote, finnhub_auth_ok
+        resp = MagicMock(); resp.status_code = 403; resp.text = "invalid api key"
+        mock_get.return_value = resp
+        assert get_finnhub_quote("AAPL") is None
+        assert finnhub_auth_ok() is False
+        mock_evt.assert_called_once()
+        assert mock_evt.call_args.args[0] == "finnhub_auth_failure"
+
+    @patch("storage.database.record_system_event")
+    @patch("market.finnhub_bars.requests.get")
+    def test_401_also_latches(self, mock_get, mock_evt):
+        from market.finnhub_bars import get_finnhub_quote, finnhub_auth_ok
+        resp = MagicMock(); resp.status_code = 401; resp.text = "unauthorized"
+        mock_get.return_value = resp
+        assert get_finnhub_quote("AAPL") is None
+        assert finnhub_auth_ok() is False
+
+    @patch("storage.database.record_system_event")
+    @patch("market.finnhub_bars.requests.get")
+    def test_404_does_not_latch(self, mock_get, mock_evt):
+        """A per-symbol 404 is genuinely 'no coverage' — must not be confused
+        with an account-wide auth failure."""
+        from market.finnhub_bars import get_finnhub_quote, finnhub_auth_ok
+        resp = MagicMock(); resp.status_code = 404; resp.text = "symbol not found"
+        mock_get.return_value = resp
+        assert get_finnhub_quote("AAPL") is None
+        assert finnhub_auth_ok() is True
+        mock_evt.assert_not_called()
+
+    @patch("storage.database.record_system_event")
+    @patch("market.finnhub_bars.requests.get")
+    def test_latch_fires_system_event_only_once(self, mock_get, mock_evt):
+        from market.finnhub_bars import get_finnhub_quote
+        resp = MagicMock(); resp.status_code = 403; resp.text = "invalid api key"
+        mock_get.return_value = resp
+        get_finnhub_quote("AAPL")
+        get_finnhub_quote("MSFT")
+        assert mock_evt.call_count == 1
 
 
 class TestFxRateCreditGuard:
@@ -3012,6 +3272,47 @@ class TestBenzingaOutageEvent:
         f._note_benzinga_ok()
         f._note_benzinga_failure()  # 1 of 10 again, not 10 of 10
         mock_evt.assert_not_called()
+
+
+class TestBenzingaMalformedResponseShape:
+    """
+    v21.9: a 200 OK whose body isn't the expected {"results"|"articles": [...]}
+    envelope (schema change, an error wrapped in a 200) must count as a FETCH
+    FAILURE, not "fetched zero articles" — the latter resets
+    _benzinga_consecutive_failures and would let the outage tripwire
+    (TestBenzingaOutageEvent above) never fire while every cycle silently
+    starves.
+    """
+
+    def setup_method(self):
+        import news.fetcher as f
+        f._benzinga_consecutive_failures = 0
+
+    teardown_method = setup_method
+
+    @patch("news.fetcher.requests.get")
+    def test_normal_empty_results_is_still_success(self, mock_get):
+        import news.fetcher as f
+        mock_get.return_value = MagicMock(ok=True, json=lambda: {"results": []})
+        articles = f._fetch(lookback_minutes=5)
+        assert articles == []
+        assert f._benzinga_consecutive_failures == 0
+
+    @patch("news.fetcher.requests.get")
+    def test_unrecognized_envelope_counts_as_failure(self, mock_get):
+        import news.fetcher as f
+        mock_get.return_value = MagicMock(ok=True, json=lambda: {"message": "invalid API key format"})
+        articles = f._fetch(lookback_minutes=5)
+        assert articles == []
+        assert f._benzinga_consecutive_failures == 1
+
+    @patch("news.fetcher.requests.get")
+    def test_non_dict_body_counts_as_failure(self, mock_get):
+        import news.fetcher as f
+        mock_get.return_value = MagicMock(ok=True, json=lambda: ["unexpected", "list", "shape"])
+        articles = f._fetch(lookback_minutes=5)
+        assert articles == []
+        assert f._benzinga_consecutive_failures == 1
 
 
 # ── v19.2 tests: data-integrity + opportunity-capture fixes (2026-07-07) ──────

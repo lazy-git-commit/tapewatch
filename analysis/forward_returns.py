@@ -65,6 +65,43 @@ logger = logging.getLogger(__name__)
 # process (yesterday's bars are also stale for a still-maturing article).
 _bars_cache: dict[str, pd.DataFrame | None] = {}
 
+# yfinance is an unofficial scraper of Yahoo Finance — it can be rate-limited
+# or have its response shape change with zero warning. An exception here and
+# a legitimately-empty result (weekend/holiday/delisted ticker/too-old-for-1m)
+# both return None and are treated identically by every caller — that's an
+# acceptable ambiguity for ONE ticker-day, but if yfinance itself is down or
+# blocked, every row in the run gets silently marked "computed" with NULL
+# forward returns, permanently, and nothing above DEBUG would show it. This
+# counter mirrors news/fetcher.py's Benzinga outage tripwire.
+_YFINANCE_OUTAGE_THRESHOLD = 10
+_yfinance_consecutive_failures = 0
+
+
+def _note_yfinance_failure() -> None:
+    global _yfinance_consecutive_failures
+    _yfinance_consecutive_failures += 1
+    if _yfinance_consecutive_failures == _YFINANCE_OUTAGE_THRESHOLD:
+        logger.error(
+            "yfinance has failed %d consecutive fetches this run — forward "
+            "returns may be getting silently marked NULL for every row rather "
+            "than genuinely having no data. Check for a Yahoo Finance-side "
+            "rate limit/block or an API shape change.",
+            _YFINANCE_OUTAGE_THRESHOLD,
+        )
+        try:
+            from storage.database import record_system_event
+            record_system_event(
+                "yfinance_outage",
+                f"{_YFINANCE_OUTAGE_THRESHOLD} consecutive failed yfinance fetches in one forward-returns run",
+            )
+        except Exception as exc:
+            logger.debug("Could not record yfinance_outage system_event: %s", exc)
+
+
+def _note_yfinance_ok() -> None:
+    global _yfinance_consecutive_failures
+    _yfinance_consecutive_failures = 0
+
 
 def _get_intraday_bars(symbol: str, day: datetime) -> pd.DataFrame | None:
     """1-min bars for one ticker-day via yfinance (UTC index), cached."""
@@ -78,13 +115,23 @@ def _get_intraday_bars(symbol: str, day: datetime) -> pd.DataFrame | None:
             interval="1m",
         )
         if df.empty:
+            # A legitimately empty result (weekend/holiday/delisted/too old
+            # for the 1m window) is NOT a fetch failure — don't count it
+            # toward the outage tripwire, which exists for yfinance itself
+            # being down/blocked, not for genuinely dataless ticker-days.
             _bars_cache[key] = None
             return None
         df.index = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
         _bars_cache[key] = df
+        _note_yfinance_ok()
         return df
     except Exception as exc:
-        logger.debug("yfinance fetch failed for %s %s: %s", symbol, day.date(), exc)
+        # WARNING, not DEBUG: at production's INFO level, DEBUG here made a
+        # real yfinance outage or Yahoo-side API shape change completely
+        # invisible — every affected row silently got NULL forward returns
+        # with zero trace anywhere in the logs.
+        logger.warning("yfinance fetch failed for %s %s: %s", symbol, day.date(), exc)
+        _note_yfinance_failure()
         _bars_cache[key] = None
         return None
 
@@ -237,7 +284,24 @@ def _compute_batch(rows: list[dict]) -> int:
         # those silently poisoned ~400 rows / 5k+ yfinance errors/month
         # (observed 2026-07-22) before this was reused from trading.executor
         # instead of reimplemented here.
-        symbol = t212_to_symbol(str(row["ticker"]))
+        #
+        # Guarded because this function has itself been the site of a repeat
+        # ticker-mapping bug (see the module docstring and CHANGELOG v21.4) —
+        # an unguarded call here would let one new/unexpected T212 ticker
+        # shape crash this entire batch (and every batch after it in this
+        # run), silently starving the whole nightly eval loop rather than
+        # just marking the one offending row unresolved.
+        try:
+            symbol = t212_to_symbol(str(row["ticker"]))
+        except Exception as exc:
+            logger.error(
+                "Forward returns: t212_to_symbol raised for ticker %r (row %s): %s — "
+                "marking row unresolved, not crashing the batch",
+                row.get("ticker"), row.get("id"), exc, exc_info=True,
+            )
+            update_forward_returns(row["id"], None, None, None)
+            updated += 1
+            continue
         try:
             published = datetime.fromisoformat(str(row["published_at"]).replace("Z", "+00:00"))
             if published.tzinfo is None:

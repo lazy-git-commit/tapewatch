@@ -680,7 +680,21 @@ def news_cycle() -> None:
         approved, graduated = (
             evaluate_premarket_candidates() if session == REGULAR else ([], [])
         )
-        for cand, conf in approved:
+    except Exception as exc:
+        # Nothing to iterate if the evaluation call itself blew up — this one
+        # legitimately aborts the whole premarket step for the cycle.
+        logger.error("Pre-market candidate evaluation failed: %s", exc, exc_info=True)
+        approved, graduated = [], []
+
+    # Each candidate is handled in its own try/except so a bug triggered by one
+    # candidate's data (e.g. an unexpected field shape) can't silently drop
+    # every candidate queued behind it with no DB trace of what happened to
+    # them. This is the same shape of bug that caused a 2026-06-11→07-06
+    # zero-trade drought: a single unhandled TypeError inside this loop used
+    # to abort the whole batch with one generic log line and no per-candidate
+    # status update, leaving the rest stuck "pending" indefinitely.
+    for cand, conf in approved:
+        try:
             if was_recently_traded(cand["ticker"]):
                 update_premarket_candidate(cand["id"], "rejected", "24h ticker cooldown")
                 continue
@@ -690,21 +704,32 @@ def news_cycle() -> None:
                 cand["id"], "traded" if opened else "rejected",
                 None if opened else "buy failed or signal save failed",
             )
-            # Re-check gates after each entry so a fill can't blow the caps.
-            gates_ok, gate_reason = _risk_gates_pass()
-            if not gates_ok:
-                logger.warning("Risk gate tripped mid-cycle: %s", gate_reason)
-                return
+        except Exception as exc:
+            logger.error(
+                "Pre-market candidate %s (id=%s) failed: %s",
+                cand.get("ticker"), cand.get("id"), exc, exc_info=True,
+            )
+            try:
+                update_premarket_candidate(cand["id"], "rejected", f"unhandled error: {exc}")
+            except Exception:
+                pass
+            continue
+        # Re-check gates after each entry so a fill can't blow the caps.
+        gates_ok, gate_reason = _risk_gates_pass()
+        if not gates_ok:
+            logger.warning("Risk gate tripped mid-cycle: %s", gate_reason)
+            return
 
-        # Candidates whose 30-min gap-and-go window closed still PENDING (never
-        # confirmed, never terminally rejected) are hand off to the same
-        # standing re-evaluation queue regular-hours signals use, rather than
-        # discarded. A synthetic transient PriceConfirmation routes them through
-        # the existing _execute_entry -> _queue_reeval path unchanged (see
-        # 2026-07-08 post-mortem: KGS/ARQT/AYA/URGN all drifted 1-3% higher
-        # over the rest of the session after their premarket window expired,
-        # with no mechanism to ever look at them again).
-        for cand in graduated:
+    # Candidates whose 30-min gap-and-go window closed still PENDING (never
+    # confirmed, never terminally rejected) are hand off to the same
+    # standing re-evaluation queue regular-hours signals use, rather than
+    # discarded. A synthetic transient PriceConfirmation routes them through
+    # the existing _execute_entry -> _queue_reeval path unchanged (see
+    # 2026-07-08 post-mortem: KGS/ARQT/AYA/URGN all drifted 1-3% higher
+    # over the rest of the session after their premarket window expired,
+    # with no mechanism to ever look at them again).
+    for cand in graduated:
+        try:
             if was_recently_traded(cand["ticker"]):
                 continue
             item = _candidate_to_news_item(cand)
@@ -723,8 +748,12 @@ def news_cycle() -> None:
                 reason_code="low_momentum",
             )
             _execute_entry(item, handoff_conf, fetched_at)
-    except Exception as exc:
-        logger.error("Pre-market candidate evaluation failed: %s", exc, exc_info=True)
+        except Exception as exc:
+            logger.error(
+                "Pre-market candidate hand-off %s (id=%s) failed: %s",
+                cand.get("ticker"), cand.get("id"), exc, exc_info=True,
+            )
+            continue
 
     # ── 2. Re-eval queue (transient tape rejections awaiting participation) ──
     reeval_opened = _process_reeval_queue()

@@ -23,6 +23,46 @@ _QUOTE_URL = "https://finnhub.io/api/v1/quote"
 _RETRIES = 3
 _BASE_BACKOFF = 1.0  # seconds
 
+# ── Auth/entitlement failure latch ───────────────────────────────────────────
+# A 401/403 means the API key is invalid/revoked or the plan doesn't cover
+# this endpoint — a SYSTEMIC failure affecting every symbol, not "this ticker
+# has no coverage." Without this latch, a revoked key looks identical to N
+# independent per-symbol "no Finnhub data" misses, each just a per-call
+# WARNING — exactly the misclassification shape that got nine liquid tickers
+# permanently blacklisted on the Twelvedata side (CLAUDE.md v21.6). Mirrors
+# twelvedata_bars.py's _prepost_supported/_note_prepost_denied latch.
+# None = not yet seen a definitive auth failure, False = latched.
+_auth_ok: bool | None = None
+
+
+def finnhub_auth_ok() -> bool:
+    """False once a 401/403 has been seen this process — a systemic failure,
+    not per-symbol coverage. Callers can use this to avoid counting a
+    downstream miss as a no-quote strike while Finnhub is broken account-wide."""
+    return _auth_ok is not False
+
+
+def _note_auth_failure(status_code: int, detail: str) -> None:
+    """Latch the auth/entitlement failure and record it once, loudly."""
+    global _auth_ok
+    if _auth_ok is False:
+        return
+    _auth_ok = False
+    logger.error(
+        "Finnhub API key appears invalid or revoked (HTTP %d) — every symbol "
+        "will fail this way until FINNHUBIO_API_KEY is fixed, not just the one "
+        "that triggered this. Provider said: %s",
+        status_code, detail,
+    )
+    try:
+        from storage.database import record_system_event
+        record_system_event(
+            "finnhub_auth_failure",
+            f"HTTP {status_code}: {detail[:200]}",
+        )
+    except Exception as exc:
+        logger.debug("Could not record finnhub_auth_failure system_event: %s", exc)
+
 
 def _safe_float(v) -> float | None:
     """float(v) that returns None for unparseable/non-finite values instead
@@ -95,7 +135,14 @@ def get_finnhub_quote(symbol: str, fast: bool = False) -> dict | None:
                 params={"symbol": symbol, "token": cfg.finnhub_api_key},
                 timeout=5,
             )
-            # Client errors (4xx) won't self-heal — log and return immediately
+            # 401/403 is a systemic auth/entitlement failure (bad or revoked
+            # key), not "this symbol has no coverage" — latch it distinctly so
+            # it isn't logged (and counted downstream) identically to a
+            # per-symbol 404/422.
+            if resp.status_code in (401, 403):
+                _note_auth_failure(resp.status_code, resp.text[:200])
+                return None
+            # Other client errors (4xx) won't self-heal — log and return immediately
             if 400 <= resp.status_code < 500:
                 logger.warning(
                     "Finnhub quote HTTP %d for %s — not retrying: %s",

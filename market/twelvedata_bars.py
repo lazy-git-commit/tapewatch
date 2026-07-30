@@ -598,13 +598,30 @@ def get_twelvedata_quote(symbol: str, fast: bool = False) -> dict | None:
                     return None
                 time.sleep(1.5 * attempt)
                 continue
+            # A 403 here is an auth/plan-entitlement failure (bad API key,
+            # exhausted plan tier), not "symbol not covered" — surfaced loudly
+            # and distinctly, mirroring _get_time_series's prepost-403 handling,
+            # since this endpoint is the Finnhub-fallback path for exactly the
+            # small-cap/no-coverage names most likely to accumulate no-quote
+            # strikes if an entitlement failure were mistaken for "no coverage."
+            if resp.status_code == 403:
+                detail = _error_message(resp)
+                logger.error("Twelvedata /quote HTTP 403 for %s (auth/plan failure): %s", symbol, detail)
+                return None
             resp.raise_for_status()
             data = resp.json()
             if data.get("status") == "error":
-                logger.debug(
-                    "Twelvedata /quote error for %s: %s",
-                    symbol, data.get("message", "unknown")[:80],
-                )
+                message = str(data.get("message", "unknown"))
+                # Twelvedata can serve an auth/entitlement failure as HTTP 200
+                # + status:error instead of a real 403 (same shape as the
+                # prepost-denial case in _get_time_series). A message about
+                # the API key/plan is a systemic failure affecting every
+                # symbol, not "this ticker has no data" — must not be logged
+                # at the same level (or lower) than a genuine no-coverage miss.
+                if any(term in message.lower() for term in ("api key", "apikey", "plan", "not authorized", "unauthoriz")):
+                    logger.error("Twelvedata /quote auth/plan error for %s: %s", symbol, message[:200])
+                else:
+                    logger.warning("Twelvedata /quote error for %s: %s", symbol, message[:80])
                 return None
             # Defensive coercion field-by-field: one malformed secondary field
             # (a garbage previous_close or timestamp) must degrade to None for
@@ -640,6 +657,13 @@ def get_twelvedata_quote(symbol: str, fast: bool = False) -> dict | None:
             time.sleep(1.5 * attempt)
         except (KeyError, ValueError, TypeError) as exc:
             logger.warning("Twelvedata /quote malformed data for %s: %s", symbol, exc)
+            return None
+        except Exception as exc:
+            # Catch-all so an unanticipated exception type degrades this one
+            # quote to None instead of crashing the whole news/monitor cycle —
+            # matches the sibling _get_time_series's behavior for the same
+            # class of failure.
+            logger.error("Twelvedata /quote unexpected error for %s: %s", symbol, exc, exc_info=True)
             return None
     logger.warning("Twelvedata /quote: all attempts failed for %s — last: %s", symbol, last_exc)
     return None
