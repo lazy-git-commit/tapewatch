@@ -7,6 +7,39 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.8 — 2026-07-30 (exit-horizon fix activated: TIME_STOP_MINUTES 60 → 120)
+
+The v21.3 (2026-07-20) forward-return panel showed `guidance_raise` still
+climbing at the 60-min mark (+3.8%/60m, 83% positive) and recommended
+lengthening the hold — but the `.env` change was never actually shipped to
+the deploy workflow, so production kept running the old 60-min time-stop for
+over a week.
+
+Reviewing 2026-07-29's three trades (all `guidance_raise`, all entered at the
+open via the pre-market scanner path) gave a third live confirmation:
+- **GRMN**: take-profit hit in 9 minutes (+3.86%) while the stock continued
+  to an intraday high of $304 and closed +12.6% on the day — the 60-min hold
+  was never even the constraint here, but the same undermoved-catalyst
+  pattern the panel measured.
+- **BIIB**: no clean trend either way for the full hour; closed on the
+  60-min time-stop at a marginal +1.17% — a coin-flip exit, not a thesis
+  playing out.
+- **APH** (smaller catalyst magnitude, weaker confidence) stopped out at
+  -2.56% within 90 seconds of entry — unrelated to the hold length, this one
+  is an entry-timing issue (bought within $1 of the first-minute spike high).
+
+### Changed
+- `.github/workflows/deploy.yml`: `TIME_STOP_MINUTES=60` → `120`.
+  `ENTRY_CUTOFF_MINUTES` now set explicitly to `60` (previously unset,
+  silently inheriting `TIME_STOP_MINUTES`) so the longer hold does not also
+  widen the entry-cutoff window — see docs/algorithm.md §12 for the
+  decoupling rationale from v21.3.
+
+### Not changed — needs more evidence
+APH's entry-timing issue (chasing the first-minute spike high) is a
+different failure mode than the hold-length one and is not addressed by
+this change. Worth watching for recurrence before treating it as a pattern.
+
 ## v21.7 — 2026-07-28 (ITW post-mortem: broker-side retry gaps; Claude empty-batch retry)
 
 Investigated another zero-trade day (2026-07-28, regular hours). Two eligible
