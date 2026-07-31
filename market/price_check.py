@@ -259,6 +259,56 @@ def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
 _QUOTE_MAX_AGE_SECONDS = 20 * 60
 
 
+# ── Frozen-feed tripwire (v21.10) ────────────────────────────────────────────
+# The staleness check below correctly REFUSES a frozen quote, but each refusal
+# was only ever an isolated per-symbol WARNING. On 2026-07-30 Twelvedata served
+# a quote frozen at 14:30 ET for 71+ minutes — 23 refusals across the session,
+# while a position was open and its take-profit was being polled — and nothing
+# counted them, so the operator had no signal that a price feed had died.
+# A single stale symbol can be an illiquid name; a STREAK of them (with no
+# fresh quote in between) is the provider's cache, not the tape.
+#
+# Like the Finnhub outage latch, the alert fires at most ONCE PER SOURCE per
+# process: system_events already de-dupes to one row per day, and this sits on
+# the monitor's 5s price path where record_system_event -> get_conn() can
+# retry-with-backoff if the DB is also degraded. One attempt per source keeps
+# a database problem from ever slowing the price-fetch loop.
+_STALE_QUOTE_ALERT_THRESHOLD = 10
+_stale_quote_streak: dict[str, int] = {}
+_stale_quote_reported: set[str] = set()
+
+
+def _note_quote_fresh(source: str) -> None:
+    """A usable, current quote arrived — the feed is alive."""
+    if _stale_quote_streak.get(source):
+        _stale_quote_streak[source] = 0
+
+
+def _note_quote_stale(source: str, symbol: str, age_minutes: float) -> None:
+    """Count a stale reading and shout once when the streak looks systemic."""
+    streak = _stale_quote_streak.get(source, 0) + 1
+    _stale_quote_streak[source] = streak
+    if streak < _STALE_QUOTE_ALERT_THRESHOLD or source in _stale_quote_reported:
+        return
+    _stale_quote_reported.add(source)
+    logger.error(
+        "%s has served %d consecutive STALE quotes with no fresh one in "
+        "between (most recent: %s, %.0f min old) — this is a frozen provider "
+        "feed, not a quiet ticker. Price-dependent exits (polled take-profit, "
+        "polled stop) are degraded until it recovers.",
+        source, _STALE_QUOTE_ALERT_THRESHOLD, symbol, age_minutes,
+    )
+    try:
+        from storage.database import record_system_event
+        record_system_event(
+            "stale_quote_feed",
+            f"{source}: {_STALE_QUOTE_ALERT_THRESHOLD} consecutive stale quotes "
+            f"(most recent {symbol}, {age_minutes:.0f} min old)",
+        )
+    except Exception as exc:
+        logger.debug("Could not record stale_quote_feed system_event: %s", exc)
+
+
 def _quote_is_stale(symbol: str, quote: dict, source: str) -> bool:
     """True when the quote carries a data timestamp older than the max age.
 
@@ -280,7 +330,9 @@ def _quote_is_stale(symbol: str, quote: dict, source: str) -> bool:
             symbol, source, age / 60,
             datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S"),
         )
+        _note_quote_stale(source, symbol, age / 60)
         return True
+    _note_quote_fresh(source)
     return False
 
 

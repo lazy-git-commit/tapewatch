@@ -172,6 +172,28 @@ def init_db() -> None:
                 ALTER TABLE trades
                 ADD COLUMN IF NOT EXISTS session TEXT
             """)
+            # Excursion tracking (v21.10): the highest and lowest price the
+            # position reached while open, as a % of the buy price.
+            #   max_favorable_pct (MFE) — best unrealised gain before exit
+            #   max_adverse_pct   (MAE) — worst unrealised loss before exit
+            # WHY: the flat time-stop demonstrably cuts live winners (FSS,
+            # 2026-07-30: exited +0.73% at the 120-min stop, closed +5.01%),
+            # but a trailing-stop replacement could only be backtested over 8
+            # trades because yfinance retains 1-min bars for ~30 days — the
+            # bootstrap came back +0.51%/trade with a 95% CI of [-0.38, +1.30]
+            # (not significant). The monitor already computes the live price
+            # every 5s; persisting the running extremes makes the trailing-stop
+            # question answerable from OUR OWN data in ~30 trades instead of
+            # being permanently capped by a vendor's retention window.
+            # Pure observability: no exit decision reads these columns.
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS max_favorable_pct REAL
+            """)
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS max_adverse_pct REAL
+            """)
             # One-time backfill (v21.2): every pre-v21.1 row was a regular-hours
             # entry (extended-hours trading didn't exist before 2026-07-17), so
             # stamp them instead of re-deriving session from buy_time in every
@@ -646,6 +668,30 @@ def set_ratchet_armed(trade_id: int) -> None:
             cur.execute(
                 "UPDATE trades SET ratchet_armed = 1 WHERE id = %s",
                 (trade_id,),
+            )
+
+
+def update_trade_excursion(trade_id: int, gain_pct: float) -> None:
+    """
+    Record one observed unrealised P&L reading against a trade's running
+    extremes (v21.10 — MFE/MAE instrumentation).
+
+    Widen-only, computed in SQL via GREATEST/LEAST so concurrent or
+    out-of-order updates can never narrow an extreme already seen, and so a
+    monitor restart mid-position resumes from the persisted values rather
+    than resetting them. NULL-safe: COALESCE seeds the first reading.
+
+    Pure observability — no exit decision reads these columns. See the
+    schema comment in init_db() for why this exists.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE trades
+                      SET max_favorable_pct = GREATEST(COALESCE(max_favorable_pct, %s), %s),
+                          max_adverse_pct   = LEAST(COALESCE(max_adverse_pct, %s), %s)
+                    WHERE id = %s""",
+                (gain_pct, gain_pct, gain_pct, gain_pct, trade_id),
             )
 
 

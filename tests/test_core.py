@@ -1167,6 +1167,72 @@ class TestSellExecution:
         assert mock_post.call_args[0][0] == "/equity/orders/market"
 
 
+class TestExcursionTracking:
+    """
+    v21.10: MFE/MAE instrumentation. The monitor already computes unrealised
+    P&L every 5s; persisting the running extremes is what makes the
+    trailing-stop-vs-time-stop question answerable from our own data instead
+    of being capped at n=8 by yfinance's 30-day 1-min retention.
+
+    Contract: widen-only, writes only on a NEW extreme, never breaks the
+    monitor loop, and a failed write is retried rather than assumed landed.
+    """
+
+    def setup_method(self):
+        import monitor.position_monitor as pm
+        pm._excursion_seen.clear()
+
+    teardown_method = setup_method
+
+    @patch("monitor.position_monitor.update_trade_excursion")
+    def test_first_reading_always_writes(self, mock_upd):
+        from monitor.position_monitor import _record_excursion
+        _record_excursion(1, 1.5)
+        mock_upd.assert_called_once_with(1, 1.5)
+
+    @patch("monitor.position_monitor.update_trade_excursion")
+    def test_reading_inside_known_band_does_not_write(self, mock_upd):
+        """The 5s poll must not hammer the DB when nothing new happened."""
+        from monitor.position_monitor import _record_excursion
+        _record_excursion(1, 3.0)     # establishes (3.0, 3.0)
+        _record_excursion(1, -1.0)    # widens low  -> (3.0, -1.0)
+        mock_upd.reset_mock()
+        _record_excursion(1, 0.5)     # inside band — no write
+        _record_excursion(1, 2.9)     # inside band — no write
+        mock_upd.assert_not_called()
+
+    @patch("monitor.position_monitor.update_trade_excursion")
+    def test_new_high_and_new_low_both_write(self, mock_upd):
+        from monitor.position_monitor import _record_excursion
+        import monitor.position_monitor as pm
+        _record_excursion(1, 1.0)
+        _record_excursion(1, 4.2)     # new high
+        _record_excursion(1, -2.5)    # new low
+        assert mock_upd.call_count == 3
+        assert pm._excursion_seen[1] == (4.2, -2.5)
+
+    @patch("monitor.position_monitor.update_trade_excursion", side_effect=Exception("db down"))
+    def test_write_failure_is_logged_and_not_cached(self, _mock_upd, caplog):
+        """A failed write must NOT poison the cache — otherwise that extreme
+        is lost forever because later cycles think it was already recorded."""
+        import logging
+        import monitor.position_monitor as pm
+        from monitor.position_monitor import _record_excursion
+        with caplog.at_level(logging.WARNING, logger="monitor.position_monitor"):
+            _record_excursion(1, 3.0)
+        assert any("db down" in rec.message for rec in caplog.records)
+        assert 1 not in pm._excursion_seen  # retried next cycle
+
+    @patch("monitor.position_monitor.update_trade_excursion")
+    def test_trades_are_tracked_independently(self, mock_upd):
+        from monitor.position_monitor import _record_excursion
+        import monitor.position_monitor as pm
+        _record_excursion(1, 5.0)
+        _record_excursion(2, -3.0)
+        assert pm._excursion_seen[1] == (5.0, 5.0)
+        assert pm._excursion_seen[2] == (-3.0, -3.0)
+
+
 class TestClearRestingLogsOnFailure:
     """
     v21.9: _clear_resting's DB write must not fail silently. A failed write
@@ -2820,6 +2886,154 @@ class TestFinnhubAuthFailureLatch:
         get_finnhub_quote("AAPL")
         get_finnhub_quote("MSFT")
         assert mock_evt.call_count == 1
+
+
+class TestFinnhubOutageTripwire:
+    """
+    v21.10: the v21.9 auth latch only catches a definitive 401/403. On
+    2026-07-30 Finnhub instead TIMED OUT on every poll for ~5 min while a
+    position was open — each failure an isolated per-symbol WARNING, nothing
+    counting them, so a dead primary price source produced no operator signal.
+    """
+
+    def setup_method(self):
+        import market.finnhub_bars as fh
+        fh._finnhub_consecutive_failures = 0
+        fh._auth_ok = None
+
+    teardown_method = setup_method
+
+    @patch("storage.database.record_system_event")
+    @patch("market.finnhub_bars.time.sleep")
+    @patch("market.finnhub_bars.requests.get")
+    def test_sustained_timeouts_fire_one_event(self, mock_get, _sleep, mock_evt):
+        import requests as _rq
+        import market.finnhub_bars as fh
+        mock_get.side_effect = _rq.exceptions.Timeout()
+        for _ in range(fh._FINNHUB_OUTAGE_THRESHOLD + 2):
+            fh.get_finnhub_quote("AAPL", fast=True)
+        assert mock_evt.call_count == 1  # only at the threshold crossing
+        assert mock_evt.call_args.args[0] == "finnhub_outage"
+
+    @patch("storage.database.record_system_event")
+    @patch("market.finnhub_bars.time.sleep")
+    @patch("market.finnhub_bars.requests.get")
+    def test_alert_latches_for_the_process(self, mock_get, _sleep, mock_evt):
+        """The event must fire at most once per process even across separate
+        streaks: system_events de-dupes daily anyway, and this sits on the
+        monitor's 5s price path where a degraded DB could otherwise make
+        record_system_event retry-with-backoff repeatedly."""
+        import requests as _rq
+        import market.finnhub_bars as fh
+        good = MagicMock(status_code=200)
+        good.json.return_value = {"c": 10.0, "o": 9.5, "pc": 9.4, "t": 1}
+        for _cycle in range(2):
+            mock_get.side_effect = _rq.exceptions.Timeout()
+            for _ in range(fh._FINNHUB_OUTAGE_THRESHOLD + 1):
+                fh.get_finnhub_quote("AAPL", fast=True)
+            mock_get.side_effect = None          # recovery resets the streak
+            mock_get.return_value = good
+            fh.get_finnhub_quote("AAPL", fast=True)
+        assert mock_evt.call_count == 1
+
+    @patch("storage.database.record_system_event")
+    @patch("market.finnhub_bars.time.sleep")
+    @patch("market.finnhub_bars.requests.get")
+    def test_a_success_resets_the_streak(self, mock_get, _sleep, mock_evt):
+        """One flaky ticker between good quotes must never trip the wire."""
+        import requests as _rq
+        import market.finnhub_bars as fh
+        good = MagicMock(status_code=200)
+        good.json.return_value = {"c": 10.0, "o": 9.5, "pc": 9.4, "t": 1}
+        for _ in range(fh._FINNHUB_OUTAGE_THRESHOLD - 1):
+            mock_get.side_effect = _rq.exceptions.Timeout()
+            fh.get_finnhub_quote("AAPL", fast=True)
+        mock_get.side_effect = None
+        mock_get.return_value = good
+        fh.get_finnhub_quote("MSFT", fast=True)
+        assert fh._finnhub_consecutive_failures == 0
+        mock_evt.assert_not_called()
+
+    @patch("storage.database.record_system_event")
+    @patch("market.finnhub_bars.requests.get")
+    def test_404_counts_as_healthy_provider(self, mock_get, mock_evt):
+        """A bad SYMBOL is a healthy provider answering correctly — it must
+        clear the outage streak, not contribute to it."""
+        import market.finnhub_bars as fh
+        fh._finnhub_consecutive_failures = 5
+        resp = MagicMock(status_code=404); resp.text = "not found"
+        mock_get.return_value = resp
+        fh.get_finnhub_quote("NOPE", fast=True)
+        assert fh._finnhub_consecutive_failures == 0
+
+
+class TestStaleQuoteFeedTripwire:
+    """
+    v21.10: a frozen provider feed. On 2026-07-30 Twelvedata served a quote
+    stuck at 14:30 ET for 71+ min — 23 refusals, each an isolated WARNING,
+    none counted, while a position's take-profit was being polled.
+    """
+
+    def setup_method(self):
+        import market.price_check as pc
+        pc._stale_quote_streak.clear()
+
+    teardown_method = setup_method
+
+    @patch("storage.database.record_system_event")
+    def test_streak_of_stale_quotes_fires_once(self, mock_evt):
+        import time as _t
+        import market.price_check as pc
+        old = {"t": _t.time() - 3600}  # 60 min old
+        for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD + 3):
+            assert pc._quote_is_stale("FSS", old, "Twelvedata") is True
+        assert mock_evt.call_count == 1
+        assert mock_evt.call_args.args[0] == "stale_quote_feed"
+
+    @patch("storage.database.record_system_event")
+    def test_alert_latches_per_source(self, mock_evt):
+        """Once reported for a source, a later streak on that same source must
+        not re-fire — this runs on the 5s price path and a degraded DB would
+        make record_system_event retry-with-backoff each time."""
+        import time as _t
+        import market.price_check as pc
+        old = {"t": _t.time() - 3600}
+        fresh = {"t": _t.time()}
+        for _cycle in range(2):
+            for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD + 1):
+                pc._quote_is_stale("FSS", old, "Twelvedata")
+            pc._quote_is_stale("FSS", fresh, "Twelvedata")  # recovery
+        assert mock_evt.call_count == 1
+
+    @patch("storage.database.record_system_event")
+    def test_fresh_quote_resets_streak(self, mock_evt):
+        import time as _t
+        import market.price_check as pc
+        old = {"t": _t.time() - 3600}
+        fresh = {"t": _t.time()}
+        for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD - 1):
+            pc._quote_is_stale("FSS", old, "Twelvedata")
+        assert pc._quote_is_stale("FSS", fresh, "Twelvedata") is False
+        assert pc._stale_quote_streak["Twelvedata"] == 0
+        mock_evt.assert_not_called()
+
+    @patch("storage.database.record_system_event")
+    def test_sources_counted_separately(self, mock_evt):
+        """Finnhub being frozen says nothing about Twelvedata's feed."""
+        import time as _t
+        import market.price_check as pc
+        old = {"t": _t.time() - 3600}
+        for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD - 1):
+            pc._quote_is_stale("A", old, "Finnhub")
+        pc._quote_is_stale("B", old, "Twelvedata")
+        assert pc._stale_quote_streak["Twelvedata"] == 1
+        mock_evt.assert_not_called()
+
+    def test_quote_without_timestamp_is_not_counted(self):
+        """Fail-open on missing metadata — must not inflate the streak."""
+        import market.price_check as pc
+        assert pc._quote_is_stale("A", {"c": 5.0}, "Finnhub") is False
+        assert pc._stale_quote_streak.get("Finnhub", 0) == 0
 
 
 class TestFxRateCreditGuard:

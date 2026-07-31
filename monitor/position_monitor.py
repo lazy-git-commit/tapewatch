@@ -79,6 +79,7 @@ from trading.executor import (
 from storage.database import (
     get_open_trades, close_trade, set_tp_order_id, set_stop_order_id,
     set_ratchet_armed, touch_heartbeat, record_system_event,
+    update_trade_excursion,
 )
 from config.settings import cfg
 
@@ -203,6 +204,44 @@ def _stop_threshold(trade: dict) -> float:
     return normal
 
 
+# ── Excursion tracking (v21.10) ──────────────────────────────────────────────
+# Running MFE/MAE per open trade: {trade_id: (max_favorable, max_adverse)}.
+# In-process cache purely to avoid a DB write on every 5s poll — the SQL in
+# update_trade_excursion() is GREATEST/LEAST so it stays correct if this cache
+# is empty (fresh process) or stale. Pruned against the open-trade set each
+# cycle so it can't grow unbounded in a long-lived service.
+_excursion_seen: dict[int, tuple[float, float]] = {}
+
+
+def _record_excursion(trade_id: int, gain_pct: float) -> None:
+    """
+    Persist a new unrealised-P&L extreme for a trade, if this reading widens
+    the band already recorded.
+
+    Observability only — this must never affect an exit decision or break the
+    monitor loop, hence the broad catch. The exception IS logged (a silent
+    swallow here would make a systematically-failing write invisible, which is
+    the exact bug class the v21.9 audit removed elsewhere in this file).
+    """
+    prev = _excursion_seen.get(trade_id)
+    if prev is not None and prev[1] <= gain_pct <= prev[0]:
+        return  # inside the band already persisted — nothing new to record
+    try:
+        update_trade_excursion(trade_id, gain_pct)
+    except Exception as exc:
+        # Deliberately do NOT update the cache — leaving it unset means the
+        # next cycle retries this reading rather than assuming it landed.
+        logger.warning(
+            "Could not record excursion for trade %d (%.2f%%): %s",
+            trade_id, gain_pct, exc,
+        )
+        return
+    if prev is None:
+        _excursion_seen[trade_id] = (gain_pct, gain_pct)
+    else:
+        _excursion_seen[trade_id] = (max(prev[0], gain_pct), min(prev[1], gain_pct))
+
+
 def _log_holding(
     trade_id: int, ticker: str, current_price: float, pct_from_buy: float,
     take_profit_threshold: float, stop_loss_threshold: float,
@@ -282,6 +321,11 @@ def check_exit_conditions(
     take_profit_threshold = buy_price * (1 + cfg.take_profit_pct / 100)
     stop_loss_threshold = _stop_threshold(trade)
     pct_from_buy = ((current_price - buy_price) / buy_price) * 100
+
+    # Record the excursion BEFORE the exit checks below, so the reading that
+    # triggers an exit is itself captured (the peak that fires a take-profit
+    # is exactly the datapoint the trailing-stop analysis needs).
+    _record_excursion(trade["id"], pct_from_buy)
 
     # ── Take profit (polled — the resting side is the STOP since v20) ────────
     if not has_resting_tp and current_price >= take_profit_threshold:
@@ -661,6 +705,14 @@ def monitor_positions() -> None:
     # failed after its buy filled — leaves the DB empty, and skipping
     # reconciliation there would make exactly that orphan invisible forever.
     _reconcile_positions(open_trades)
+
+    # Prune the excursion cache to the currently-open set (v21.10) — a closed
+    # trade's entry is dead weight, and a trade id could in principle be
+    # reused across a DB reset.
+    if _excursion_seen:
+        live_ids = {t["id"] for t in open_trades}
+        for dead_id in [tid for tid in _excursion_seen if tid not in live_ids]:
+            _excursion_seen.pop(dead_id, None)
 
     if not open_trades:
         return

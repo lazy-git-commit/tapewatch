@@ -7,6 +7,72 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.10 — 2026-07-31 (MFE/MAE instrumentation; two undetected-outage tripwires)
+
+Deep-dive on the 2026-07-30 session (2 trades, +$0.94 net) produced one
+**correction** and three changes. All are observability — no entry or exit
+decision changes behaviour.
+
+### Correction: stop-loss slippage is NOT a live problem
+An earlier read of the all-time record claimed stop-losses average −4.50%
+against a −2% trigger, i.e. that slippage was doubling every loss. That figure
+pools two different exit architectures and is wrong as a statement about the
+current system. Split by era:
+
+| era | n | mean slippage past the −2% trigger |
+|---|---|---|
+| polled stop (pre-v20, trades 1–16) | 7 | −2.92% (−0.52% excluding the GOAI microcap) |
+| **resting stop (v20+, trades 17+)** | 2 | **−0.06%** (worst −0.25%) |
+
+The v20 broker-side resting stop already fixed this. All-time −$80.27 is
+legacy: −$79.10 predates v20; the v20+ era is −$1.17 across 7 trades. No code
+change needed — recorded so the pooled figure isn't re-raised as a live bug.
+
+### The real open question: the time-stop cuts live winners
+FSS (2026-07-30) exited at +0.73% on the 120-min time-stop and closed **+5.01%**
+— it reached $124.85 against a $124.52 take-profit target, so the TP would have
+filled had the position been held. Simulating a trailing stop over the 8
+time-stop exits with usable 1-min data:
+
+- flat time-stop (actual): **+0.39%** mean
+- trail −1.5% below the high: **+0.89%** mean, +1.14% median, 5/8 wins
+- trail −2.5%: +1.00% mean but +0.01% median, and its lead collapses to +0.09%
+  with the single FSS trade removed — an outlier artifact, not an edge.
+
+Bootstrap on the −1.5% variant: **+0.51%/trade, 95% CI [−0.38%, +1.30%],
+P(no real edge) ≈ 12% — not significant at n=8.** Also, the time-stop currently
+acts as a *rescue*: on LEVI and SCHW it exited at −1.19%/−0.22% where a
+trailing stop ran both to the full −2%. **A trailing stop was therefore NOT
+shipped.** The sample is capped at 8 because yfinance retains 1-min bars for
+only ~30 days — which is what the instrumentation below fixes.
+
+### Added
+- **MFE/MAE tracking** (`trades.max_favorable_pct`, `trades.max_adverse_pct`;
+  `storage/database.py::update_trade_excursion`;
+  `monitor/position_monitor.py::_record_excursion`): the monitor already
+  computes unrealised P&L every 5s — the running extremes are now persisted,
+  making the trailing-stop question answerable from our own data in ~30 trades
+  rather than being permanently capped by a vendor's retention window.
+  Widen-only via SQL `GREATEST`/`LEAST` (correct across restarts and
+  out-of-order writes); an in-process cache means a DB write happens only on a
+  genuinely new extreme, not every poll; a failed write is deliberately not
+  cached so the next cycle retries it. Recorded *before* the exit checks so the
+  peak that triggers a take-profit is itself captured. Pure observability — no
+  exit path reads these columns.
+- **Finnhub sustained-outage tripwire** (`_note_finnhub_failure`,
+  threshold 8 consecutive total failures): the v21.9 latch only fires on a
+  definitive 401/403. On 2026-07-30 Finnhub instead **timed out on every poll
+  for ~5 minutes while a position was open**, each failure logged as an
+  isolated per-symbol WARNING with nothing counting them. A 2xx or a 4xx
+  (healthy provider, bad symbol) resets the streak, so one flaky ticker cannot
+  trip it — only a genuinely unavailable provider.
+- **Frozen-feed tripwire** (`market/price_check.py::_note_quote_stale`,
+  threshold 10 consecutive stale reads per source): the staleness guard
+  correctly *refused* Twelvedata's quote frozen at 14:30 ET for 71+ minutes on
+  2026-07-30, but all **23 refusals** were isolated WARNINGs — no signal that a
+  price feed had died while a take-profit was being polled. Counted per source
+  (Finnhub being frozen says nothing about Twelvedata); any fresh quote resets.
+
 ## v21.9 — 2026-07-30 (exception-handling audit: 9 misclassification bugs across every module)
 
 Full-codebase audit for one specific bug shape: a real exception (network

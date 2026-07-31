@@ -64,6 +64,59 @@ def _note_auth_failure(status_code: int, detail: str) -> None:
         logger.debug("Could not record finnhub_auth_failure system_event: %s", exc)
 
 
+# ── Sustained-unavailability tripwire (v21.10) ───────────────────────────────
+# The auth latch above only fires on a definitive 401/403. On 2026-07-30
+# Finnhub instead TIMED OUT on every poll for ~5 minutes while a position was
+# open and its take-profit was being polled — the primary price source was
+# effectively down, each failure logged as an isolated per-symbol WARNING, and
+# nothing anywhere counted them. The monitor silently degraded to stale
+# Twelvedata bar closes with no operator-visible signal.
+#
+# This counts CONSECUTIVE total failures (all attempts exhausted) across all
+# symbols. Any success resets it, so a single flaky ticker can't trip it —
+# only a genuinely unavailable provider can.
+#
+# The alert LATCHES for the process (like _auth_ok above) rather than
+# re-firing on every subsequent streak. Two reasons: the DB already de-dupes
+# system_events to one row per type per day, so repeat writes buy nothing; and
+# this runs on the monitor's 5s quote-fetch path, where record_system_event ->
+# get_conn() can retry-with-backoff if the DB is ALSO degraded. Bounding it to
+# one attempt per process keeps a database problem from ever slowing the
+# price-fetch loop.
+_FINNHUB_OUTAGE_THRESHOLD = 8
+_finnhub_consecutive_failures = 0
+_finnhub_outage_reported = False
+
+
+def _note_finnhub_failure(symbol: str, last_exc) -> None:
+    global _finnhub_consecutive_failures, _finnhub_outage_reported
+    _finnhub_consecutive_failures += 1
+    if (_finnhub_consecutive_failures >= _FINNHUB_OUTAGE_THRESHOLD
+            and not _finnhub_outage_reported):
+        _finnhub_outage_reported = True
+        logger.error(
+            "Finnhub has failed %d consecutive quote fetches (most recent: %s "
+            "for %s) — the PRIMARY price source is effectively down. Polled "
+            "take-profit and stop checks are running on the Twelvedata "
+            "fallback, which may serve a stale quote.",
+            _FINNHUB_OUTAGE_THRESHOLD, last_exc, symbol,
+        )
+        try:
+            from storage.database import record_system_event
+            record_system_event(
+                "finnhub_outage",
+                f"{_FINNHUB_OUTAGE_THRESHOLD} consecutive failed quote fetches "
+                f"(most recent: {symbol} — {last_exc})",
+            )
+        except Exception as exc:
+            logger.debug("Could not record finnhub_outage system_event: %s", exc)
+
+
+def _note_finnhub_ok() -> None:
+    global _finnhub_consecutive_failures
+    _finnhub_consecutive_failures = 0
+
+
 def _safe_float(v) -> float | None:
     """float(v) that returns None for unparseable/non-finite values instead
     of raising. NaN matters: NaN compares False against every gate threshold,
@@ -144,6 +197,9 @@ def get_finnhub_quote(symbol: str, fast: bool = False) -> dict | None:
                 return None
             # Other client errors (4xx) won't self-heal — log and return immediately
             if 400 <= resp.status_code < 500:
+                # The provider answered correctly; the SYMBOL is the problem.
+                # That's a healthy Finnhub, so it clears the outage counter.
+                _note_finnhub_ok()
                 logger.warning(
                     "Finnhub quote HTTP %d for %s — not retrying: %s",
                     resp.status_code, symbol, resp.text[:120],
@@ -165,6 +221,10 @@ def get_finnhub_quote(symbol: str, fast: bool = False) -> dict | None:
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
+            # A 2xx means Finnhub is up and serving, regardless of whether
+            # THIS symbol normalises to a usable quote (c=0 for an unknown or
+            # halted ticker is a per-symbol fact, not a provider outage).
+            _note_finnhub_ok()
             quote = _normalize_quote(symbol, resp.json())
             if quote is None:
                 return None
@@ -197,4 +257,8 @@ def get_finnhub_quote(symbol: str, fast: bool = False) -> dict | None:
         "Finnhub: all %d attempt(s) failed for %s — last error: %s",
         attempts, symbol, last_exc,
     )
+    # Every attempt exhausted without the provider answering — timeouts,
+    # connection errors, or sustained 5xx. This is the counter that catches a
+    # provider-level outage the 401/403 latch above cannot see (2026-07-30).
+    _note_finnhub_failure(symbol, last_exc)
     return None
