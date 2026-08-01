@@ -283,11 +283,13 @@ Checks run cheapest-first; each rejection records a `reason_code`:
 
 | # | Code | Rule (defaults) | Motivating incident |
 |---|---|---|---|
+| 0 | `stale_price` | quote's own timestamp older than **90s** (`MAX_ENTRY_QUOTE_AGE_SECONDS`), RTH only — **TRANSIENT (v21.11)** | NVT 2026-07-31: a quote that honestly reported itself ~3 min old passed the 20-min *coverage* check and confirmed the entry. See "Two staleness questions" below |
 | 1 | `opening_block` | < 5 min after a session boundary — **TRANSIENT since v21.6** | GOAI: entire spike in 09:30 bar, bought 09:32 into collapse. The block is right; its permanence was not — see below |
 | 2 | `penny_stock` | price < **$5** | Every Jun 8–11 loss was sub-$5 |
 | 3 | `wide_spread` | last-bar range > 3% of price | No bid/ask feed; bar range proxies effective spread |
 | 4 | `dead_cat` | < −3% vs **prev close** | Prev close (not open) so gap-downs count: a stock down 25% overnight but flat since open is still a falling knife |
-| 5 | `extended_move` | > +25% vs **prev close** | Closes the v13 hole: stock up 80% on the day but flat in the last 5 min passed the 5-min ceiling |
+| 5 | `extended_move` | > **+10%** vs **prev close** (was 25% until v21.11) | Closes the v13 hole: stock up 80% on the day but flat in the last 5 min passed the 5-min ceiling. v21.11 retuned it on the realized record — see "Day-move ceiling" below |
+| 5.5 | `stale_volume` | \|day move\| ≥ **5%** while RVOL < **0.5** — **TRANSIENT (v21.11)** | NVT: +15.59% on the day reported alongside RVOL 0.28, while the first minute alone traded ~10% of an average day. Price and volume disagreeing that hard means the volume feed is behind — see below |
 | 6 | `illiquid` | 20-day ADV × price < **$5M** | **ADV-based on purpose**: spike-day volume explodes and would pass exactly the halt patterns this blocks. Exit slippage depends on the NORMAL book (GOAI: $390k ADV → −18.99% stop fill) |
 | 7 | `low_momentum` | < +0.2% over ~5 min (v15: dead-tape noise floor only) | Just rejects "the catalyst moved nothing"; VWAP does the real work (step 10). Moves below −0.2% log as "tape moving against the signal" (same code) |
 | 8 | `high_momentum` | > +15% over ~5 min | Post-halt spike — halt articles publish AFTER the 30–120% pop. Runs before VWAP to save a credit |
@@ -297,8 +299,10 @@ Checks run cheapest-first; each rejection records a `reason_code`:
 | 10.5 | `exhausted_bounce` | day's range ≥ **5%** AND price recovered ≥ **75%** of it | v19.5: LEVI bought within 15¢ of the day's exact high, 3 min before the peak, after gapping down −7.8% at the open — see below |
 | 11 | `insufficient_data` | no volume measurement AND no VWAP | v19.2: individually-reasonable fallbacks (open-price baseline, RVOL deferred, VWAP skipped) could stack into approving on a bare stale quote — how GLASF traded. At least one participation measure must positively exist |
 
-**Transient vs terminal (v19.2, extended v20):** `low_volume`, `low_momentum`
-and `overextended` describe the tape AT THIS MINUTE, not the instrument —
+**Transient vs terminal (v19.2, extended v20/v21.11):** `low_volume`,
+`low_momentum`, `overextended`, `opening_block`, `stale_price` and
+`stale_volume` describe the tape AT THIS MINUTE (or the feed at this minute),
+not the instrument —
 signals are scored within ~3 min of publication, often before participation
 can exist (VERA's FDA approval was rejected on RVOL 0.71 measured the minute
 the news broke), and an extended price pulls back into buyable range within
@@ -306,6 +310,124 @@ minutes on genuine movers. RTH signals rejected with these codes park in a
 re-eval queue and re-confirm every cycle for 15 minutes; premarket candidates
 stay pending until the eval window closes. Everything else is terminal on
 first sight.
+
+### Two staleness questions, two thresholds (v21.11)
+
+The 20-minute check above and the 90-second check at gate 0 look like the same
+rule with different numbers. They are not — they answer different questions,
+and conflating them is what cost us the 2026-07-31 trade.
+
+| | `_QUOTE_MAX_AGE_SECONDS` (20 min) | `MAX_ENTRY_QUOTE_AGE_SECONDS` (90 s) |
+|---|---|---|
+| Question | *Does any provider carry this instrument?* | *Is this price safe to size and buy against right now?* |
+| On failure | treat as **no coverage** → try the fallback → strike toward a session blacklist | reject `stale_price`, **TRANSIENT** → re-eval queue, **no strike** |
+| Applies to | every caller, including the position monitor | entry confirmation only, and RTH only |
+
+**What happened.** On 2026-07-31 both providers froze at the opening bell.
+Finnhub served the *previous day's close* — timestamped 1,051–1,092 minutes
+old — for every symbol it was asked about, SONY included; Twelvedata's quote
+was stuck at the 09:30 value and was still 42 minutes stale at 10:11 ET. 153
+stale-quote warnings across 9 symbols. The 20-minute check correctly threw all
+of those out.
+
+Then it accepted one. NVT's quote carried a timestamp ~3 minutes old — well
+inside 20 minutes — with a price of $167.37, which was the **09:33 bar's
+close**. The real tape at the 09:35:57 decision was ~$165.50 and falling.
+
+The damage is not that a gate failed. It is that **every gate agreed**:
+
+| Gate | What it saw | What was true |
+|---|---|---|
+| momentum | +1.74% over ~5 min | negative |
+| RVOL | 0.28 → triggered the size-neutral bypass | well above 1 |
+| VWAP | $165.93, price $1.44 above it | price sitting *at* VWAP |
+| day move | +15.59%, inside the then-25% ceiling | same, but the ceiling was too loose |
+
+A lagging quote does not make the gates fail. It makes them agree, on a market
+that has already moved on. The position was stopped out **42 seconds** after
+the fill.
+
+**Why RTH only.** In an extended session the quote is *expected* to lag — the
+16:00 official close is served for minutes into after-hours — and the
+confirmation deliberately substitutes the fresher anchored bar close as "now"
+(§12). An age test on the quote out there would reject exactly the signals
+that substitution exists to rescue. In regular hours no such substitution
+happens: `current_price` **is** the quote, so its age is the age of the price
+we would trade on.
+
+**Why the fallback is consulted first.** `get_quote_with_fallback()` takes a
+soft `prefer_fresher_than`: when the primary is older than the entry bar, the
+fallback is fetched and the *fresher of the two* wins. It never returns None
+for freshness alone. Deciding a quote is too stale to ACT on belongs to the
+gate, because "unusable for an entry" and "this ticker has no coverage" must
+not collapse into the same outcome — the second one burns a strike toward a
+session-long blacklist.
+
+### Volume plausibility: when the feeds disagree, believe the price (v21.11)
+
+RVOL and the day move come from **different sources** — session minute-bar
+volume versus the quote price against previous close. So they can disagree.
+When they disagree hard, one of them is lagging, and it is essentially always
+the volume side: a stock cannot reprice several percent on a fraction of its
+normal volume, because the shares had to trade for the price to get there.
+
+NVT reported **+15.59% on the day with RVOL 0.28** — 28% of normal volume for
+that time of day. The real tape printed 191,000 shares in the first minute
+alone, roughly **10% of NVT's entire average day**. True RVOL was well above 1.
+
+The consequence was worse than a bad number. Because the reading looked *low*,
+it triggered the **size-neutral RVOL bypass** (below) — the rule that exists
+for a genuinely quiet mega-cap grinding up on ordinary volume. The gate meant
+to catch "no real participation" was defeated by "we cannot see the
+participation yet", and waved the entry through on evidence that never existed.
+
+Deferring is the only safe response, because VWAP is computed from the same
+bars — an implausible volume reading impugns the accumulation test too.
+
+Two placement decisions matter:
+
+- **After the extended-move ceiling.** A move too big to trade is a *permanent*
+  verdict and must stay terminal, not be downgraded to this transient code and
+  re-queued forever.
+- **Thresholds deliberately conservative** (`|day move| ≥ 5%` *and* `RVOL < 0.5`).
+  The BMY case the bypass was built for — +2.1% on the day, RVOL ~0.3, VWAP
+  held — sits nowhere near them. Only a *large* move on near-zero relative
+  volume is flagged, because that combination is not a market state, it is a
+  data state.
+
+### Day-move ceiling: retuned on the realized record (v21.11)
+
+`MAX_DAY_MOVE_PCT` went **25% → 10%**, calibrated on all 24 closed trades by
+reconstructing each entry's day move (fill price vs that day's previous close)
+and pairing it with the realized P&L.
+
+25% was so loose it never bound on a real trade: all 20 trades with usable
+previous-close data passed it. (The two that did not are microcap artifacts —
+INHD at +205% and GOAI at +25% — which only got through because their previous
+close was unavailable, so the gate was skipped entirely.)
+
+Excluding those two:
+
+| ceiling | kept | mean P&L | blocked | blocked mean |
+|---|---|---|---|---|
+| 8% | 14 | −0.57% | MRVL, CRCL, TMO, APH, **GRMN** | −1.72% |
+| **10%** | **17** | **−0.57%** | CRCL, TMO, NVT | **−2.85%** |
+| 12% | 18 | −0.65% | CRCL, NVT | −3.27% |
+| 25% (old) | 20 | −0.91% | nothing | — |
+
+**10% is the tightest ceiling that blocks only losers.** It removes CRCL
+(−3.97%), TMO (−2.03%) and NVT (−2.56%) and costs no winner. 8% would also cut
+GRMN (+3.86%), the second-best trade on record, which was entered at +9.99% on
+the day.
+
+The reasoning is risk:reward, not momentum. With a 2% stop and a 5% target,
+entering a stock already up 15% requires it to reach +21% on the day to pay
+out, while a routine pullback stops you — the trade is upside-down before it is
+placed. `cfg.validate()` now also refuses any ceiling at or below
+`TAKE_PROFIT_PCT`, since that configuration rejects everything that could pay.
+
+**Sample caveat:** n=20 is calibration, not proof, and GRMN sits 0.01
+percentage points inside the boundary. Revisit as trades accumulate.
 
 ### Momentum confirmation: why VWAP, not a fixed % (v15)
 
@@ -556,6 +678,46 @@ costs money on every single fast reversal.
 | **Time stop** | `TIME_STOP_MINUTES` after entry (**120, raised from 60 in production 2026-07-30**), polled; needs no price feed (fires even in a data outage). **v21.3:** the 60-min forward-return panel showed the kept classes' drift *still climbing* at 60 min (guidance_raise +3.8%/60m, fda_approval +1.1%/60m) — i.e. 60 clips the grind mid-move. Confirmed again by three 2026-07-29 trades (GRMN's take-profit fired in 9 min while the stock ran to +12.6% by the close; BIIB's 60-min time-stop closed out a directionless chop). **The entry cutoff is decoupled** (`ENTRY_CUTOFF_MINUTES=60`, held at the old value) so the longer hold doesn't shrink the entry window | ≤ 5s |
 | **EOD flatten** | ALL positions force-closed 10 min before the close with a market sell, regardless of P&L. Stops don't work overnight; one gap erases a month | — |
 
+**Why the resting stop matters more than latency (2026-07-31).** The v20
+inversion was justified on speed. It earned its keep on something else
+entirely: NVT was bought into a frozen price feed, and for the whole 42-second
+holding period the monitor's polled price never moved off $167.37 — MFE +0.81%,
+MAE +0.75%, i.e. it never observed a single negative price while the real tape
+fell ~3%. **A polled stop would not have fired.** The broker-side stop did,
+because it executes on Trading 212's servers and does not care what our data
+providers are doing. It exited at −2.29%; the position was −6.80% at the
+120-minute mark and −7.36% at the close. Feed-independence is not a bonus
+property of resting orders — for the loss side it is the point.
+
+### MFE / MAE — excursion instrumentation (v21.10, corrected v21.11)
+
+`trades.max_favorable_pct` / `max_adverse_pct` record the best and worst
+*unrealised* P&L a position reached while open — in plain terms, how far up it
+went before we sold and how far down it dipped. Written by
+`_record_excursion()` (widen-only in SQL via `GREATEST`/`LEAST`, so restarts
+and out-of-order writes stay correct; an in-process cache keeps a DB write to
+genuinely new extremes rather than every 5s poll).
+
+**Pure observability — no exit decision reads these columns.** They exist
+because the flat time-stop demonstrably cuts live winners (FSS 2026-07-30:
+exited +0.73%, closed +5.01%) while a trailing-stop replacement could only be
+backtested over 8 trades (yfinance retains 1-min bars ~30 days), giving
++0.51%/trade with a 95% confidence interval of [−0.38, +1.30] — too wide to
+act on. The gap between `max_favorable_pct` and realised `profit_loss_pct`
+measures directly what the exit rule hands back, and answers the question from
+our own record instead of a capped simulation. Surfaced in Grafana as
+*"Exit Efficiency: MFE vs realised"*.
+
+**v21.11 correction.** Until v21.11 excursions saw only prices the *polling
+loop* observed — and a broker-side resting stop fills without the poller
+involved. NVT closed at −2.56% carrying `max_adverse_pct = +0.75%`: an
+impossible row, because the last polled quote was frozen and the real fill was
+never fed in. That biased MAE toward zero on exactly the trades where "how much
+heat did this take?" is the whole question. `_record_exit_excursion()` now
+folds the realised exit price into the band on every close path (resting fill
+and polled sell alike). Rows where `max_adverse_pct > profit_loss_pct` predate
+the fix and should be excluded from any analysis.
+
 Monitor cadence is 5s (was 20s): with the stop resting broker-side, the poll
 no longer guards the loss side, but the POLLED side (take-profit) pays the
 full cadence as latency at the exact moment price touches the target. The
@@ -771,6 +933,39 @@ live service had gone six days and 16 accumulated tickers with `NRestarts=0`.
 implementing what the design always meant and bounding any future false
 positive to a single session.
 
+**Blackout scoping, part 2 — provider outages (v21.11, 2026-07-31):** the v21.6
+fix scoped strikes to sessions where data is *genuinely expected*. A
+regular-session provider freeze is exactly such a session, so strikes still
+counted — and the same class of false positive recurred immediately.
+
+On 2026-07-31 both feeds served the previous day's close for every symbol for
+the first 40+ minutes of the regular session. Two RTH signals (**GTES**,
+**IRMD**) were blacklisted for the day, and four of nine pre-market candidates
+(GTES, MOG, IRMD ×2) expired as *"no quote after 3 consecutive retries"* — all
+liquid, fully-covered names discarded for a vendor problem.
+
+The system already **detected** this: `stale_quote_feed` fired at 09:31:56 ET,
+four minutes before the NVT entry. The blacklist simply was not listening.
+`price_check.quote_feed_degraded()` now exposes the live streak state, and both
+strike sites — `main._queue_retry()` and the pre-market evaluator — skip the
+strike while any feed is frozen. The signal is still parked and retried; it
+just cannot earn a blacklist for a provider's failure.
+
+Note this reads the **current** streak, not the once-per-process alert latch —
+`_note_quote_fresh()` zeroes it the moment a usable quote arrives. Reading the
+latch instead would suppress strikes for the rest of the day after one outage.
+
+**Phantom tickers (v21.11):** `resolve_t212_ticker()` used to fall back to
+`<symbol>_US_EQ` for any symbol missing from the T212 instrument map. Since the
+map is the complete T212 USD catalogue, a symbol absent from it is not
+tradeable here and the guess can only produce a phantom. Benzinga tagged a Moog
+article with both `MOG.A` (real) and `MOG` (Moog trades as MOG.A/MOG.B — plain
+`MOG` is not a US listing); the fallback manufactured `MOG_US_EQ`, which spent
+the morning consuming quote retries and API budget for an instrument that
+cannot exist. Absent-from-a-built-map symbols are now dropped with a log line.
+The fallback still applies when the map is empty, so a startup before the first
+successful build does not drop everything.
+
 **Extended-hours entitlement wall (v21.6, 2026-07-27):** Twelvedata serves
 pre/post-market bars only on the Pro (individual) / Venture (business) tiers.
 Below that, **every** `prepost=true` request returns HTTP 403, for every
@@ -942,13 +1137,44 @@ most partnership news produces no intraday price action at all.
 | Claude outage / overload (529/500/network) | typed-exception handled: fail-closed (no scores → no trades) + short cooldown (`_CLAUDE_OUTAGE_COOLDOWN_SECONDS`, 120s) so we don't hammer a struggling API; auto-resumes; `system_events` row (`claude_outage`) |
 | Claude out-of-credits / billing (403 `billing_error`) or auth (401) | does **not** self-heal — CRITICAL log + long cooldown (`_CLAUDE_BILLING_COOLDOWN_SECONDS`, 30 min) + `system_events` (`claude_billing_error`/`claude_auth_error`) so the journal shows what actually broke |
 | Both feeds down with open position | TP/SL skipped that cycle; time stop still fires (needs no price) |
-| Quote frozen / stale (source up, data dead) | **v19.2:** quote `t` older than 20 min → treated as no coverage (falls to next source / fail-closed). A frozen print is not a price (GLASF: entry, P&L, and every exit limit priced off a $12.50 quote that never moved) |
+| Quote frozen / stale (source up, data dead) | **v19.2:** quote `t` older than 20 min → treated as no coverage (falls to next source / fail-closed). A frozen print is not a price (GLASF: entry, P&L, and every exit limit priced off a $12.50 quote that never moved). **v21.10:** 10 consecutive stale readings from one source → `stale_quote_feed` `system_events` row + ERROR, because a *streak* is a provider cache, not a quiet ticker. **v21.11:** while that streak is live, no-quote misses stop counting toward the session blacklist, and a quote merely LAGGING (not frozen) is rejected for entries at 90s via `stale_price` |
+| Quote lagging but inside the coverage window | **v21.11:** entries only, RTH only — `stale_price` (transient). Distinct from the row above: a 3-minute-old quote is honest about its age and passes every coverage test, yet makes momentum/RVOL/VWAP agree on a market that has moved on (NVT 2026-07-31, stopped out 42s after the fill) |
+| Broker rate-limits the cash endpoint | **v21.11:** `/equity/account/cash` is served from a 15s process cache behind a lock, with one retry on 429/5xx. The lock is the actual fix — it serializes the callers that used to collide. See "Scheduler collisions" below |
 | Malformed payloads (wrong types, NaN, nulls, mis-scaled values) | **v19.3: normalized at every seam** — Finnhub quotes require a positive finite `c`; Twelvedata quote fields coerce individually (bad secondary field ≠ dead quote); bar arrays must be lists and non-dict bars are skipped; Claude records validated individually with out-of-range values REJECTED not clamped; article-feed nulls/scalars/bare-string tickers skipped per element. Contract enforced by `tests/test_adversarial.py`: garbage may never crash a cycle nor produce an approval |
 | Exit limit sells never fill | **v19.2: escalation** — after 3 consecutive unfilled limit attempts for one trade, the next attempt is a market order; one-per-day `exit_stuck` `system_events` row (warning). Execution certainty over slippage control once the bounded path has demonstrably failed |
 | DB down | 3 retries on OperationalError; eval-loop writes never block the trading path |
 | T212 symbol map 429 at startup | retries with 30s backoff + daily 08:00 UTC rebuild (a single startup 429 used to poison the whole session) |
 | Service crash | systemd `Restart=always` + deploy-time config validation + post-restart health check + **heartbeat table** (below) |
 | Silent zero-trade drought | **v17: tripwire** — `check_zero_trade_drought` (startup + daily 21:30 UTC) fires CRITICAL + `system_events` after `ZERO_TRADE_ALERT_SESSIONS` (3) consecutive NYSE sessions with no trades while up and scoring. Alerts only; never stands the system down (a drought can be a legitimately bad tape) |
+
+**Scheduler collisions on a rate-limited endpoint (v21.11, 2026-07-31):**
+`/equity/account/cash` had three callers on independent schedules — the daily
+kill switch inside `news_cycle` (every 60s, but *only once the day's realized
+P&L is negative*), `portfolio_snapshot` (every 5 min), and
+`calculate_quantity` (per entry).
+
+APScheduler anchors every `IntervalTrigger` to process start, and **5 minutes
+is an exact multiple of 1 minute** — so the kill-switch call and the snapshot
+call landed on the same instant every fifth minute, forever, and Trading 212
+rejected one of them every time. `_fetch_cash()` had no retry, and for the kill
+switch a failed lookup is not a warning, it is a stand-down:
+
+> `Risk gate active: kill-switch check impossible (portfolio value unavailable) — standing down — no new entries this cycle`
+
+**64 rejections on 2026-07-31; 44 of them stood an entire news cycle down.**
+The trigger is the `if realized < 0` branch, so the system goes ~20% blind for
+the rest of the day *precisely on the days it has already lost money*. The
+per-day counts confirm the mechanism exactly: 07-27/28/30 (never negative) had
+**0**; 07-29 (briefly negative) had **2**; 07-31 (negative from 09:36 on) had
+**64**.
+
+The fix is a lock plus a short TTL cache. The **lock** is what actually solves
+it: it serializes the racing callers so the second finds a warm cache instead
+of issuing a competing request. The TTL (15s; 3s for order sizing, which
+tolerates less staleness) just bounds how stale that shared answer may be — the
+account total only moves when we trade. One retry on a retryable status is
+defence in depth. Fail-closed behaviour is unchanged; it simply stops firing
+for a self-inflicted reason.
 
 **Heartbeat / alerting:** every job updates `heartbeat(job, last_beat_at)`.
 Grafana alert query (fires when the news cycle is silent >10 min):

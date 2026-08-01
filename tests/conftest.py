@@ -27,11 +27,16 @@ def _reset_process_level_state():
     import market.finnhub_bars as fh
     import market.price_check as pc
     import monitor.position_monitor as pm
+    import trading.executor as ex
 
     # Finnhub: auth latch + sustained-outage counter (v21.9 / v21.10)
     fh._auth_ok = None
     fh._finnhub_consecutive_failures = 0
     fh._finnhub_outage_reported = False
+
+    # T212 cash-balance cache (v21.11) — a value cached by one test would
+    # otherwise be served to the next, hiding whatever _get mock it installed.
+    ex._cash_cache = None
 
     # Frozen-feed tripwire (v21.10)
     pc._stale_quote_streak.clear()

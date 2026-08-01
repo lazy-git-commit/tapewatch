@@ -44,7 +44,9 @@ from datetime import datetime
 import pytz
 
 from config.settings import cfg
-from market.price_check import confirm_price_signal, PriceConfirmation
+from market.price_check import (
+    confirm_price_signal, PriceConfirmation, quote_feed_degraded,
+)
 from market.twelvedata_bars import credits_exhausted
 from news.fetcher import fetch_all_news, NewsItem
 from storage.database import (
@@ -125,8 +127,11 @@ _GAP_PCT_EXPIRE_AFTER = 5
 # in main.py). Everything else (penny_stock, illiquid, dead_cat,
 # extended_move, wide_spread, high_momentum, high_volume, below_vwap,
 # exhausted_bounce, insufficient_data) is terminal.
+# Must stay in sync with main._TRANSIENT_REJECT_CODES — see the note there on
+# why stale_price/stale_volume (v21.11) belong here.
 _TRANSIENT_REJECT_CODES = frozenset(
-    {"low_volume", "low_momentum", "overextended", "opening_block"}
+    {"low_volume", "low_momentum", "overextended", "opening_block",
+     "stale_price", "stale_volume"}
 )
 
 
@@ -295,6 +300,21 @@ def _apply_confirmation(
                 "Pre-market eval [%s]: price data unavailable (opening grace "
                 "period, %.1f min since open) — retrying next cycle, no strike",
                 ticker, minutes_open,
+            )
+            return None
+        # v21.11: while a provider feed is demonstrably frozen, a miss says
+        # nothing about THIS candidate's coverage — so don't strike it toward
+        # the "no_coverage" expiry. 2026-07-31: four of nine candidates (GTES,
+        # MOG, IRMD ×2) expired as "no quote after 3 consecutive retries"
+        # during a session-open outage in which BOTH providers served the
+        # previous day's close for every symbol, SONY included. Those were
+        # tradeable names discarded for a vendor problem.
+        if quote_feed_degraded():
+            logger.warning(
+                "Pre-market eval [%s]: price data unavailable but a quote feed "
+                "is currently frozen — retrying next cycle, no strike "
+                "(provider outage, not missing coverage)",
+                ticker,
             )
             return None
         # Track consecutive no-data cycles. After _NO_QUOTE_EXPIRE_AFTER strikes

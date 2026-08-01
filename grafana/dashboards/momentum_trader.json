@@ -56,7 +56,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ticker, COALESCE(session, 'unknown') AS session, quantity, buy_price, buy_time, ROUND(EXTRACT(EPOCH FROM (NOW() - buy_time::timestamptz)) / 60) AS age_minutes FROM trades WHERE status = 'open' AND mode = '$mode' ORDER BY buy_time DESC",
+          "rawSql": "SELECT ticker, COALESCE(session, 'unknown') AS session, quantity, buy_price, buy_time, ROUND(EXTRACT(EPOCH FROM (NOW() - buy_time::timestamptz)) / 60) AS age_minutes, ROUND(max_favorable_pct::numeric, 2) AS mfe_pct, ROUND(max_adverse_pct::numeric, 2) AS mae_pct FROM trades WHERE status = 'open' AND mode = '$mode' ORDER BY buy_time DESC",
           "format": "table",
           "refId": "A"
         }
@@ -244,11 +244,12 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ticker, COALESCE(session, 'unknown') AS session, ROUND(quantity::numeric, 4) AS quantity, buy_time, ROUND(buy_price::numeric, 4) AS buy_price_usd, COALESCE(ROUND(buy_net_gbp::numeric, 2)::text, '\u2014') AS buy_total_gbp, COALESCE(ROUND(buy_fees_gbp::numeric, 2)::text, '\u2014') AS buy_fees_gbp, COALESCE(ROUND(buy_fx_rate::numeric, 4)::text, '\u2014') AS buy_fx_rate, sell_time, ROUND(sell_price::numeric, 4) AS sell_price_usd, ROUND(sell_net_gbp::numeric, 2) AS sell_total_gbp, ROUND(sell_fees_gbp::numeric, 2) AS sell_fees_gbp, ROUND(sell_fx_rate::numeric, 4) AS sell_fx_rate, ROUND(profit_loss::numeric, 2) AS pnl_gbp, ROUND(profit_loss_pct::numeric, 2) AS pnl_pct, exit_reason FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
+          "rawSql": "SELECT ticker, COALESCE(session, 'unknown') AS session, ROUND(quantity::numeric, 4) AS quantity, buy_time, ROUND(buy_price::numeric, 4) AS buy_price_usd, COALESCE(ROUND(buy_net_gbp::numeric, 2)::text, '—') AS buy_total_gbp, COALESCE(ROUND(buy_fees_gbp::numeric, 2)::text, '—') AS buy_fees_gbp, COALESCE(ROUND(buy_fx_rate::numeric, 4)::text, '—') AS buy_fx_rate, sell_time, ROUND(sell_price::numeric, 4) AS sell_price_usd, ROUND(sell_net_gbp::numeric, 2) AS sell_total_gbp, ROUND(sell_fees_gbp::numeric, 2) AS sell_fees_gbp, ROUND(sell_fx_rate::numeric, 4) AS sell_fx_rate, ROUND(profit_loss::numeric, 2) AS pnl_gbp, ROUND(profit_loss_pct::numeric, 2) AS pnl_pct, ROUND(max_favorable_pct::numeric, 2) AS mfe_pct, ROUND(max_adverse_pct::numeric, 2) AS mae_pct, ROUND((max_favorable_pct - profit_loss_pct)::numeric, 2) AS left_on_table_pct, exit_reason FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
           "format": "table",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Every closed trade. mfe_pct / mae_pct (v21.10) are the best and worst unrealised P&L the position reached while open — 'how far up did this go before I sold, and how far down did it dip'. left_on_table_pct = mfe_pct minus what was actually banked: the money the exit rule gave back. Blank on trades that closed before v21.10 (2026-07-31)."
     },
     {
       "id": 7,
@@ -517,7 +518,8 @@
           "format": "table",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Why signals did not become trades. stale_price / stale_volume (v21.11) are DATA states, not market states: the price feed is lagging, so the signal was deferred and re-queued rather than judged. A spike in either means a provider is behind — cross-check the System Events panel."
     },
     {
       "id": 13,
@@ -670,7 +672,7 @@
       "id": 17,
       "title": "Magnitude Gate Funnel (sentiment_scores, last 7 days)",
       "type": "table",
-      "description": "Shows how many signals the magnitude gate is filtering. All fetcher-gate drops (confidence, catalyst type, already_moved, magnitude) are visible here via sentiment_scores \u2014 which stores every Claude classification before any gate is applied.",
+      "description": "Shows how many signals the magnitude gate is filtering. All fetcher-gate drops (confidence, catalyst type, already_moved, magnitude) are visible here via sentiment_scores — which stores every Claude classification before any gate is applied.",
       "gridPos": {
         "x": 12,
         "y": 45,
@@ -999,6 +1001,35 @@
       "targets": [
         {
           "rawSql": "SELECT exit_reason, COUNT(*) AS n, ROUND(AVG(profit_loss_pct)::numeric, 2) AS avg_pnl_pct, ROUND(SUM(profit_loss)::numeric, 2) AS total_pnl_gbp FROM trades WHERE status = 'closed' AND mode = '$mode' AND exit_reason IS NOT NULL AND sell_time::timestamptz >= NOW() - INTERVAL '30 days' GROUP BY exit_reason ORDER BY n DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "title": "Exit Efficiency: MFE vs realised (is the time-stop cutting winners?)",
+      "description": "The question v21.10's MFE/MAE instrumentation exists to answer. avg_mfe_pct = the average best unrealised gain a position reached while open; avg_realised_pct = what was actually banked. avg_left_on_table = the gap between them, i.e. how much of the move the exit rule handed back. A persistently large gap on time_stop rows is the case FOR a trailing stop; a large gap on stop_loss rows is the case for a wider or later stop. Needs ~30 post-2026-07-31 trades before it means anything — until then it is a sample, not a finding.",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 66,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT exit_reason, COUNT(*) AS n, ROUND(AVG(profit_loss_pct)::numeric, 2) AS avg_realised_pct, ROUND(AVG(max_favorable_pct)::numeric, 2) AS avg_mfe_pct, ROUND(AVG(max_adverse_pct)::numeric, 2) AS avg_mae_pct, ROUND(AVG(max_favorable_pct - profit_loss_pct)::numeric, 2) AS avg_left_on_table, ROUND(MAX(max_favorable_pct)::numeric, 2) AS best_mfe_pct FROM trades WHERE status = 'closed' AND mode = '$mode' AND exit_reason IS NOT NULL AND max_favorable_pct IS NOT NULL GROUP BY exit_reason ORDER BY n DESC",
           "format": "table",
           "refId": "A"
         }

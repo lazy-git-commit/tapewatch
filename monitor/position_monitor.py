@@ -64,6 +64,7 @@ Price fetch failure policy:
 """
 
 import logging
+import math
 import time as _time
 from datetime import datetime, timezone
 import pytz
@@ -242,6 +243,31 @@ def _record_excursion(trade_id: int, gain_pct: float) -> None:
         _excursion_seen[trade_id] = (max(prev[0], gain_pct), min(prev[1], gain_pct))
 
 
+def _record_exit_excursion(trade: dict, sell_price: float | None) -> None:
+    """
+    Fold the REALIZED exit price into the trade's MFE/MAE band (v21.11).
+
+    Without this, excursions only ever saw prices the polling loop happened to
+    observe, and a broker-side resting stop fills without the poller involved
+    at all. The result was an impossible row: NVT (2026-07-31) closed at
+    −2.56% carrying max_adverse_pct = +0.75%, because the last polled quote
+    was frozen and the −2.29% fill was never fed in. That biases MAE toward
+    zero on exactly the trades where "how much heat did this take?" is the
+    entire question — the stop-outs — and MFE/MAE exists to answer the
+    trailing-stop-vs-time-stop question from our own data.
+
+    Still pure observability: no exit decision reads these columns.
+    """
+    try:
+        buy_price = float(trade.get("buy_price") or 0)
+        if buy_price <= 0 or sell_price is None or not math.isfinite(float(sell_price)):
+            return
+        _record_excursion(trade["id"], ((float(sell_price) - buy_price) / buy_price) * 100)
+    except (TypeError, ValueError, KeyError) as exc:
+        logger.debug("Could not record exit excursion for trade %s: %s",
+                     trade.get("id"), exc)
+
+
 def _log_holding(
     trade_id: int, ticker: str, current_price: float, pct_from_buy: float,
     take_profit_threshold: float, stop_loss_threshold: float,
@@ -417,6 +443,7 @@ def _close_as_resting_fill(trade: dict, order_id: str, kind: str, fill: dict | N
         "Monitor [%s] trade=%d: resting %s FILLED @ $%.4f",
         trade["ticker"], trade["id"], kind.upper(), sell_price,
     )
+    _record_exit_excursion(trade, sell_price)
     close_trade(
         trade["id"], sell_price, reason,
         sell_order_id=order_id,
@@ -912,6 +939,7 @@ def monitor_positions() -> None:
             _sell_fail_counts.pop(trade_id, None)
             _last_status_check.pop(trade_id, None)
             _last_price_log.pop(trade_id, None)
+            _record_exit_excursion(trade, result.price)
             try:
                 close_trade(
                     trade_id, result.price, reason,

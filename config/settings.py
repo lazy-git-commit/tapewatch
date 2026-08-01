@@ -129,8 +129,45 @@ class Settings:
     # already paid out its catalyst — late articles on it are recaps.
     # This closes the hole where a stock up 80% on the day but flat in the
     # last 5 minutes passed the 5-min momentum ceiling.
+    #
+    # v21.11: 25% → 10%, calibrated on all 24 closed trades (2026-08-01).
+    # 25% was so loose it never bound on a real (non-microcap) trade — every
+    # one of the 20 trades with usable prev-close data passed it. The entry
+    # day-move vs realized P&L panel:
+    #
+    #   ceiling  kept  mean P&L   blocked                       blocked mean
+    #     8%      14    -0.57%    MRVL,CRCL,TMO,APH,GRMN,NVT      -1.72%
+    #    10%      17    -0.57%    CRCL,TMO,NVT                    -2.85%
+    #    12%      18    -0.65%    CRCL,NVT                        -3.27%
+    #    25%      20    -0.91%    (nothing)                            —
+    #
+    # 10% is the TIGHTEST ceiling that blocks only losers: it removes CRCL
+    # (-3.97%), TMO (-2.03%) and NVT (-2.56%) and costs no winner. 8% also
+    # cuts GRMN (+3.86%, entered at +9.99%), the second-best trade on record.
+    # Mechanically this is a risk:reward statement, not a momentum one — with
+    # a 2% stop and a 5% target, entering a stock already up 15% needs +21%
+    # on the day to pay out while a routine pullback stops you.
+    # n=20 is calibration, not proof; GRMN sits 0.01pp inside the boundary.
     max_day_move_pct: float = field(
-        default_factory=lambda: float(os.getenv("MAX_DAY_MOVE_PCT", "25.0"))
+        default_factory=lambda: float(os.getenv("MAX_DAY_MOVE_PCT", "10.0"))
+    )
+    # Maximum age of the quote backing an ENTRY decision (seconds).
+    #
+    # Distinct from price_check._QUOTE_MAX_AGE_SECONDS (20 min), which answers
+    # "does any provider carry this instrument at all?" — a coverage question.
+    # This answers "is this price safe to size and buy against right now?"
+    #
+    # Why (2026-07-31, NVT): both providers froze at the open. The quote that
+    # confirmed the entry honestly reported itself ~3 minutes old and the
+    # 20-minute coverage threshold waved it through. That price ($167.37) was
+    # the 09:33 bar close; the real tape was ~$165.50 and falling. Every gate
+    # — momentum +1.74%, RVOL, VWAP held — was computed from a 3-minute-old
+    # photograph, and each produced a green light the live market would have
+    # refused. The position was stopped out 42 seconds after the fill.
+    # In the first minutes of a session a 3-minute lag is a 3% pricing error:
+    # larger than the entire stop distance.
+    max_entry_quote_age_seconds: int = field(
+        default_factory=lambda: int(os.getenv("MAX_ENTRY_QUOTE_AGE_SECONDS", "90"))
     )
     # How many minutes back the momentum baseline looks. Bars are selected by
     # TIMESTAMP (not array index) so missing 1-min bars on thin stocks don't
@@ -466,6 +503,11 @@ class Settings:
             ("MIN_PRICE_MOVE_PCT", self.min_price_move_pct >= 0),
             ("MAX_PRICE_MOVE_PCT", self.max_price_move_pct > self.min_price_move_pct),
             ("MAX_DAY_MOVE_PCT", self.max_day_move_pct > 0),
+            # A ceiling at or below the take-profit target is self-defeating:
+            # anything that could pay out would already be rejected on entry.
+            ("MAX_DAY_MOVE_PCT > TAKE_PROFIT_PCT",
+             self.max_day_move_pct > self.take_profit_pct),
+            ("MAX_ENTRY_QUOTE_AGE_SECONDS", self.max_entry_quote_age_seconds > 0),
             ("MOMENTUM_LOOKBACK_MINUTES", self.momentum_lookback_minutes > 0),
             ("MAX_DAY_DROP_PCT", self.max_day_drop_pct > 0),
             ("MIN_DAILY_DOLLAR_VOLUME", self.min_daily_dollar_volume >= 0),

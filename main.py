@@ -57,6 +57,7 @@ from storage.database import (
 from news.fetcher import fetch_all_news, NewsItem
 from market.price_check import (
     confirm_price_signal, is_too_late_to_buy, PriceConfirmation,
+    quote_feed_degraded,
 )
 from market.sessions import (
     get_trading_session, is_entry_session, REGULAR, EXTENDED_SESSIONS, _ET,
@@ -119,8 +120,12 @@ _retry_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"ite
 # covers, so terminal handling here forfeits the densest catalyst window of
 # the day. The block itself is sound and unchanged (auction/MOC noise is real);
 # only its permanence was wrong.
+# stale_price / stale_volume (v21.11) are data states, not market states: the
+# feed is behind, not the stock. Both clear on their own within minutes, so
+# discarding the signal would throw away a catalyst over a vendor hiccup.
 _TRANSIENT_REJECT_CODES = frozenset(
-    {"low_volume", "low_momentum", "overextended", "opening_block"}
+    {"low_volume", "low_momentum", "overextended", "opening_block",
+     "stale_price", "stale_volume"}
 )
 _REEVAL_TTL_MINUTES = 15
 _reeval_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"item", "signal_id", "expires_at"}
@@ -188,6 +193,22 @@ def _queue_retry(item: NewsItem, count_strike: bool = True) -> None:
             "Signal [%s] parked for retry (no extended-hours price data — not "
             "counted toward the no-quote blackout) — expires in %d min",
             item.ticker, _RETRY_TTL_MINUTES,
+        )
+        return
+    # v21.11: a strike asserts "no provider carries this instrument". While a
+    # provider feed is demonstrably frozen, a miss proves nothing about the
+    # TICKER, so it must not count toward a session-long blacklist. On
+    # 2026-07-31 both feeds served the previous day's close for every symbol
+    # they were asked about (SONY included) for the first 40+ minutes of the
+    # session, and GTES + IRMD — liquid, fully-covered names — were blacklisted
+    # for the day as a result. The frozen-feed tripwire already DETECTS this;
+    # the blacklist simply wasn't listening to it.
+    if quote_feed_degraded():
+        logger.warning(
+            "Signal [%s] parked for retry — a quote feed is currently frozen, "
+            "so this miss is NOT counted toward the no-quote blackout "
+            "(provider outage, not missing ticker coverage)",
+            item.ticker,
         )
         return
     # Track consecutive no-data strikes for this ticker.

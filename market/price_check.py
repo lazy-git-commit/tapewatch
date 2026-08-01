@@ -13,6 +13,13 @@ Price sources:
 A signal is confirmed when ALL of the following hold (in evaluation order —
 cheapest checks first so we fail fast and spend fewer API credits):
 
+  0. stale_price     — the quote backing the decision must be no older than
+                       cfg.max_entry_quote_age_seconds. Runs FIRST because a
+                       lagging quote doesn't make the gates below fail, it
+                       makes them AGREE — on a market that has moved on
+                       (NVT 2026-07-31: a 3-min-old $167.37 confirmed momentum,
+                       RVOL and VWAP while the tape traded $165.50 and fell;
+                       stopped out 42s after the fill). TRANSIENT.
   1. opening_block   — at least cfg.open_block_minutes after the open. The
                        opening auction produces violent noise (GOAI: entire
                        spike was in the 09:30 bar; bought 09:32 into collapse).
@@ -41,6 +48,13 @@ cheapest checks first so we fail fast and spend fewer API credits):
   8. high_momentum   — but NOT up more than cfg.max_price_move_pct in that
                        window — that is a post-halt spike, not an entry.
                        Runs before VWAP so spikes don't waste a VWAP credit.
+  5.5 stale_volume   — RVOL and the day move come from different sources, so
+                       when they disagree hard (a big day move on near-zero
+                       relative volume) the VOLUME side is lagging, not calm.
+                       Defer instead of letting the size-neutral bypass below
+                       excuse a reading that was never real (NVT 2026-07-31:
+                       +15.59% on the day, RVOL 0.28, while the first minute
+                       alone traded ~10% of an average day). TRANSIENT.
   9. low_volume /    — RVOL (time-of-day normalized relative volume) within
      high_volume       [cfg.min_rvol, cfg.max_rvol]. See _expected_volume_
                        fraction() for why raw volume ratios are meaningless
@@ -198,7 +212,9 @@ def _to_yf_ticker(t212_ticker: str) -> str:
     return t212_to_symbol(t212_ticker)
 
 
-def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
+def get_quote_with_fallback(
+    symbol: str, fast: bool = False, prefer_fresher_than: float | None = None,
+) -> dict | None:
     """
     Real-time quote with a two-source fallback chain:
       1. Finnhub /quote  — primary (fastest, generous rate limit)
@@ -217,6 +233,14 @@ def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
     Both sources return the same normalised keys (c/o/pc), so callers don't
     need to know which one answered.
 
+    `prefer_fresher_than` (seconds, v21.11) is a SOFT preference, not a filter:
+    when the primary's quote is older than this, the fallback is consulted and
+    the fresher of the two wins. It never causes None to be returned — deciding
+    that a quote is too stale to ACT on belongs to the caller (see
+    confirm_price_signal's stale_price gate), because "unusable for an entry"
+    and "this ticker has no coverage" must not collapse into the same outcome:
+    the latter burns a no-quote strike toward a session blacklist.
+
     `pc` (previous close) gets special treatment: Finnhub's free tier routinely
     returns pc=0 (or a stale pc) in the first minutes after the open, before its
     daily rollover settles (observed 2026-06-16: OTLK/SLP/SPCB all had a valid
@@ -230,6 +254,24 @@ def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
     if quote is not None and _quote_is_stale(symbol, quote, "Finnhub"):
         quote = None  # fall through to Twelvedata exactly as if uncovered
     if quote is not None:
+        # v21.11: Finnhub answered and is inside the COVERAGE window, but the
+        # caller needs a tighter freshness bar (an entry decision). Give
+        # Twelvedata a chance rather than rejecting outright — on 2026-07-31
+        # the two providers lagged by different amounts, so the fallback is
+        # worth consulting even when the primary technically "answered".
+        if _below_freshness_bar(quote, prefer_fresher_than):
+            td = get_twelvedata_quote(symbol, fast=fast)
+            if td is not None and not _quote_is_stale(symbol, td, "Twelvedata"):
+                fh_age, td_age = quote_age_seconds(quote), quote_age_seconds(td)
+                if td_age is not None and (fh_age is None or td_age < fh_age):
+                    logger.info(
+                        "Quote [%s]: Finnhub quote %.0fs old is behind the "
+                        "%.0fs entry bar — using fresher Twelvedata quote (%.0fs)",
+                        symbol, fh_age or -1, prefer_fresher_than, td_age,
+                    )
+                    if not (float(td.get("pc") or 0) > 0) and float(quote.get("pc") or 0) > 0:
+                        td["pc"] = quote["pc"]   # keep Finnhub's prev close
+                    return td
         if not (float(quote.get("pc") or 0) > 0):
             td = get_twelvedata_quote(symbol, fast=fast)
             td_pc = float(td.get("pc") or 0) if td else 0
@@ -257,6 +299,18 @@ def get_quote_with_fallback(symbol: str, fast: bool = False) -> dict | None:
 # the real book — 459 consecutive unfilled sells until the EOD market flatten.
 # A quote that hasn't updated in 20 minutes is not a price, it's a memory.
 _QUOTE_MAX_AGE_SECONDS = 20 * 60
+
+
+# ── Volume plausibility cross-check (v21.11) ─────────────────────────────────
+# Thresholds for "the volume feed disagrees with the price feed so hard that
+# one of them must be lagging". Deliberately conservative so the size-neutral
+# RVOL bypass keeps working for its actual purpose — a genuinely quiet
+# mega-cap grinding up on ordinary volume (BMY 2026-07-13: +2.1% on the day,
+# RVOL ~0.3) stays well inside the day-move threshold and is untouched.
+# Only a LARGE move on near-zero relative volume is flagged, because that
+# combination is not a market state, it is a data state.
+_VOLUME_PLAUSIBILITY_DAY_MOVE_PCT = 5.0   # |day change| at/above this...
+_VOLUME_PLAUSIBILITY_MIN_RVOL = 0.5       # ...must not come with RVOL below this
 
 
 # ── Frozen-feed tripwire (v21.10) ────────────────────────────────────────────
@@ -309,6 +363,47 @@ def _note_quote_stale(source: str, symbol: str, age_minutes: float) -> None:
         logger.debug("Could not record stale_quote_feed system_event: %s", exc)
 
 
+def quote_feed_degraded() -> bool:
+    """
+    True while ANY quote source is in a live stale streak long enough to look
+    like a frozen provider feed rather than a quiet ticker.
+
+    Unlike the once-per-process alert latch above, this reads the CURRENT
+    streak — `_note_quote_fresh()` zeroes it the moment a usable quote
+    arrives — so it answers "are the feeds degraded right now?".
+
+    Callers use it to avoid punishing a TICKER for a PROVIDER's outage: on
+    2026-07-31 both feeds froze at the open and two liquid names (GTES,
+    IRMD) were blacklisted for the session as "no coverage" while Finnhub
+    was serving the previous day's close for every symbol it was asked
+    about, SONY included.
+    """
+    return any(
+        streak >= _STALE_QUOTE_ALERT_THRESHOLD
+        for streak in _stale_quote_streak.values()
+    )
+
+
+def quote_age_seconds(quote: dict) -> float | None:
+    """Age of a quote's own data timestamp in seconds, or None when it carries
+    no usable timestamp (which is NOT the same as "fresh" — callers decide)."""
+    ts = quote.get("t") if quote else None
+    if not ts:
+        return None
+    try:
+        return time.time() - float(ts)
+    except (TypeError, ValueError):
+        return None
+
+
+def _below_freshness_bar(quote: dict, bar_seconds: float | None) -> bool:
+    """True when a freshness bar is set and this quote is provably older."""
+    if not bar_seconds:
+        return False
+    age = quote_age_seconds(quote)
+    return age is not None and age > bar_seconds
+
+
 def _quote_is_stale(symbol: str, quote: dict, source: str) -> bool:
     """True when the quote carries a data timestamp older than the max age.
 
@@ -316,13 +411,10 @@ def _quote_is_stale(symbol: str, quote: dict, source: str) -> bool:
     missing metadata — the other gates still apply); the check only fires on
     positive evidence of staleness.
     """
+    age = quote_age_seconds(quote)
+    if age is None:
+        return False
     ts = quote.get("t")
-    if not ts:
-        return False
-    try:
-        age = time.time() - float(ts)
-    except (TypeError, ValueError):
-        return False
     if age > _QUOTE_MAX_AGE_SECONDS:
         logger.warning(
             "Quote [%s]: %s quote is %.0f min old (last update %s) — treating "
@@ -530,7 +622,9 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
 
     try:
         # ── Current price + previous close (Finnhub → Twelvedata fallback) ──
-        quote = get_quote_with_fallback(symbol, fast=fast)
+        quote = get_quote_with_fallback(
+            symbol, fast=fast, prefer_fresher_than=cfg.max_entry_quote_age_seconds,
+        )
         if quote is None:
             logger.warning(
                 "Price check [%s]: no quote from Finnhub or Twelvedata — cannot evaluate signal",
@@ -571,6 +665,39 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             rvol=0.0, avg_dollar_volume=None, spread_proxy_pct=None,
             session=session,
         )
+
+        # ── 0. Entry-price freshness (v21.11) ────────────────────────────────
+        # Runs FIRST because it invalidates everything downstream: current
+        # price, the day-move maths, and (via the bar pull that follows) the
+        # momentum/RVOL/VWAP readings all describe whatever moment this quote
+        # actually belongs to. A lagging quote does not make the gates fail —
+        # it makes them agree, on a market that no longer exists.
+        #
+        # TRANSIENT: a feed running behind catches up within minutes, so this
+        # goes to the re-eval queue rather than discarding the signal. It is
+        # deliberately NOT a None return: "coverage exists but is lagging" must
+        # not be recorded as "this ticker is unpriceable", which strikes the
+        # ticker toward a session-long blacklist (2026-07-31, GTES/IRMD).
+        # RTH only. In an extended session the quote is EXPECTED to lag (the
+        # 16:00 official close is served for minutes into after-hours) and the
+        # block below deliberately substitutes the fresher anchored bar close
+        # as "now" — so an age test on the quote here would reject exactly the
+        # signals that substitution exists to rescue. In regular hours no such
+        # substitution happens: current_price IS the quote, so its age is the
+        # age of the price we would trade on.
+        entry_quote_age = quote_age_seconds(quote)
+        if (
+            not extended
+            and entry_quote_age is not None
+            and entry_quote_age > cfg.max_entry_quote_age_seconds
+        ):
+            return _reject(
+                base, "stale_price",
+                f"Entry-price freshness: quote is {entry_quote_age:.0f}s old "
+                f"(max {cfg.max_entry_quote_age_seconds}s for an entry) — every "
+                f"gate below would be computed from a market that has already "
+                f"moved on",
+            )
 
         # ── 1. Opening block ─────────────────────────────────────────────────
         # Costs nothing to check; rejects before any Twelvedata credit is spent.
@@ -723,6 +850,7 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             avg_dollar_volume=avg_dollar_volume,
         )
 
+
         # ── 4. Dead-cat guard (vs prev close) ────────────────────────────────
         # If prev close is unavailable from both sources, fall back to the
         # open-based day move rather than silently disabling the guard —
@@ -744,6 +872,40 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
                 f"Extended-move ceiling: {day_change_pct:+.2f}% vs prev close exceeds "
                 f"+{cfg.max_day_move_pct}% — catalyst already paid out, entries here "
                 f"buy exhaustion",
+            )
+
+        # ── 5.5 Volume plausibility cross-check (v21.11) ─────────────────────
+        # RVOL and the day move come from DIFFERENT sources (session minute-bar
+        # volume vs quote price against prev close), so they can disagree — and
+        # when they disagree this hard, the VOLUME side is lagging, not calm.
+        # A stock cannot reprice several percent on a fraction of its normal
+        # volume; the shares had to trade for the price to get there.
+        #
+        # 2026-07-31, NVT: +15.59% on the day with RVOL reported as 0.28, while
+        # the real tape printed 191k shares in the FIRST MINUTE — about 10% of
+        # NVT's entire average day. Because that reading looked low, it
+        # triggered the size-neutral bypass in step 9 (which exists for
+        # genuinely quiet mega-caps) and waved the trade through on
+        # participation evidence that was never there.
+        #
+        # Deliberately placed AFTER the extended-move ceiling: a move too big
+        # to trade is a permanent verdict and must stay terminal, not be
+        # downgraded to this transient one and re-queued forever.
+        # Deferring is the only safe response — VWAP comes from the same bars,
+        # so an implausible volume reading impugns the accumulation test too.
+        if (
+            not extended
+            and session_volume is not None
+            and day_change_pct is not None
+            and abs(day_change_pct) >= _VOLUME_PLAUSIBILITY_DAY_MOVE_PCT
+            and rvol < _VOLUME_PLAUSIBILITY_MIN_RVOL
+        ):
+            return _reject(
+                base, "stale_volume",
+                f"Volume/price disagreement: {day_change_pct:+.2f}% on the day "
+                f"but RVOL only {rvol:.2f} — a move that size cannot happen on "
+                f"{rvol:.0%} of normal volume, so the volume feed is behind "
+                f"(RVOL and VWAP both unusable this cycle)",
             )
 
         # ── 6. Liquidity floor (ADV-based) ───────────────────────────────────

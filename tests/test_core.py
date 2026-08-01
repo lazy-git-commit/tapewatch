@@ -3649,7 +3649,11 @@ class TestSessionVolumeGates:
         (open-price momentum fallback alone must never confirm a bare quote)
     """
 
-    _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.0}
+    # pc=10.28 → +2.14% on the day. Keeps these tests aimed at the VOLUME
+    # gates: at the old pc=10.0 (+5.0%) the zero-volume case now trips the
+    # v21.11 plausibility cross-check first, which is a correct verdict but a
+    # different one than this class exists to pin down.
+    _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.28}
 
     @staticmethod
     def _now_et(minutes_after_open=30):
@@ -3759,8 +3763,13 @@ class TestRvolBypass:
     the RVOL floor ran before the VWAP gate ever got a look.
     """
 
-    _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.0}
-    _MEGACAP_DAILY = (5_000_000, 750_000_000.0, 10.0)  # BMY-scale ADV$
+    # pc=10.28 → +2.14% on the day, matching the BMY drift this class
+    # documents. (It was pc=10.0/+5.0% until v21.11, which was never the
+    # incident: a +5% day move on RVOL ~0.06 is the volume feed lagging, and
+    # the 5.5 plausibility gate now — correctly — defers that combination
+    # before the bypass is ever consulted. See test_implausible_volume_*.)
+    _QUOTE = {"c": 10.5, "o": 10.0, "pc": 10.28}
+    _MEGACAP_DAILY = (5_000_000, 750_000_000.0, 10.28)  # BMY-scale ADV$
 
     @staticmethod
     def _now_et():
@@ -4026,3 +4035,338 @@ class TestSessionAnalysisAggregates:
         assert sa.last_price == 10.1
         assert sa.session_low == 9.9   # prior-session bar excluded
         assert sa.session_high == 10.2
+
+
+# ── v21.11: the 2026-07-31 NVT post-mortem ────────────────────────────────────
+
+class TestEntryPriceFreshness:
+    """
+    v21.11 gate 0 (stale_price). 2026-07-31, NVT: both providers froze at the
+    open. The quote that confirmed the entry honestly reported itself ~3 min
+    old and the 20-minute COVERAGE threshold waved it through — so momentum
+    (+1.74%), RVOL and VWAP were all computed from the 09:33 tape while the
+    real market traded 1.1% lower and falling. Stopped out 42s after the fill.
+
+    A lagging quote does not make the gates fail. It makes them agree.
+    """
+
+    @staticmethod
+    def _now_et():
+        import pytz
+        et = pytz.timezone("America/New_York")
+        return et.localize(datetime(2026, 7, 10, 10, 0, 0))
+
+    def _quote(self, age_seconds):
+        return {"c": 10.5, "o": 10.0, "pc": 10.28,
+                "t": time.time() - age_seconds}
+
+    def test_fresh_quote_confirms(self):
+        conf, _ = _confirm_with(self._now_et(), self._quote(10), _mk_sa())
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+
+    def test_lagging_quote_rejected_before_any_other_gate(self):
+        conf, mock_sa = _confirm_with(self._now_et(), self._quote(180), _mk_sa())
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "stale_price"
+        # Runs before the bars pull: a price we won't act on costs no credit.
+        mock_sa.assert_not_called()
+
+    def test_quote_without_timestamp_is_not_rejected(self):
+        # Fail-open on missing metadata — the other gates still apply. Only
+        # POSITIVE evidence of lag rejects.
+        conf, _ = _confirm_with(
+            self._now_et(), {"c": 10.5, "o": 10.0, "pc": 10.28}, _mk_sa(),
+        )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+
+    def test_boundary_is_the_configured_age(self):
+        import market.price_check as pc
+        with patch.object(pc.cfg, "max_entry_quote_age_seconds", 90):
+            inside, _ = _confirm_with(self._now_et(), self._quote(80), _mk_sa())
+            outside, _ = _confirm_with(self._now_et(), self._quote(100), _mk_sa())
+        assert inside is not None and inside.is_confirmed
+        assert outside is not None and outside.reason_code == "stale_price"
+
+    def test_stale_price_is_transient_everywhere(self):
+        # A feed running behind catches up in minutes — re-check, don't discard.
+        import main as m
+        import premarket.scanner as sc
+        assert "stale_price" in m._TRANSIENT_REJECT_CODES
+        assert "stale_price" in sc._TRANSIENT_REJECT_CODES
+
+
+class TestVolumePlausibility:
+    """
+    v21.11 gate 5.5 (stale_volume). NVT was +15.59% on the day with RVOL
+    reported as 0.28, while the real tape printed ~10% of an average DAY in
+    the first minute alone. Because that reading looked low it triggered the
+    size-neutral RVOL bypass — the gate meant for genuinely quiet mega-caps —
+    and confirmed the entry on participation evidence that never existed.
+    """
+
+    _MEGACAP_DAILY = (5_000_000, 750_000_000.0, 10.0)
+
+    @staticmethod
+    def _now_et():
+        import pytz
+        et = pytz.timezone("America/New_York")
+        return et.localize(datetime(2026, 7, 10, 10, 0, 0))
+
+    def test_big_move_on_near_zero_rvol_defers(self):
+        # +5.0% on the day, RVOL ~0.06 — the shares had to trade for the
+        # price to get there, so the volume feed is behind.
+        conf, _ = _confirm_with(
+            self._now_et(), {"c": 10.5, "o": 10.0, "pc": 10.0},
+            _mk_sa(session_volume=50_000, vwap=10.45),
+            daily=self._MEGACAP_DAILY,
+        )
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "stale_volume"
+
+    def test_quiet_megacap_drift_still_uses_the_bypass(self):
+        # The BMY case this must NOT break: +2.14% on the day, low RVOL,
+        # VWAP held. A small move on low volume is a market state, not a
+        # data state.
+        conf, _ = _confirm_with(
+            self._now_et(), {"c": 10.5, "o": 10.0, "pc": 10.28},
+            _mk_sa(session_volume=50_000, vwap=10.45),
+            daily=(5_000_000, 750_000_000.0, 10.28),
+        )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+        assert conf.rvol < 1.5
+
+    def test_big_move_with_real_volume_is_untouched(self):
+        # +5.0% on the day AND healthy RVOL — nothing implausible here.
+        conf, _ = _confirm_with(
+            self._now_et(), {"c": 10.5, "o": 10.0, "pc": 10.0},
+            _mk_sa(session_volume=400_000, vwap=10.45),
+            daily=self._MEGACAP_DAILY,
+        )
+        assert conf is not None and conf.is_confirmed, conf and conf.reason
+
+    def test_day_move_ceiling_still_wins(self):
+        # Precedence: a move too big to trade is a PERMANENT verdict. It must
+        # stay terminal (extended_move), not be downgraded to this transient
+        # code and re-queued forever.
+        conf, _ = _confirm_with(
+            self._now_et(), {"c": 13.0, "o": 10.0, "pc": 10.0},
+            _mk_sa(session_volume=50_000, vwap=12.9, past_price=12.9,
+                   current_bar_price=13.0, last_price=13.0),
+            daily=self._MEGACAP_DAILY,
+        )
+        assert conf is not None and not conf.is_confirmed
+        assert conf.reason_code == "extended_move"
+
+    def test_stale_volume_is_transient_everywhere(self):
+        import main as m
+        import premarket.scanner as sc
+        assert "stale_volume" in m._TRANSIENT_REJECT_CODES
+        assert "stale_volume" in sc._TRANSIENT_REJECT_CODES
+
+
+class TestDayMoveCeiling:
+    """
+    v21.11: MAX_DAY_MOVE_PCT 25% → 10%, calibrated on all 24 closed trades.
+    With a 2% stop and a 5% target, entering a stock already up 15% needs
+    +21% on the day to pay out while a routine pullback stops it — the
+    risk:reward is inverted before the entry is even placed.
+    """
+
+    def test_default_is_ten_percent(self):
+        import os
+        from config.settings import Settings
+        saved = os.environ.pop("MAX_DAY_MOVE_PCT", None)
+        try:
+            assert Settings().max_day_move_pct == 10.0
+        finally:
+            if saved is not None:
+                os.environ["MAX_DAY_MOVE_PCT"] = saved
+
+    def test_ceiling_must_exceed_the_take_profit_target(self):
+        # A ceiling at or below the target rejects everything that could pay
+        # out. cfg.validate() must refuse that configuration outright.
+        from config.settings import Settings
+        s = Settings()
+        s.max_day_move_pct = s.take_profit_pct
+        with pytest.raises(EnvironmentError):
+            s.validate()
+
+
+class TestCashCacheCollision:
+    """
+    v21.11: /equity/account/cash had three callers on independent schedules.
+    APScheduler anchors every IntervalTrigger to process start and 5 min is an
+    exact multiple of 1 min, so the kill-switch call and the 5-minute snapshot
+    landed on the SAME INSTANT every fifth minute — 64 rejections on
+    2026-07-31, 44 of which stood an entire news cycle down. The lock is the
+    fix (it serializes the racers); the TTL bounds how stale the shared answer
+    may be.
+    """
+
+    def _cash(self):
+        return {"total": 5000.0, "free": 5000.0, "invested": 0.0}
+
+    @patch("trading.executor._get")
+    def test_second_caller_within_ttl_makes_no_request(self, mock_get):
+        import trading.executor as ex
+        mock_get.return_value = self._cash()
+        assert ex.get_portfolio_value() == 5000.0
+        assert ex.get_account_summary() == (5000.0, 5000.0)
+        assert mock_get.call_count == 1   # the collision that used to 429
+
+    @patch("trading.executor._get")
+    def test_expired_ttl_refetches(self, mock_get):
+        import trading.executor as ex
+        mock_get.return_value = self._cash()
+        ex.get_portfolio_value()
+        ex._cash_cache = (time.time() - ex._CASH_CACHE_TTL_SECONDS - 1,
+                          self._cash())
+        ex.get_portfolio_value()
+        assert mock_get.call_count == 2
+
+    @patch("trading.executor._get")
+    def test_failure_is_not_cached(self, mock_get):
+        import trading.executor as ex
+        mock_get.side_effect = [
+            ex.T212HTTPError(429, "too many requests"),
+            ex.T212HTTPError(429, "too many requests"),
+            self._cash(),
+        ]
+        with patch("trading.executor.time.sleep"):
+            assert ex.get_portfolio_value() is None    # both attempts failed
+            assert ex.get_portfolio_value() == 5000.0  # next call still tries
+
+    @patch("trading.executor._get")
+    def test_concurrent_callers_are_serialized(self, mock_get):
+        # The real-world shape: two scheduler threads firing on the same tick.
+        import threading as _th
+        import trading.executor as ex
+
+        def slow_get(_path):
+            time.sleep(0.05)
+            return self._cash()
+
+        mock_get.side_effect = slow_get
+        results = []
+        threads = [
+            _th.Thread(target=lambda: results.append(ex.get_portfolio_value()))
+            for _ in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results == [5000.0] * 4
+        assert mock_get.call_count == 1
+
+
+class TestPhantomTickerDropped:
+    """
+    v21.11: Benzinga tagged a Moog article with both "MOG.A" (real) and "MOG"
+    (not a US listing — Moog trades as MOG.A/MOG.B). The <symbol>_US_EQ
+    fallback manufactured MOG_US_EQ, which then spent 2026-07-31 consuming
+    quote retries and API budget for an instrument that cannot exist.
+    """
+
+    def test_symbol_absent_from_a_built_map_is_dropped(self):
+        import trading.executor as ex
+        with patch.object(ex, "_symbol_to_t212", {"MOG.A": "MOG.A_US_EQ"}):
+            assert ex.resolve_t212_ticker("MOG.A") == "MOG.A_US_EQ"
+            assert ex.resolve_t212_ticker("MOG") is None
+
+    def test_fallback_still_applies_before_the_map_is_built(self):
+        # A startup before the first successful build must not drop everything.
+        import trading.executor as ex
+        with patch.object(ex, "_symbol_to_t212", {}):
+            assert ex.resolve_t212_ticker("AAPL") == "AAPL_US_EQ"
+
+
+class TestExitExcursionRecorded:
+    """
+    v21.11: MFE/MAE only ever saw prices the POLLING loop observed, and a
+    broker-side resting stop fills without the poller involved. NVT closed at
+    -2.56% carrying max_adverse_pct = +0.75% — an impossible row, because the
+    last polled quote was frozen and the real fill was never fed in. That
+    biases MAE toward zero on exactly the trades where the question is "how
+    much heat did this take?".
+    """
+
+    def test_resting_stop_fill_widens_the_band(self):
+        import monitor.position_monitor as pm
+        trade = {"id": 24, "ticker": "NVT_US_EQ", "buy_price": 166.13,
+                 "stop_order_id": "1", "quantity": 1.98}
+        with patch.object(pm, "update_trade_excursion") as mock_upd, \
+             patch.object(pm, "close_trade"), \
+             patch.object(pm, "_fetch_fill", return_value=None), \
+             patch.object(pm, "_parse_fill",
+                          return_value=(162.32, None, None, None)):
+            pm._close_as_resting_fill(trade, "1", "stop")
+        recorded = [c.args[1] for c in mock_upd.call_args_list]
+        assert recorded, "the realized stop fill must reach the excursion band"
+        assert recorded[0] == pytest.approx(-2.293, abs=0.01)
+
+    def test_polled_exit_price_also_recorded(self):
+        import monitor.position_monitor as pm
+        trade = {"id": 25, "ticker": "ACME_US_EQ", "buy_price": 100.0}
+        with patch.object(pm, "update_trade_excursion") as mock_upd:
+            pm._record_exit_excursion(trade, 104.0)
+        assert mock_upd.call_args.args[1] == pytest.approx(4.0)
+
+    def test_bad_fill_price_is_ignored_not_raised(self):
+        import monitor.position_monitor as pm
+        trade = {"id": 26, "ticker": "ACME_US_EQ", "buy_price": 100.0}
+        with patch.object(pm, "update_trade_excursion") as mock_upd:
+            pm._record_exit_excursion(trade, None)
+            pm._record_exit_excursion({"id": 27, "buy_price": 0}, 10.0)
+        mock_upd.assert_not_called()
+
+
+class TestProviderOutageDoesNotBlacklistTickers:
+    """
+    v21.11: a no-quote strike asserts "no provider carries this instrument".
+    On 2026-07-31 both feeds served the previous day's close for every symbol
+    they were asked about (SONY included) for 40+ minutes, and GTES + IRMD —
+    liquid, fully-covered names — were blacklisted for the session as a
+    result. The frozen-feed tripwire already DETECTED this; the blacklist
+    simply wasn't listening to it.
+    """
+
+    def _item(self, ticker="GTES_US_EQ"):
+        import pytz as _pytz
+        from news.fetcher import NewsItem
+        return NewsItem(
+            article_id="a1", ticker=ticker, headline="h", body="", source="s",
+            published_at=datetime.now(_pytz.utc), sentiment="positive",
+            confidence=0.8, catalyst_type="guidance_raise", already_moved=False,
+            catalyst_magnitude=3,
+        )
+
+    def test_strikes_suppressed_while_a_feed_is_frozen(self):
+        import main
+        main._no_quote_ticker_strikes.clear()
+        main._no_quote_blackout.clear()
+        with patch.object(main, "quote_feed_degraded", return_value=True):
+            for _ in range(5):
+                main._queue_retry(self._item())
+        assert "GTES_US_EQ" not in main._no_quote_blackout
+        assert not main._no_quote_ticker_strikes
+
+    def test_strikes_still_count_when_feeds_are_healthy(self):
+        import main
+        main._no_quote_ticker_strikes.clear()
+        main._no_quote_blackout.clear()
+        with patch.object(main, "quote_feed_degraded", return_value=False):
+            for _ in range(main._NO_QUOTE_BLACKOUT_RETRIES):
+                main._queue_retry(self._item())
+        assert "GTES_US_EQ" in main._no_quote_blackout
+
+    def test_degraded_reads_the_live_streak_not_the_alert_latch(self):
+        # The alert fires once per process; this must go back to False as
+        # soon as a usable quote arrives, or one outage would suppress
+        # strikes for the rest of the day.
+        import market.price_check as pc
+        for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD):
+            pc._note_quote_stale("Finnhub", "ACME", 1051)
+        assert pc.quote_feed_degraded() is True
+        pc._note_quote_fresh("Finnhub")
+        assert pc.quote_feed_degraded() is False

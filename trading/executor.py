@@ -15,6 +15,7 @@ the portfolio's total value, capped to available cash.
 import base64
 import logging
 import math
+import threading
 import time
 import requests
 from dataclasses import dataclass
@@ -195,12 +196,32 @@ def resolve_t212_ticker(exchange_symbol: str) -> str | None:
       1. clean the raw tag (drop foreign listings, strip disambiguation cruft)
       2. look up the cleaned symbol in the T212 shortName→ticker map
          (handles post-SPAC/rename mismatches: SUNE → JCS_US_EQ)
-      3. fall back to "<symbol>_US_EQ"
+      3. when the map is BUILT and the symbol is absent, drop the tag (v21.11)
+      4. only when the map is unavailable, fall back to "<symbol>_US_EQ"
+
+    Step 3 exists because the map is the complete T212 USD catalogue, so a
+    symbol missing from it is not tradeable here and the "<symbol>_US_EQ"
+    guess can only ever produce a phantom. 2026-07-31: Benzinga tagged a Moog
+    article with both "MOG.A" (real) and "MOG" (not a US listing — Moog trades
+    as MOG.A/MOG.B), and the fallback manufactured MOG_US_EQ, which then spent
+    the morning consuming quote retries and API budget for an instrument that
+    cannot exist. Guarded on a non-empty map so a startup before the first
+    successful build still uses the fallback rather than dropping everything.
     """
     cleaned = clean_benzinga_symbol(exchange_symbol)
     if cleaned is None:
         return None
-    return _symbol_to_t212.get(cleaned, f"{cleaned}_US_EQ")
+    mapped = _symbol_to_t212.get(cleaned)
+    if mapped:
+        return mapped
+    if _symbol_to_t212:
+        logger.info(
+            "resolve_t212_ticker: %s is not in the T212 instrument catalogue "
+            "(%d USD instruments) — dropping rather than guessing %s_US_EQ",
+            cleaned, len(_symbol_to_t212), cleaned,
+        )
+        return None
+    return f"{cleaned}_US_EQ"
 
 
 def t212_to_symbol(t212_ticker: str) -> str:
@@ -357,23 +378,91 @@ def _parse_fill(fill: dict) -> tuple[float | None, float | None, float | None, f
     return filled_price, net_gbp, fx_rate, fees_gbp
 
 
-def _fetch_cash() -> dict | None:
-    """Fetch /equity/account/cash once and return the raw dict, or None on error."""
+# ── Cash-balance cache (v21.11) ──────────────────────────────────────────────
+# /equity/account/cash is rate-limited by T212 and has THREE callers on
+# independent schedules: news_cycle's daily kill switch (every 60s, but only
+# once the day's realized P&L is negative), portfolio_snapshot (every 5 min),
+# and calculate_quantity (per entry).
+#
+# APScheduler anchors every IntervalTrigger to process start, and 5 minutes is
+# an exact multiple of 1 minute — so the kill-switch call and the snapshot call
+# land on the SAME INSTANT every fifth minute, forever, and one of the two is
+# always rejected. On 2026-07-31: 64 rejections, 44 of which stood an entire
+# news cycle down ("kill-switch check impossible — standing down"). The trigger
+# is the `if realized < 0` branch, so the system goes ~20% blind for the rest
+# of the day precisely on the days it has already lost money.
+#
+# The lock is what actually fixes it: it SERIALIZES the racing callers so the
+# second one finds a warm cache instead of issuing a competing request. The TTL
+# just bounds how stale that shared answer may be. 15s is far inside any
+# caller's tolerance — the account total moves only when we trade — while
+# collapsing three schedules into at most one request per 15s.
+_CASH_CACHE_TTL_SECONDS = 15
+# Sizing an actual order tolerates less staleness than a snapshot or a risk
+# check does, but still goes through the same lock — so it can never race the
+# scheduled jobs, it just declines to reuse an older answer.
+_CASH_CACHE_TTL_SIZING_SECONDS = 3
+_CASH_RETRY_BACKOFF_SECONDS = 2.0
+_cash_lock = threading.Lock()
+_cash_cache: tuple[float, dict] | None = None
+
+
+def _fetch_cash(max_age_seconds: float = _CASH_CACHE_TTL_SECONDS) -> dict:
+    """
+    Fetch /equity/account/cash, served from a short-lived process cache under
+    a lock (see above). Retries once on a RETRYABLE failure (429/5xx) — a
+    single throttled response used to be terminal for whichever caller lost
+    the race, and for the kill switch "terminal" means the whole cycle stands
+    down with no entries.
+
+    RAISES the underlying exception on failure so callers can report the real
+    cause; use _fetch_cash_or_none() where None is the wanted signal.
+    """
+    global _cash_cache
+    with _cash_lock:
+        cached = _cash_cache
+        if cached is not None and (time.time() - cached[0]) <= max_age_seconds:
+            return cached[1]
+        last_exc: Exception = RuntimeError("cash fetch made no attempt")
+        for attempt in (1, 2):
+            try:
+                data = _get("/equity/account/cash")
+                _cash_cache = (time.time(), data)
+                return data
+            except Exception as exc:
+                last_exc = exc
+                # Only retry what can plausibly clear on its own (429, 5xx, or
+                # a network error with no status at all). A 401/403/404 fails
+                # identically in two seconds — credentials don't change.
+                retryable = not isinstance(exc, T212HTTPError) or exc.retryable
+                if attempt == 1 and retryable:
+                    logger.warning(
+                        "T212 cash balance fetch failed (%s) — retrying once in %.1fs",
+                        exc, _CASH_RETRY_BACKOFF_SECONDS,
+                    )
+                    time.sleep(_CASH_RETRY_BACKOFF_SECONDS)
+                    continue
+                break
+        raise last_exc
+
+
+def _fetch_cash_or_none(max_age_seconds: float = _CASH_CACHE_TTL_SECONDS) -> dict | None:
+    """_fetch_cash() for callers that treat failure as 'unknown', not an error."""
     try:
-        return _get("/equity/account/cash")
+        return _fetch_cash(max_age_seconds)
     except Exception as exc:
         logger.error("Failed to fetch T212 cash balance: %s", exc)
         return None
 
 
 def get_portfolio_value() -> float | None:
-    data = _fetch_cash()
+    data = _fetch_cash_or_none()
     return float(data["total"]) if data else None
 
 
 def get_account_summary() -> tuple[float, float] | None:
     """(total_value, free_cash) in one API call — used by the snapshot job."""
-    data = _fetch_cash()
+    data = _fetch_cash_or_none()
     if not data:
         return None
     return float(data.get("total", 0)), float(data.get("free", 0))
@@ -435,41 +524,18 @@ def calculate_quantity(
     if not math.isfinite(price) or price <= 0:
         return None, f"invalid price {price!r} — refusing to size"
 
-    # One retry on a transient cash-lookup failure (e.g. HTTP 429). This call
-    # runs on every entry's hot path — an already-approved signal (all price/
-    # momentum/liquidity gates passed) was previously lost outright to a
-    # single rate-limit blip here (ITW, 2026-07-28: approved, then died on
-    # exactly this call with zero retries, on a day with only 2 total 429s).
-    # A short sleep is enough for a token-bucket-style limit to clear.
-    data = None
-    last_exc: Exception | None = None
-    for attempt in range(2):
-        try:
-            data = _get("/equity/account/cash")
-            break
-        except Exception as exc:
-            last_exc = exc
-            # Only retry failures that can plausibly clear on their own (429
-            # rate limit, 5xx, or a network-layer error with no status code
-            # at all). A 401/403/404 will fail identically on retry — the
-            # credentials or endpoint don't change in 2 seconds — so burn no
-            # time on it and fail fast with the real cause still visible.
-            retryable = not isinstance(exc, T212HTTPError) or exc.retryable
-            if attempt == 0 and retryable:
-                logger.warning(
-                    "calculate_quantity for %s: T212 cash API failed (%s) — retrying once",
-                    ticker, exc,
-                )
-                time.sleep(2)
-            elif attempt == 0:
-                logger.warning(
-                    "calculate_quantity for %s: T212 cash API failed with a "
-                    "non-retryable error (%s) — not retrying",
-                    ticker, exc,
-                )
-                break
-    if data is None:
-        reason = f"T212 cash API failed: {last_exc}"
+    # Cash lookup with retry + short shared cache — see _fetch_cash(). This
+    # call runs on every entry's hot path, and an already-approved signal (all
+    # price/momentum/liquidity gates passed) was once lost outright to a single
+    # rate-limit blip here (ITW, 2026-07-28: approved, then died on exactly
+    # this call with zero retries, on a day with only 2 total 429s).
+    # A tighter TTL than the background callers': sizing is the one caller
+    # whose answer becomes an order, so it tolerates less staleness — but it
+    # still shares the lock, so it can never race the scheduled jobs.
+    try:
+        data = _fetch_cash(max_age_seconds=_CASH_CACHE_TTL_SIZING_SECONDS)
+    except Exception as exc:
+        reason = f"T212 cash API failed: {exc}"
         logger.error("calculate_quantity for %s: %s", ticker, reason)
         return None, reason
 

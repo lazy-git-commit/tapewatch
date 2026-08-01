@@ -7,6 +7,142 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.11 — 2026-08-01 (NVT post-mortem: the system traded a stale price)
+
+Deep-dive on 2026-07-31 (1 trade, −£6.30). The loss is not the story — the
+resting stop took the *best* outcome available after entry. The story is that
+**both price feeds froze at the opening bell and the confirmation traded on a
+3-minute-old quote without knowing it.**
+
+What happened, in order:
+
+- Finnhub served the previous day's close — timestamped **1,051–1,092 minutes
+  old** — for every symbol asked, **SONY included**. Twelvedata's quote was
+  stuck at the 09:30 value, still 42 minutes stale at 10:11 ET. 153 stale-quote
+  warnings across 9 symbols. The v21.10 `stale_quote_feed` tripwire fired at
+  09:31:56, correctly, on its first live day.
+- NVT's quote then passed the 20-minute *coverage* check while carrying the
+  **09:33 bar's close ($167.37)**. Real tape at the 09:35:57 decision: ~$165.50
+  and falling.
+- Every gate agreed, because every gate was reading the same stale photograph:
+  momentum +1.74% (truly negative), RVOL 0.28 (truly >1 — the first minute
+  alone traded ~10% of an average day), VWAP "held" by $1.44 (price was *at*
+  VWAP). The low RVOL additionally triggered the size-neutral bypass — the rule
+  built for genuinely quiet mega-caps — so the participation gate excused
+  evidence that never existed.
+- Filled $166.13; stopped out **42 seconds later** at $162.32 (−2.29%).
+
+**The resting stop is the reason this was a small loss.** For all 42 seconds
+the monitor's polled price never moved off $167.37 (MFE +0.81%, MAE +0.75% —
+it never saw a negative price). A polled stop would not have fired. NVT was
+−6.80% at the 120-minute mark and −7.36% at the close.
+
+### Changed — entry gates
+
+- **`stale_price` (new gate 0).** `MAX_ENTRY_QUOTE_AGE_SECONDS` (90s) caps the
+  age of the quote an ENTRY is decided on. Deliberately separate from the
+  20-minute staleness guard: that one answers *"does any provider carry this
+  instrument?"* (failure ⇒ no coverage ⇒ strike toward a blacklist), this one
+  answers *"is this price safe to buy against right now?"* (failure ⇒ transient
+  reject, re-eval queue, **no strike**). RTH only — extended sessions expect a
+  lagging quote and deliberately substitute the fresher anchored bar close.
+  `get_quote_with_fallback()` gained a soft `prefer_fresher_than`: when the
+  primary lags the entry bar, the fallback is consulted and the fresher wins.
+- **`stale_volume` (new gate 5.5).** RVOL and the day move come from different
+  sources; when they disagree hard (|day move| ≥ 5% with RVOL < 0.5) the volume
+  side is lagging, not calm — a stock cannot reprice several percent on a
+  fraction of its normal volume. Defers instead of letting the bypass excuse
+  it. Placed *after* the extended-move ceiling so a permanently-too-big move
+  stays terminal rather than being re-queued forever. Thresholds are
+  conservative by design: the BMY case the bypass exists for (+2.1%, RVOL ~0.3)
+  is nowhere near them.
+- **`MAX_DAY_MOVE_PCT` 25% → 10%**, calibrated on all 24 closed trades. 25%
+  never bound on a real trade. 10% is the tightest ceiling that blocks only
+  losers — it removes CRCL (−3.97%), TMO (−2.03%) and NVT (−2.56%) and costs no
+  winner; 8% would also cut GRMN (+3.86%, entered at +9.99%). Mean P&L across
+  kept trades −0.91% → −0.57%. `cfg.validate()` now refuses a ceiling at or
+  below `TAKE_PROFIT_PCT`. n=20 is calibration, not proof.
+
+### Fixed — 44 news cycles a day stood down for a self-inflicted reason
+
+`/equity/account/cash` had three callers on independent schedules. APScheduler
+anchors every `IntervalTrigger` to process start and **5 min is an exact
+multiple of 1 min**, so the kill-switch call (`news_cycle`) and the
+`portfolio_snapshot` call landed on the same instant every fifth minute,
+forever — and T212 rejected one every time. `_fetch_cash()` had no retry, and
+for the kill switch a failed lookup means *stand the whole cycle down*.
+
+64 rejections on 2026-07-31; **44 of them killed an entire news cycle**. The
+trigger is the `if realized < 0` branch, so the system goes ~20% blind for the
+rest of the day precisely on days it has already lost money. Per-day counts
+confirm the mechanism: 07-27/28/30 (never negative) → 0; 07-29 (briefly
+negative) → 2; 07-31 (negative from 09:36) → 64.
+
+Fixed with a lock + short TTL cache (15s; 3s for order sizing) and one retry on
+a retryable status. **The lock is the actual fix** — it serializes the racers so
+the second finds a warm cache instead of issuing a competing request. This also
+absorbed the duplicated v21.7 retry that lived in `calculate_quantity`.
+
+### Fixed — MFE/MAE was wrong on exactly the trades that matter
+
+`max_adverse_pct = +0.75%` on a trade that closed −2.56% is an impossible row.
+Excursions only ever saw prices the *polling loop* observed, and a broker-side
+resting stop fills without the poller involved — so MAE was biased toward zero
+on every stop-out, the trades where "how much heat did this take?" is the whole
+question. `_record_exit_excursion()` now folds the realised exit price into the
+band on every close path. Rows where `max_adverse_pct > profit_loss_pct`
+predate this fix and must be excluded from analysis.
+
+### Fixed — liquid tickers blacklisted for a vendor outage
+
+The v21.6 scoping exempted extended-session misses; a *regular*-session
+provider freeze is a session where data is genuinely expected, so strikes still
+counted. Two RTH signals (GTES, IRMD) were blacklisted for the day and four of
+nine pre-market candidates expired as "no quote after 3 consecutive retries" —
+all liquid, fully-covered names. The system already **detected** the freeze
+(`stale_quote_feed`, 09:31:56); the blacklist was not listening.
+`quote_feed_degraded()` now exposes the live streak, and both strike sites skip
+the strike while any feed is frozen. It reads the current streak, not the
+once-per-process alert latch, so one outage cannot suppress strikes all day.
+
+### Fixed — phantom tickers
+
+`resolve_t212_ticker()` fell back to `<symbol>_US_EQ` for anything missing from
+the T212 instrument map. Since that map is the complete USD catalogue, an
+absent symbol is not tradeable and the guess can only produce a phantom.
+Benzinga tagged a Moog article with both `MOG.A` (real) and `MOG` (Moog trades
+as MOG.A/MOG.B); `MOG_US_EQ` then burned quote retries all morning. Absent
+symbols are now dropped; the fallback still applies when the map is empty.
+
+### Observability
+
+Grafana: MFE/MAE columns added to **Trade History** (plus a `left_on_table_pct`
+column: MFE minus what was banked) and **Open Trades**; new panel **"Exit
+Efficiency: MFE vs realised"** — the panel v21.10's instrumentation was shipped
+for. Rejection-funnel description now names the two data-state codes so a spike
+in them reads as "the feed is behind", not "the market was quiet".
+
+Docs: `docs/database_schema.md` was four versions behind — added `session`
+(v21.1), `stop_order_id`/`ratchet_armed` (v20/v20.1), the MFE/MAE block
+(v21.10) and the v21.3 forward-return horizons. `docs/algorithm.md` gained the
+two-staleness-questions table, volume plausibility, day-move calibration, the
+scheduler-collision post-mortem and the MFE/MAE section.
+
+### Tests
+
+`TestEntryPriceFreshness`, `TestVolumePlausibility`, `TestDayMoveCeiling`,
+`TestCashCacheCollision` (including a real 4-thread concurrency test asserting
+one HTTP call), `TestPhantomTickerDropped`, `TestExitExcursionRecorded`,
+`TestProviderOutageDoesNotBlacklistTickers`. 374 pass.
+
+Two existing fixtures were corrected rather than worked around: `TestRvolBypass`
+and `TestSessionVolumeGates` used `pc=10.0` (+5.0% on the day) with near-zero
+RVOL — a combination the new plausibility gate correctly calls a data artifact.
+Both now use `pc=10.28` (+2.14%), which is what the BMY incident they document
+actually was.
+
+---
+
 ## v21.10 — 2026-07-31 (MFE/MAE instrumentation; two undetected-outage tripwires)
 
 Deep-dive on the 2026-07-30 session (2 trades, +$0.94 net) produced one

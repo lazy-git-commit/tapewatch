@@ -49,6 +49,7 @@ One row per open or closed trade. A row is inserted when a buy order is placed (
 | `ticker` | TEXT | Trading 212 instrument code (e.g. `AMZN_US_EQ`). |
 | `signal_id` | INTEGER FK | Foreign key to `news_signals.id` — the article that triggered this trade. |
 | `status` | TEXT | `"open"` while the position is held; `"closed"` once sold. |
+| `session` | TEXT | **(v21.1)** The trading session the ENTRY fired in: `premarket`, `regular`, `afterhours`. Enables per-session P&L reporting ("is after-hours worth trading?"). |
 
 ### Buy side (filled on order placement)
 
@@ -69,8 +70,10 @@ One row per open or closed trade. A row is inserted when a buy order is placed (
 | `sell_price` | REAL | Actual fill price in USD at the time of sale. |
 | `sell_time` | TEXT | ISO 8601 timestamp (London time, BST/GMT) of when the sell order was placed. |
 | `sell_order_id` | TEXT | Trading 212 order ID for the sell. |
-| `tp_order_id` | TEXT | Order ID of the resting take-profit LIMIT sell placed at buy time. Cleared (NULL) if cancelled before a stop/time-stop exit. The monitor checks this order's status each cycle to detect take-profit fills. |
-| `exit_reason` | TEXT | Why the position was closed: `"take_profit"`, `"stop_loss"`, `"time_stop"`, or `"eod_flatten"` (forced close before the bell — day-trading systems never hold overnight). |
+| `stop_order_id` | TEXT | **(v20)** Order ID of the resting STOP-market sell placed at buy time. This is the current architecture: the loss side rests at the broker (zero latency, and — proven on 2026-07-31 — independent of whether *our* price feed is working), while take-profit and time-stop are polled. Cleared (NULL) when cancelled/replaced by the breakeven ratchet. |
+| `tp_order_id` | TEXT | **(legacy, pre-v20)** Order ID of the resting take-profit LIMIT sell. The v20 inversion replaced this with `stop_order_id`; only trades opened before v20 still carry it, and they keep the old handling until they close. |
+| `ratchet_armed` | INTEGER | **(v20.1)** 1 once the breakeven ratchet has fired (stop moved up to roughly break-even after +`RATCHET_TRIGGER_PCT`). Persisted on the row rather than in memory so a restart mid-position cannot re-arm and cancel a good stop. |
+| `exit_reason` | TEXT | Why the position was closed: `"take_profit"`, `"stop_loss"`, `"time_stop"`, `"eod_flatten"` (forced close before the bell — day-trading systems never hold overnight), or `"afterhours_flatten"` (v21, the extended-session equivalent at 19:45 ET). |
 | `sell_net_gbp` | REAL | GBP amount credited back to the account from this sale, net of FX conversion and fees, as reported by Trading 212. |
 | `sell_fx_rate` | REAL | USD/GBP exchange rate applied by Trading 212 at the time of the sell fill. |
 | `sell_fees_gbp` | REAL | Total transaction costs charged by Trading 212 on the sell, in GBP. |
@@ -81,6 +84,38 @@ One row per open or closed trade. A row is inserted when a buy order is placed (
 |---|---|---|
 | `profit_loss` | REAL | Realised profit or loss in GBP. Computed as `abs(sell_net_gbp) - abs(buy_net_gbp)` when both GBP values are available, so broker wallet-impact sign conventions cannot corrupt P&L or the daily kill switch. Falls back to `(sell_price - buy_price) × quantity` in USD terms for historical rows that pre-date GBP fill capture. |
 | `profit_loss_pct` | REAL | P&L as a percentage of the cost basis. Computed as `profit_loss / abs(buy_net_gbp) × 100` when GBP data is available, otherwise `(sell_price - buy_price) / buy_price × 100`. |
+
+### Excursion / MFE-MAE (v21.10)
+
+**Maximum Favourable Excursion** and **Maximum Adverse Excursion** — in plain
+terms, *how far up did this position go before I sold, and how far down did it
+dip*. Both are percentages relative to `buy_price`.
+
+**Pure observability: no exit decision reads these columns.** They exist to
+make the trailing-stop-versus-flat-time-stop question answerable from our own
+record, instead of from a simulation capped by yfinance's ~30-day 1-minute bar
+retention (that simulation gave +0.51%/trade with a 95% confidence interval of
+[−0.38, +1.30] over 8 trades — too wide to act on).
+
+Written by `monitor/position_monitor.py::_record_excursion` via
+`update_trade_excursion()`, which widens the band in SQL with
+`GREATEST`/`LEAST`, so it stays correct across restarts and out-of-order
+writes. An in-process cache means a DB write happens only on a genuinely new
+extreme, not on every 5-second poll.
+
+| Column | Type | Description |
+|---|---|---|
+| `max_favorable_pct` | REAL | Best unrealised gain the position reached while open, in % from `buy_price`. NULL for trades that closed before v21.10 (2026-07-31). |
+| `max_adverse_pct` | REAL | Worst unrealised loss the position reached while open, in % from `buy_price`. |
+
+**v21.11 correction — read older rows with care.** Until v21.11 these columns
+recorded only prices the *polling loop* observed, and a broker-side resting
+stop fills without the poller involved. NVT (trade 24, 2026-07-31) closed at
+−2.56% while carrying `max_adverse_pct = +0.75%` — an impossible row, because
+the last polled quote was frozen and the real −2.29% fill was never fed in.
+v21.11 folds the realised exit price into the band on every close path
+(`_record_exit_excursion`), so from that point MAE is bounded by the actual
+outcome. Any row where `max_adverse_pct > profit_loss_pct` predates the fix.
 
 ---
 
@@ -120,6 +155,9 @@ and prompt changes measurable (see `docs/algorithm.md` §9 for the queries).
 | `fwd_return_5m` | REAL | % price change in the 5 minutes after publication. NULL until computed; stays NULL if price data unavailable. |
 | `fwd_return_15m` | REAL | % price change in the 15 minutes after publication. |
 | `fwd_return_60m` | REAL | % price change in the 60 minutes after publication. |
+| `fwd_return_120m` | REAL | **(v21.3)** % price change 120 minutes after publication. Added because the 60-minute panel showed the tradeable-catalyst edge still *climbing* at 60 min — i.e. the old 60-minute time-stop was clipping the move mid-catalyst. This column is what sized the hold at 120 min (v21.8). |
+| `fwd_return_eod` | REAL | **(v21.3)** % price change from publication to that session's close — the upper bound on what a same-day hold could have captured. |
+| `catalyst_magnitude` | INTEGER | Claude's 1–5 size rating for the catalyst. Gated by `MIN_CATALYST_MAGNITUDE`. |
 | `returns_computed_at` | TEXT | When the nightly job processed this row. NULL = pending. |
 
 ---
@@ -180,7 +218,7 @@ automatically from `event_type`.
 | Column | Type | Description |
 |---|---|---|
 | `id` | SERIAL PK | Auto-incrementing primary key. |
-| `event_type` | TEXT | Machine-readable event key. Critical: `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`, `zero_trade_session`. Warning: `claude_outage`. |
+| `event_type` | TEXT | Machine-readable event key. Critical: `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`, `zero_trade_session`. Warning: `claude_outage`, `twelvedata_prepost_unavailable` (v21.6), `finnhub_outage` (v21.10), `stale_quote_feed` (v21.10 — a provider serving a run of frozen quotes; fired for real on its first live day, 2026-07-31, four minutes before the NVT entry). |
 | `severity` | TEXT | `"critical"` or `"warning"`. |
 | `detail` | TEXT | Human-readable context (e.g. credits used at exhaustion, drought session count). |
 | `created_at` | TIMESTAMPTZ | When the event was first recorded. |
