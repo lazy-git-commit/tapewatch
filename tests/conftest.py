@@ -38,8 +38,9 @@ def _reset_process_level_state():
     # otherwise be served to the next, hiding whatever _get mock it installed.
     ex._cash_cache = None
 
-    # Frozen-feed tripwire (v21.10)
+    # Frozen-feed tripwire (v21.10; distinct-symbol set added v21.12)
     pc._stale_quote_streak.clear()
+    pc._stale_quote_symbols.clear()
     pc._stale_quote_reported.clear()
 
     # MFE/MAE excursion cache (v21.10)

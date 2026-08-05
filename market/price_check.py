@@ -328,36 +328,72 @@ _VOLUME_PLAUSIBILITY_MIN_RVOL = 0.5       # ...must not come with RVOL below thi
 # retry-with-backoff if the DB is also degraded. One attempt per source keeps
 # a database problem from ever slowing the price-fetch loop.
 _STALE_QUOTE_ALERT_THRESHOLD = 10
+
+# v21.12 — a streak alone is NOT enough: it must span several DISTINCT symbols.
+# 2026-08-04: MZDAY (Mazda's OTC ADR, a security so thin its entire day spanned
+# $3.38-$3.55) sat in the re-eval queue and was polled 221 times. Ten of those
+# in a row tripped this detector on BOTH providers — Twelvedata at 09:33 ET,
+# Finnhub at 09:51 — while the feeds were perfectly healthy: BE was quoted
+# correctly two minutes later and traded normally all session.
+#
+# The false alarm is not merely noise, it closes a loop. quote_feed_degraded()
+# suppresses the no-quote strikes that would eventually blacklist a dead ticker
+# (deliberately — that is the whole v21.11 fix). So MZDAY tripped the alarm,
+# the alarm protected MZDAY from being blacklisted, and MZDAY kept being polled
+# to trip the alarm again. All day.
+#
+# Requiring N distinct symbols keeps the original protection intact: on
+# 2026-07-31 the real outage served the previous day's close for EVERY symbol
+# asked, SONY included, so it clears a distinct-symbol bar trivially. One dead
+# ticker polled in a loop never can.
+_STALE_QUOTE_MIN_DISTINCT_SYMBOLS = 3
+
 _stale_quote_streak: dict[str, int] = {}
+_stale_quote_symbols: dict[str, set[str]] = {}
 _stale_quote_reported: set[str] = set()
+
+
+def _feed_looks_frozen(source: str) -> bool:
+    """A long stale streak spanning enough distinct symbols to be the provider."""
+    return (
+        _stale_quote_streak.get(source, 0) >= _STALE_QUOTE_ALERT_THRESHOLD
+        and len(_stale_quote_symbols.get(source, ())) >= _STALE_QUOTE_MIN_DISTINCT_SYMBOLS
+    )
 
 
 def _note_quote_fresh(source: str) -> None:
     """A usable, current quote arrived — the feed is alive."""
     if _stale_quote_streak.get(source):
         _stale_quote_streak[source] = 0
+    # Clear the symbol set with the streak, or a provider that alternates
+    # fresh/stale readings would accumulate distinct symbols indefinitely and
+    # eventually clear the bar without ever having been frozen.
+    if _stale_quote_symbols.get(source):
+        _stale_quote_symbols[source] = set()
 
 
 def _note_quote_stale(source: str, symbol: str, age_minutes: float) -> None:
     """Count a stale reading and shout once when the streak looks systemic."""
     streak = _stale_quote_streak.get(source, 0) + 1
     _stale_quote_streak[source] = streak
-    if streak < _STALE_QUOTE_ALERT_THRESHOLD or source in _stale_quote_reported:
+    _stale_quote_symbols.setdefault(source, set()).add(symbol)
+    if not _feed_looks_frozen(source) or source in _stale_quote_reported:
         return
     _stale_quote_reported.add(source)
+    distinct = len(_stale_quote_symbols.get(source, ()))
     logger.error(
-        "%s has served %d consecutive STALE quotes with no fresh one in "
-        "between (most recent: %s, %.0f min old) — this is a frozen provider "
-        "feed, not a quiet ticker. Price-dependent exits (polled take-profit, "
-        "polled stop) are degraded until it recovers.",
-        source, _STALE_QUOTE_ALERT_THRESHOLD, symbol, age_minutes,
+        "%s has served %d consecutive STALE quotes across %d DISTINCT symbols "
+        "with no fresh one in between (most recent: %s, %.0f min old) — this is "
+        "a frozen provider feed, not a quiet ticker. Price-dependent exits "
+        "(polled take-profit, polled stop) are degraded until it recovers.",
+        source, streak, distinct, symbol, age_minutes,
     )
     try:
         from storage.database import record_system_event
         record_system_event(
             "stale_quote_feed",
-            f"{source}: {_STALE_QUOTE_ALERT_THRESHOLD} consecutive stale quotes "
-            f"(most recent {symbol}, {age_minutes:.0f} min old)",
+            f"{source}: {streak} consecutive stale quotes across {distinct} "
+            f"distinct symbols (most recent {symbol}, {age_minutes:.0f} min old)",
         )
     except Exception as exc:
         logger.debug("Could not record stale_quote_feed system_event: %s", exc)
@@ -377,11 +413,12 @@ def quote_feed_degraded() -> bool:
     IRMD) were blacklisted for the session as "no coverage" while Finnhub
     was serving the previous day's close for every symbol it was asked
     about, SONY included.
+
+    v21.12: the streak must also span _STALE_QUOTE_MIN_DISTINCT_SYMBOLS —
+    otherwise ONE dead ticker polled in a loop declares the provider frozen and
+    thereby protects itself from ever being blacklisted (MZDAY, 2026-08-04).
     """
-    return any(
-        streak >= _STALE_QUOTE_ALERT_THRESHOLD
-        for streak in _stale_quote_streak.values()
-    )
+    return any(_feed_looks_frozen(source) for source in _stale_quote_streak)
 
 
 def quote_age_seconds(quote: dict) -> float | None:

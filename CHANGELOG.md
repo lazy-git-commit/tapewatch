@@ -7,6 +7,110 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.12 — 2026-08-05 (BE post-mortem: traded a recap; two guards mis-scoped)
+
+Deep-dive on 2026-08-04 (1 trade, −£7.04). Three findings, only one of which
+cost money — but all three are failures of *scoping*: a filter that didn't
+cover a template, a detector counting the wrong thing, and a retry budget set
+one attempt too low.
+
+**The trade.** Bloom Energy, bought $228.99 at 09:35:51 ET, resting stop filled
+$223.25 at 09:42:49. Realised −2.82% (−2.51% at price level; the remaining
+0.31pp is Trading 212's 0.15% FX conversion fee charged each way — worth
+knowing, it lifts the break-even win rate for +5%/−2% from 28.6% to 33.0%).
+
+The entry came from this headline:
+
+> *"Bloom Energy Stock Charges Higher Tuesday: What's Driving the Post-Earnings Rally?"*
+
+That is not news. It is a Benzinga **explainer** — an article about a move that
+had already happened. Claude scored it `guidance_raise` / positive / conf 0.75
+with **`already_moved` = FALSE**, while the headline says in its own words that
+the rally was underway; the stock was already +3.99% on the day at entry.
+`already_moved` is the one field that would have blocked the trade.
+
+Two things this was NOT, both checked and ruled out:
+- **Not entry slippage.** We approved at $227.04 and filled at $228.99 (+0.86%
+  in 4 seconds — a legitimate fill, the 09:35 bar's high was $229.14). Re-run at
+  the un-slipped price, the trade still stops out at −2.00%, one minute later.
+- **Not a bad day for the gate set.** The eight rejected signals were simulated
+  against real 1-minute bars: ROK, SYY, TDG, XGN, NVO and VOYG would all have
+  been −2.00% stop-outs; only CTRI reached +5% (and it was rejected on a 3.85%
+  spread proxy, then closed −12.57%). **Six losses avoided, one soft winner
+  missed — net +7pp saved,** more than the trade lost.
+
+### Changed — news filtering
+
+- **`_EXPLAINER_RE` (`news/fetcher.py`)** — a third pre-Claude headline filter,
+  alongside `_ANALYST_ACTION_RE` and `_DIGEST_RE`. Explainer/recap templates
+  (*"What's Driving…"*, *"Here's Why…"*, *"…Stock Charges Higher"*, *"…Shares
+  Are Trading Higher"*, *"post-earnings rally"*) never reach the classifier.
+  Same reasoning as the v20 digest filter: a deterministic title check beats
+  hoping the model reads through a template it has demonstrably misread.
+  Validated against **2,415 real scored headlines** (2026-07-25 → 2026-08-04):
+  49 matches (2.0%), **zero false positives**, and exactly **one** of the 49 had
+  scored positive — the Bloom Energy article above.
+
+### Changed — frozen-feed detection
+
+- **A stale streak must now span `_STALE_QUOTE_MIN_DISTINCT_SYMBOLS` (3)
+  distinct symbols** before a provider is declared frozen
+  (`market/price_check.py`). MZDAY — Mazda's OTC ADR, whose entire 2026-08-04
+  range was $3.38–$3.55 — sat in the re-eval queue and was polled **221 times**;
+  ten in a row tripped the tripwire on **both** providers (Twelvedata 09:33 ET,
+  Finnhub 09:51) while the feeds were healthy: BE was quoted correctly two
+  minutes later and traded all session.
+- This was not just noise, it closed a loop. `quote_feed_degraded()` suppresses
+  the no-quote strikes that would blacklist a dead ticker — deliberately, that
+  is the whole v21.11 fix. So MZDAY tripped the alarm, the alarm protected MZDAY
+  from being blacklisted, and MZDAY kept polling to re-trip it. All day.
+- The original protection is intact: on 2026-07-31 the real outage served the
+  previous day's close for **every** symbol asked, SONY included, so it clears a
+  distinct-symbol bar trivially. `_note_quote_fresh()` clears the symbol set
+  with the streak, so a feed alternating fresh/stale can't accumulate its way
+  over the bar.
+
+### Changed — Claude empty-batch handling
+
+- **Retry budget 2 → `_EMPTY_BATCH_ATTEMPTS` (3), with a 2s backoff between
+  attempts**, and a **`claude_empty_batch` system_event when all are exhausted**
+  (`news/fetcher.py`). The v21.7 single retry is not enough: on 2026-08-04, **25
+  consecutive cycles** across two windows (07:00–07:18 and 07:31–07:36 ET) saw
+  both the call and its retry return an empty `classifications` list.
+- The unscored backlog grew `10 → 19 → 27 → 35 → 36` and then shrank again as
+  articles **aged out of the freshness window unscored** — discarded without
+  ever being evaluated.
+- Impact was contained only because both windows fell before the 08:00 ET
+  watchlist build. The same 25 minutes landing on 09:30–09:55 would blind the
+  system through its most productive window — and **nothing recorded a
+  system_event**, so it was invisible to Grafana and to every monitoring surface
+  except a journal grep. Worst case is now ~30s, inside the 60s news cycle.
+- A missing `tool_use` block is a *parsing* failure, not an empty batch, and
+  still returns immediately without burning the retry budget.
+
+### Verified this release (not changed)
+
+- **The v21.11 cash-collision fix works.** 2026-08-04 is the first day since it
+  shipped on which realised P&L went negative — the only condition under which
+  `main.py` calls the rate-limited cash endpoint every cycle. 31 July: 64
+  rejections, 44 news cycles stood down. 4 August: **0 rejections, 0 stand-downs,
+  0 cash errors.**
+- **The v21.11 outage guard works.** Zero tickers blacklisted despite the feed
+  alarm firing (see above for why it fired at all).
+- **The v21.11 exit-excursion fix works.** Trade 25 recorded MAE −2.51%,
+  correctly folding in the realised stop fill; trade 24 had an impossible
+  +0.75%. ⚠️ **Analysis filter correction:** use `sell_time >= '2026-08-01'`, NOT
+  `max_adverse_pct <= profit_loss_pct` — MFE/MAE are gross *price* moves while
+  `profit_loss_pct` is net of FX fees, so that comparison wrongly discards valid
+  rows.
+- **The resting stop earned its keep again.** During the exit the polled feed
+  ran a full minute behind: at 09:41 the monitor read $229.22 when the bar range
+  was $225.01–$227.79, and at 09:42 it read $227.30 against $223.51–$226.23 —
+  both readings *outside* the actual bar. A polled stop would have held while BE
+  fell to $219.21 (−4.3%).
+
+---
+
 ## v21.11 — 2026-08-01 (NVT post-mortem: the system traded a stale price)
 
 Deep-dive on 2026-07-31 (1 trade, −£6.30). The loss is not the story — the

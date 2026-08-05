@@ -611,16 +611,20 @@ class TestSentimentScoring:
 
 class TestEmptyClassificationsRetry:
     """
-    Tests for news/fetcher.py::_batch_score_sentiment — one retry when Claude
+    Tests for news/fetcher.py::_batch_score_sentiment — retries when Claude
     returns a well-formed but EMPTY classifications list for a non-empty batch.
 
-    Observed twice at the exact first news_cycle tick after a session boundary
-    (2026-07-27 16:06-16:12 ET regular→afterhours, 2026-07-28 07:00-07:07 ET
-    premarket scan start): 6-8 consecutive 200-OK forced-tool-use calls each
-    returned []. Because _mark_scored only fires on a successful score, the
-    backlog of unscored articles grew every cycle with no bound but
-    max_age_minutes. A real catalyst published in that window risks going
-    unscored and untraded with nothing but a WARNING in the logs.
+    Observed at the first news_cycle tick after a session boundary (2026-07-27
+    16:06-16:12 ET regular→afterhours, 2026-07-28 07:00-07:07 ET premarket scan
+    start): 6-8 consecutive 200-OK forced-tool-use calls each returned [].
+    Because _mark_scored only fires on a successful score, the backlog of
+    unscored articles grew every cycle with no bound but max_age_minutes. A real
+    catalyst published in that window risks going unscored and untraded with
+    nothing but a WARNING in the logs.
+
+    v21.12 raised the budget from 2 attempts to _EMPTY_BATCH_ATTEMPTS after
+    2026-08-04, when 25 consecutive cycles saw BOTH the call and its single
+    retry come back empty. See TestEmptyBatchRetryAndAlert for the alerting.
     """
 
     def _mock_tool_response(self, classifications: list[dict]) -> MagicMock:
@@ -634,8 +638,9 @@ class TestEmptyClassificationsRetry:
     def _article(self, id="1", headline="Earnings beat", teaser="Revenue up"):
         return {"id": id, "headline": headline, "teaser": teaser}
 
+    @patch("news.fetcher.time.sleep")
     @patch("news.fetcher._claude")
-    def test_empty_then_populated_recovers_on_retry(self, mock_claude):
+    def test_empty_then_populated_recovers_on_retry(self, mock_claude, _sleep):
         from news.fetcher import _batch_score_sentiment
         mock_claude.messages.create.side_effect = [
             self._mock_tool_response([]),
@@ -648,12 +653,16 @@ class TestEmptyClassificationsRetry:
         assert mock_claude.messages.create.call_count == 2
         assert scores["1"]["sentiment"] == "positive"
 
+    @patch("news.fetcher.time.sleep")
+    @patch("news.fetcher._record_claude_event")
     @patch("news.fetcher._claude")
-    def test_empty_twice_gives_up_and_returns_empty(self, mock_claude):
-        from news.fetcher import _batch_score_sentiment
+    def test_empty_on_every_attempt_gives_up_and_returns_empty(
+        self, mock_claude, _evt, _sleep
+    ):
+        from news.fetcher import _batch_score_sentiment, _EMPTY_BATCH_ATTEMPTS
         mock_claude.messages.create.return_value = self._mock_tool_response([])
         scores = _batch_score_sentiment([self._article()])
-        assert mock_claude.messages.create.call_count == 2
+        assert mock_claude.messages.create.call_count == _EMPTY_BATCH_ATTEMPTS
         assert scores == {}
 
     @patch("news.fetcher._claude")
@@ -2977,16 +2986,22 @@ class TestStaleQuoteFeedTripwire:
     def setup_method(self):
         import market.price_check as pc
         pc._stale_quote_streak.clear()
+        pc._stale_quote_symbols.clear()
 
     teardown_method = setup_method
+
+    @staticmethod
+    def _symbols(n):
+        """Distinct symbols — a real provider freeze hits every name asked."""
+        return [f"SYM{i}" for i in range(n)]
 
     @patch("storage.database.record_system_event")
     def test_streak_of_stale_quotes_fires_once(self, mock_evt):
         import time as _t
         import market.price_check as pc
         old = {"t": _t.time() - 3600}  # 60 min old
-        for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD + 3):
-            assert pc._quote_is_stale("FSS", old, "Twelvedata") is True
+        for sym in self._symbols(pc._STALE_QUOTE_ALERT_THRESHOLD + 3):
+            assert pc._quote_is_stale(sym, old, "Twelvedata") is True
         assert mock_evt.call_count == 1
         assert mock_evt.call_args.args[0] == "stale_quote_feed"
 
@@ -3000,8 +3015,8 @@ class TestStaleQuoteFeedTripwire:
         old = {"t": _t.time() - 3600}
         fresh = {"t": _t.time()}
         for _cycle in range(2):
-            for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD + 1):
-                pc._quote_is_stale("FSS", old, "Twelvedata")
+            for sym in self._symbols(pc._STALE_QUOTE_ALERT_THRESHOLD + 1):
+                pc._quote_is_stale(sym, old, "Twelvedata")
             pc._quote_is_stale("FSS", fresh, "Twelvedata")  # recovery
         assert mock_evt.call_count == 1
 
@@ -3011,10 +3026,14 @@ class TestStaleQuoteFeedTripwire:
         import market.price_check as pc
         old = {"t": _t.time() - 3600}
         fresh = {"t": _t.time()}
-        for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD - 1):
-            pc._quote_is_stale("FSS", old, "Twelvedata")
+        for sym in self._symbols(pc._STALE_QUOTE_ALERT_THRESHOLD - 1):
+            pc._quote_is_stale(sym, old, "Twelvedata")
         assert pc._quote_is_stale("FSS", fresh, "Twelvedata") is False
         assert pc._stale_quote_streak["Twelvedata"] == 0
+        # The distinct-symbol set must clear WITH the streak, or a feed that
+        # alternates fresh/stale would accumulate symbols until it eventually
+        # cleared the bar without ever having been frozen (v21.12).
+        assert not pc._stale_quote_symbols["Twelvedata"]
         mock_evt.assert_not_called()
 
     @patch("storage.database.record_system_event")
@@ -4365,8 +4384,262 @@ class TestProviderOutageDoesNotBlacklistTickers:
         # soon as a usable quote arrives, or one outage would suppress
         # strikes for the rest of the day.
         import market.price_check as pc
-        for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD):
-            pc._note_quote_stale("Finnhub", "ACME", 1051)
+        for i in range(pc._STALE_QUOTE_ALERT_THRESHOLD):
+            pc._note_quote_stale("Finnhub", f"SYM{i}", 1051)
         assert pc.quote_feed_degraded() is True
         pc._note_quote_fresh("Finnhub")
         assert pc.quote_feed_degraded() is False
+
+
+# ── v21.12 (2026-08-04 post-mortem) ──────────────────────────────────────────
+
+class TestExplainerHeadlineFilter:
+    """
+    v21.12: an article ABOUT a price move that already happened is not the
+    catalyst that caused it. Trade #25 (BE, 2026-08-04, −2.82%, the only trade
+    of the day) came from "Bloom Energy Stock Charges Higher Tuesday: What's
+    Driving the Post-Earnings Rally?" — scored guidance_raise / positive /
+    conf 0.75 with already_moved=FALSE, while the headline says in its own
+    words that the rally was underway and the stock was already +3.99% on the
+    day when we bought it.
+    """
+
+    # Real headlines from the scored corpus (2026-07-25 → 2026-08-04).
+    EXPLAINERS = [
+        "Bloom Energy Stock Charges Higher Tuesday: What's Driving the Post-Earnings Rally?",
+        "What's Going On With Applied Digital Stock Today?",
+        "Why Tower Semiconductor Stock Is Surging Today: TSEM Beats Q2 Earnings",
+        "Philips Stock Sinks To 52-Week Low - Here's Why",
+        "What's Behind the Amazon Stock Bounce Ahead of Q2 Earnings?",
+        "Moleculin Biotech Stock Is Sinking Friday: What's Going On?",
+        "Robinhood Stock is Pulling Back: What's Happening Today?",
+        "Nokia Stock Rallies Tuesday: What's Driving the Rebound?",
+        "ServiceNow Stock Powers Higher Tuesday: What's Driving the Move?",
+        "Ford Motor Stock Dips Friday: What's Driving the Post-Earnings Reset?",
+    ]
+
+    # Genuine single-stock catalysts — these MUST survive the filter, because a
+    # false positive here is a silently-missed trade with no eval-loop trace.
+    CATALYSTS = [
+        "Bloom Energy Raises FY2026 Revenue Guidance To $2.0B From $1.8B",
+        "Mazda Motor Affirms FY2027 GAAP EPS Guidance of $0.46 vs $0.42 Est",
+        "FDA Approves Acme Pharma's Lead Candidate For Advanced Melanoma",
+        "TransDigm Q3 Adj. EPS $10.87 Beats $10.30 Estimate, Sales $2.741B",
+        "Voyager Boosts Forecast After Astrobotic Acquisition Success",
+        "Grab Delivers Strong GMV, Raises Outlook",
+        "Aehr Test Systems Receives Follow-On Production Order From Lead Customer",
+        "Novo Nordisk Raises 2026 Adj Sales, Operating Profit Outlook",
+        "Acme Provides Market Update On Phase 3 Results",
+        "Acme Announces $500M Share Repurchase Program",
+    ]
+
+    def test_explainer_headlines_match(self):
+        from news.fetcher import _EXPLAINER_RE
+        for h in self.EXPLAINERS:
+            assert _EXPLAINER_RE.search(h), f"should have matched: {h}"
+
+    def test_genuine_catalysts_do_not_match(self):
+        from news.fetcher import _EXPLAINER_RE
+        for h in self.CATALYSTS:
+            assert not _EXPLAINER_RE.search(h), f"false positive: {h}"
+
+    def test_the_bloom_energy_article_never_reaches_claude(self):
+        """End-to-end: the article that produced trade #25 must be dropped in
+        the pre-Claude filter pass, not merely scored and gated later."""
+        from news.fetcher import _EXPLAINER_RE, _DIGEST_RE, _ANALYST_ACTION_RE
+        h = self.EXPLAINERS[0]
+        # It slipped the two pre-existing filters — that is why it was traded.
+        assert not _DIGEST_RE.search(h)
+        assert not _ANALYST_ACTION_RE.search(h)
+        assert _EXPLAINER_RE.search(h)
+
+    def test_null_headline_does_not_crash(self):
+        """The feed can send an explicit null title (see the `or ""` at the
+        call site) — the regex must never be handed None."""
+        from news.fetcher import _EXPLAINER_RE
+        assert not _EXPLAINER_RE.search("")
+
+
+class TestFrozenFeedNeedsDistinctSymbols:
+    """
+    v21.12: a stale STREAK is not a frozen provider unless it spans several
+    DISTINCT symbols. 2026-08-04: MZDAY (Mazda's OTC ADR) sat in the re-eval
+    queue and was polled 221 times; ten in a row tripped the tripwire on BOTH
+    providers while the feeds were healthy (BE quoted correctly two minutes
+    later). The false alarm closed a loop — quote_feed_degraded() suppresses
+    the strikes that would blacklist a dead ticker, so MZDAY protected itself
+    from ever being blacklisted and kept polling to re-trip the alarm.
+    """
+
+    def setup_method(self):
+        import market.price_check as pc
+        pc._stale_quote_streak.clear()
+        pc._stale_quote_symbols.clear()
+        pc._stale_quote_reported.clear()
+
+    teardown_method = setup_method
+
+    @patch("storage.database.record_system_event")
+    def test_one_dead_ticker_polled_in_a_loop_is_not_a_frozen_feed(self, mock_evt):
+        import market.price_check as pc
+        # Far past the streak threshold, but always the same instrument.
+        for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD * 5):
+            pc._note_quote_stale("Twelvedata", "MZDAY", 1444)
+        assert pc.quote_feed_degraded() is False
+        mock_evt.assert_not_called()
+
+    @patch("storage.database.record_system_event")
+    def test_a_real_outage_across_symbols_still_fires(self, mock_evt):
+        """2026-07-31: both feeds served the previous day's close for EVERY
+        symbol asked, SONY included — that clears a distinct-symbol bar
+        trivially, so the original protection must be intact."""
+        import market.price_check as pc
+        for i in range(pc._STALE_QUOTE_ALERT_THRESHOLD):
+            pc._note_quote_stale("Finnhub", f"SYM{i}", 1051)
+        assert pc.quote_feed_degraded() is True
+        assert mock_evt.call_count == 1
+        assert mock_evt.call_args.args[0] == "stale_quote_feed"
+
+    @patch("storage.database.record_system_event")
+    def test_distinct_symbols_alone_are_not_enough(self, mock_evt):
+        """Both bars must be cleared — a handful of illiquid names is not a
+        provider outage either."""
+        import market.price_check as pc
+        assert pc._STALE_QUOTE_MIN_DISTINCT_SYMBOLS < pc._STALE_QUOTE_ALERT_THRESHOLD
+        for i in range(pc._STALE_QUOTE_MIN_DISTINCT_SYMBOLS):
+            pc._note_quote_stale("Finnhub", f"SYM{i}", 900)
+        assert pc.quote_feed_degraded() is False
+        mock_evt.assert_not_called()
+
+    def test_symbol_set_clears_on_recovery(self):
+        """Otherwise a feed alternating fresh/stale accumulates distinct
+        symbols forever and eventually clears the bar without ever freezing."""
+        import market.price_check as pc
+        for i in range(pc._STALE_QUOTE_MIN_DISTINCT_SYMBOLS + 1):
+            pc._note_quote_stale("Finnhub", f"SYM{i}", 900)
+        pc._note_quote_fresh("Finnhub")
+        assert not pc._stale_quote_symbols["Finnhub"]
+        assert pc._stale_quote_streak["Finnhub"] == 0
+
+    @patch("storage.database.record_system_event")
+    def test_mzday_scenario_leaves_the_ticker_blacklistable(self, mock_evt):
+        """The point of the fix: with the feed correctly judged healthy, a
+        genuinely un-quotable ticker can accumulate strikes again."""
+        import main
+        import market.price_check as pc
+        main._no_quote_ticker_strikes.clear()
+        main._no_quote_blackout.clear()
+        for _ in range(pc._STALE_QUOTE_ALERT_THRESHOLD * 3):
+            pc._note_quote_stale("Twelvedata", "MZDAY", 1444)
+        assert pc.quote_feed_degraded() is False
+
+        import pytz as _pytz
+        from news.fetcher import NewsItem
+        item = NewsItem(
+            article_id="a1", ticker="MZDAY_US_EQ", headline="h", body="",
+            source="s", published_at=datetime.now(_pytz.utc),
+            sentiment="positive", confidence=0.8,
+            catalyst_type="guidance_raise", already_moved=False,
+            catalyst_magnitude=3,
+        )
+        for _ in range(main._NO_QUOTE_BLACKOUT_RETRIES):
+            main._queue_retry(item)
+        assert "MZDAY_US_EQ" in main._no_quote_blackout
+
+
+class TestEmptyBatchRetryAndAlert:
+    """
+    v21.12: the v21.7 SINGLE retry is not enough. 2026-08-04: 25 news cycles
+    across two windows (07:00-07:18 and 07:31-07:36 ET) where BOTH the first
+    call and its retry returned an empty classifications list. The unscored
+    backlog grew 10 → 36 articles and then shrank as they aged out of the
+    freshness window UNSCORED — and nothing recorded a system_event, so the
+    25-minute blind spot was invisible to every monitoring surface.
+    """
+
+    def _tool_msg(self, classifications):
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": classifications}
+        msg = MagicMock()
+        msg.content = [block]
+        return msg
+
+    def _articles(self, n=3):
+        return [{"id": str(i), "headline": f"h{i}", "teaser": "t"} for i in range(n)]
+
+    @patch("news.fetcher.time.sleep")
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_all_attempts_empty_records_one_event(self, mock_claude, mock_evt, _sleep):
+        from news.fetcher import _batch_score_sentiment, _EMPTY_BATCH_ATTEMPTS
+        mock_claude.messages.create.return_value = self._tool_msg([])
+        scores = _batch_score_sentiment(self._articles())
+        assert scores == {}                                    # fail-closed
+        assert mock_claude.messages.create.call_count == _EMPTY_BATCH_ATTEMPTS
+        assert mock_evt.call_count == 1
+        assert mock_evt.call_args.args[0] == "claude_empty_batch"
+
+    @patch("news.fetcher.time.sleep")
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_recovery_on_a_later_attempt_scores_and_does_not_alert(
+        self, mock_claude, mock_evt, _sleep
+    ):
+        from news.fetcher import _batch_score_sentiment
+        good = [{"id": "0", "sentiment": "positive", "confidence": 0.8,
+                 "catalyst_type": "guidance_raise", "already_moved": False,
+                 "catalyst_magnitude": 3}]
+        mock_claude.messages.create.side_effect = [
+            self._tool_msg([]), self._tool_msg([]), self._tool_msg(good),
+        ]
+        scores = _batch_score_sentiment(self._articles())
+        assert scores["0"]["catalyst_type"] == "guidance_raise"
+        mock_evt.assert_not_called()
+
+    @patch("news.fetcher.time.sleep")
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_first_attempt_success_costs_exactly_one_call(
+        self, mock_claude, mock_evt, _sleep
+    ):
+        """The retry must not add cost to the overwhelmingly common case."""
+        from news.fetcher import _batch_score_sentiment
+        mock_claude.messages.create.return_value = self._tool_msg([
+            {"id": "0", "sentiment": "neutral", "confidence": 0.3,
+             "catalyst_type": "other", "already_moved": False,
+             "catalyst_magnitude": 1},
+        ])
+        _batch_score_sentiment(self._articles())
+        assert mock_claude.messages.create.call_count == 1
+        mock_evt.assert_not_called()
+
+    @patch("news.fetcher.time.sleep")
+    @patch("news.fetcher._claude")
+    def test_backoff_stays_inside_the_news_cycle_cadence(self, mock_claude, mock_sleep):
+        from news.fetcher import (
+            _batch_score_sentiment, _EMPTY_BATCH_ATTEMPTS,
+            _EMPTY_BATCH_BACKOFF_SECONDS,
+        )
+        mock_claude.messages.create.return_value = self._tool_msg([])
+        with patch("news.fetcher._record_claude_event"):
+            _batch_score_sentiment(self._articles())
+        # One backoff BETWEEN attempts, never after the last one.
+        assert mock_sleep.call_count == _EMPTY_BATCH_ATTEMPTS - 1
+        total = _EMPTY_BATCH_BACKOFF_SECONDS * (_EMPTY_BATCH_ATTEMPTS - 1)
+        assert total < 30, "backoff must leave room inside the 60s news cycle"
+
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_malformed_response_still_fails_fast_without_retrying(
+        self, mock_claude, mock_evt
+    ):
+        """A missing tool_use block is a PARSING failure, not an empty batch —
+        it must return immediately rather than burn the retry budget."""
+        from news.fetcher import _batch_score_sentiment
+        msg = MagicMock()
+        msg.content = []          # no tool_use block at all
+        mock_claude.messages.create.return_value = msg
+        assert _batch_score_sentiment(self._articles()) == {}
+        assert mock_claude.messages.create.call_count == 1
+        mock_evt.assert_not_called()

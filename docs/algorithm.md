@@ -104,6 +104,7 @@ trades, forward returns on all classified articles, and costed replay.
 | Roundup | >3 tickers tagged → skip | Market digests have no per-stock catalyst (v11) |
 | Analyst action | headline matches `_ANALYST_ACTION_RE` → skip | `analyst_action` is never in `TRADEABLE_CATALYSTS`. A regex on the raw headline is far cheaper than a Claude call. Catches "reiterates buy", "price target", "upgrades to overweight", "initiates coverage" etc. Added v17.4. |
 | Digest/preview | headline matches `_DIGEST_RE` → skip | v20. Compilations ("Market-Moving News for July 10th", "Stocks To Watch", "Premarket Movers", "Earnings Scheduled For…", listicles) are written ABOUT the market with tickers tagged incidentally. One slid under the >3-ticker roundup filter with exactly 3 tickers on 2026-07-10 and was classified "earnings_beat, 80% conf" for THREE unrelated companies at once — the fabricated catalyst that bought the top of CRCL's 13% parabolic spike (−3.97%). Deterministic title check; no digest reaches Claude. The prompt also gained a "digests are never catalysts" rule as defense in depth (a digest classified fda_approval would still pass the catalyst gate — the regex is the reliable layer). |
+| Explainer/recap | headline matches `_EXPLAINER_RE` → skip | **v21.12.** An article ABOUT a price move that already happened is not the catalyst that caused it, and the primary newswire item arrives separately, so nothing tradeable is lost. Trade #25 (BE, 2026-08-04, −2.82%, the only trade that day) came from *"Bloom Energy Stock Charges Higher Tuesday: What's Driving the Post-Earnings Rally?"* — scored `guidance_raise`/positive/conf 0.75 with **`already_moved` = False**, while the headline states in its own words that the rally was underway; the stock was already +3.99% on the day at entry, and `already_moved` is the single field that would have blocked it. Covers *"What's Driving/Behind/Going On With…"*, *"Here's Why…"*, *"…Stock Charges/Climbs/Slides Higher\|Lower"*, *"…Shares Are Trading Higher\|Lower"*, *"…Stock Is Surging/Sinking/Rallying"*, *"post-earnings rally/selloff/reset"*. Claude usually gets these right (it spent `catalyst_type=recap_explainer` on 140 articles that same day) — this covers the case where the template names a real earnings/guidance event and drags the classification toward the catalyst. **Validated against 2,415 real scored headlines (2026-07-25 → 2026-08-04): 49 matches (2.0%), zero false positives, and exactly one of the 49 had scored positive** — the Bloom Energy article. Pattern hygiene is inherited from `_DIGEST_RE`: every phrase must be one that cannot plausibly appear in a genuine single-stock catalyst headline, because a false positive is a silently-missed trade with no eval-loop trace. These qualify because companies never issue a PR commenting on their own share price. |
 
 ### 3.2 Claude classification
 
@@ -116,19 +117,37 @@ batched call** per cycle:
   every call after the first.
 - **Forced tool use** (`tool_choice`) — output is schema-validated JSON; no
   string parsing, no truncation recovery.
-- **One retry on an empty result (v21.7, 2026-07-28):** a 200 OK, forced-tool-
-  use response can still legitimately carry an empty `classifications` list
-  for a non-empty batch — observed 8 consecutive cycles at 07:00-07:07 ET
-  (the premarket scan start) and 6 consecutive cycles the day before at
-  16:06-16:12 ET (the regular→afterhours boundary), both times the very first
-  `news_cycle` tick after a session transition, with no per-record validation
-  warnings (so not malformed records — a genuinely empty array). Because
-  `_mark_scored()` only fires on a successful score, an un-retried empty
+- **Retries on an empty result (v21.7, 2026-07-28; widened v21.12, 2026-08-04):**
+  a 200 OK, forced-tool-use response can still legitimately carry an empty
+  `classifications` list for a non-empty batch — observed 8 consecutive cycles
+  at 07:00-07:07 ET (the premarket scan start) and 6 consecutive cycles the day
+  before at 16:06-16:12 ET (the regular→afterhours boundary), both times the
+  very first `news_cycle` tick after a session transition, with no per-record
+  validation warnings (so not malformed records — a genuinely empty array).
+  Because `_mark_scored()` only fires on a successful score, an un-retried empty
   batch regrows the unscored backlog every cycle with no bound but
-  `max_age_minutes` aging the oldest entries out. `_batch_score_sentiment`
-  now retries once immediately (logged at ERROR, not WARNING — this is a
-  data-loss risk, not routine) before giving up and returning `{}`. Root
-  cause of the empty response itself is unconfirmed — plausibly a
+  `max_age_minutes` aging the oldest entries out.
+
+  **v21.12 — one retry is not enough, and silence is worse than the outage.**
+  On 2026-08-04, **25 consecutive cycles** across two windows (07:00-07:18 and
+  07:31-07:36 ET) saw BOTH the call and its single retry come back empty. The
+  backlog grew `10 → 19 → 27 → 35 → 36` articles and then shrank again as they
+  **aged out of the freshness window unscored** — discarded without ever being
+  evaluated. Impact was contained only because both windows fell before the
+  08:00 ET watchlist build; the same 25 minutes landing on 09:30-09:55 would
+  blind the system through its most productive window. And **nothing recorded a
+  `system_event`**, so the blind spot was invisible to Grafana and every other
+  monitoring surface — only ERROR lines in the journal.
+
+  `_batch_score_sentiment` now makes `_EMPTY_BATCH_ATTEMPTS` (3) attempts with
+  a `_EMPTY_BATCH_BACKOFF_SECONDS` (2s) pause between them (logged at ERROR, not
+  WARNING — this is a data-loss risk, not routine), and records a
+  **`claude_empty_batch`** `system_events` row when all are exhausted before
+  returning `{}`. Worst case ~30s, comfortably inside the 60s news cycle.
+  `record_system_event` de-dupes per day, so this is one alert per outage rather
+  than one per cycle. A missing `tool_use` block is a *parsing* failure, not an
+  empty batch, and still returns immediately without burning the retry budget.
+  Root cause of the empty response itself remains unconfirmed — plausibly a
   backlog/complexity edge in the first larger batch after an idle gap.
 - The rubric is a **decision tree**: (1) is this NEW information, or a
   recap/halt article describing a move that already happened? (2) is the tagged
@@ -1137,7 +1156,9 @@ most partnership news produces no intraday price action at all.
 | Claude outage / overload (529/500/network) | typed-exception handled: fail-closed (no scores → no trades) + short cooldown (`_CLAUDE_OUTAGE_COOLDOWN_SECONDS`, 120s) so we don't hammer a struggling API; auto-resumes; `system_events` row (`claude_outage`) |
 | Claude out-of-credits / billing (403 `billing_error`) or auth (401) | does **not** self-heal — CRITICAL log + long cooldown (`_CLAUDE_BILLING_COOLDOWN_SECONDS`, 30 min) + `system_events` (`claude_billing_error`/`claude_auth_error`) so the journal shows what actually broke |
 | Both feeds down with open position | TP/SL skipped that cycle; time stop still fires (needs no price) |
-| Quote frozen / stale (source up, data dead) | **v19.2:** quote `t` older than 20 min → treated as no coverage (falls to next source / fail-closed). A frozen print is not a price (GLASF: entry, P&L, and every exit limit priced off a $12.50 quote that never moved). **v21.10:** 10 consecutive stale readings from one source → `stale_quote_feed` `system_events` row + ERROR, because a *streak* is a provider cache, not a quiet ticker. **v21.11:** while that streak is live, no-quote misses stop counting toward the session blacklist, and a quote merely LAGGING (not frozen) is rejected for entries at 90s via `stale_price` |
+| Quote frozen / stale (source up, data dead) | **v19.2:** quote `t` older than 20 min → treated as no coverage (falls to next source / fail-closed). A frozen print is not a price (GLASF: entry, P&L, and every exit limit priced off a $12.50 quote that never moved). **v21.10:** 10 consecutive stale readings from one source → `stale_quote_feed` `system_events` row + ERROR, because a *streak* is a provider cache, not a quiet ticker. **v21.11:** while that streak is live, no-quote misses stop counting toward the session blacklist, and a quote merely LAGGING (not frozen) is rejected for entries at 90s via `stale_price`. **v21.12:** the streak must ALSO span `_STALE_QUOTE_MIN_DISTINCT_SYMBOLS` (3) distinct symbols — one dead ticker polled in a loop is not a provider outage (MZDAY, 221 polls on 2026-08-04, tripped both providers while BE quoted fine two minutes later) |
+| Frozen-feed false alarm protecting a dead ticker | **v21.12:** the distinct-symbol requirement above closes a self-reinforcing loop. `quote_feed_degraded()` deliberately suppresses the no-quote strikes that would blacklist an un-quotable ticker (the v21.11 fix). When a single dead ticker was itself what tripped the "provider frozen" alarm, it protected itself from ever being blacklisted and kept polling to re-trip the alarm — all day. The 2026-07-31 real outage served the previous day's close for *every* symbol asked (SONY included), so it clears a distinct-symbol bar trivially; the original protection is intact. `_note_quote_fresh()` clears the symbol set with the streak so a feed alternating fresh/stale cannot accumulate its way over the bar |
+| Claude returns an empty batch repeatedly | **v21.12:** `_EMPTY_BATCH_ATTEMPTS` (3) attempts with a 2s backoff, then a `claude_empty_batch` `system_events` row. The v21.7 single retry was insufficient — 25 consecutive cycles on 2026-08-04 had both the call and its retry return empty, and articles aged out of the freshness window **unscored** with no trace on any monitoring surface. See §3.2 |
 | Quote lagging but inside the coverage window | **v21.11:** entries only, RTH only — `stale_price` (transient). Distinct from the row above: a 3-minute-old quote is honest about its age and passes every coverage test, yet makes momentum/RVOL/VWAP agree on a market that has moved on (NVT 2026-07-31, stopped out 42s after the fill) |
 | Broker rate-limits the cash endpoint | **v21.11:** `/equity/account/cash` is served from a 15s process cache behind a lock, with one retry on 429/5xx. The lock is the actual fix — it serializes the callers that used to collide. See "Scheduler collisions" below |
 | Malformed payloads (wrong types, NaN, nulls, mis-scaled values) | **v19.3: normalized at every seam** — Finnhub quotes require a positive finite `c`; Twelvedata quote fields coerce individually (bad secondary field ≠ dead quote); bar arrays must be lists and non-dict bars are skipped; Claude records validated individually with out-of-range values REJECTED not clamped; article-feed nulls/scalars/bare-string tickers skipped per element. Contract enforced by `tests/test_adversarial.py`: garbage may never crash a cycle nor produce an approval |

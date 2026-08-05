@@ -180,6 +180,45 @@ _DIGEST_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Explainer/recap headlines describe a price move that has ALREADY HAPPENED.
+# They are commentary about the tape, not the catalyst that moved it — and the
+# primary newswire item ("Acme Q2 EPS Beats...") arrives separately, so nothing
+# tradeable is lost by dropping them.
+#
+# 2026-08-04, trade #25 (the only trade of the day, −2.82%): Benzinga's
+# "Bloom Energy Stock Charges Higher Tuesday: What's Driving the Post-Earnings
+# Rally?" was scored guidance_raise / positive / conf 0.75 with
+# already_moved=FALSE — while the headline says in its own words that the rally
+# was underway and the stock was already +3.99% on the day when we bought it.
+# already_moved is the single field that would have blocked the entry, and the
+# classifier got it wrong on an article whose whole subject is a completed move.
+#
+# Same reasoning as _DIGEST_RE: a deterministic title check is cheaper and more
+# reliable than hoping the classifier reads through a template it has already
+# been shown to misread. Claude does usually get these right (it spent
+# catalyst_type=recap_explainer on 140 articles that same day) — this covers the
+# case where the template names a real earnings/guidance event and pulls the
+# classification toward the catalyst.
+#
+# Pattern hygiene (inherited from _DIGEST_RE, v20.1): every phrase must be one
+# that CANNOT plausibly appear in a genuine single-stock catalyst headline.
+# These all pass that bar because companies never issue a PR commenting on
+# their own share price, and the newswire templates state the event, never
+# explain the move. Validated against 2,415 real scored headlines (2026-07-25
+# → 2026-08-04): 49 matches (2.0%), zero false positives, and exactly ONE of
+# the 49 had scored positive — the Bloom Energy article above.
+_EXPLAINER_RE = re.compile(
+    r"("
+    r"what'?s? (driving|behind|fueling|powering|going on with|happening (with|to))"
+    r"|here'?s why"
+    r"|\b(stock|shares)\b[^.:;]{0,30}\b(is|are) (trading|moving|heading) (higher|lower|up|down)"
+    r"|\b(stock|shares)\b[^.:;]{0,30}\b(charges?|charged|climbs?|climbed|slides?|slid) (higher|lower)"
+    r"|\b(stock|shares)\b[^.:;]{0,30}\b(is|are) (soaring|surging|plunging|sinking|tanking|rallying|tumbling)"
+    r"|post[- ]earnings (rally|selloff|sell[- ]off|surge|slide|drop|pop)"
+    r")",
+    re.IGNORECASE,
+)
+
 # ── Claude availability guard ───────────────────────────────────────────────────
 # The classifier is the one external dependency with NO fallback: if Claude can't
 # score articles, there are no signals at all (positive/neutral/negative are all
@@ -201,6 +240,11 @@ _DIGEST_RE = re.compile(
 # since it can't assess the news — but the rest of the pipeline stays alive.
 _CLAUDE_OUTAGE_COOLDOWN_SECONDS = 120        # transient outage / overload / 529
 _CLAUDE_BILLING_COOLDOWN_SECONDS = 1800      # out-of-credits / auth — needs a human
+
+# Empty-classification retries (v21.12 — see the loop in _batch_score_sentiment).
+# 3 attempts + 2 backoffs keeps the worst case ~30s, inside the 60s news cycle.
+_EMPTY_BATCH_ATTEMPTS = 3
+_EMPTY_BATCH_BACKOFF_SECONDS = 2.0
 # {"until": monotonic deadline, "reason": str} — None means Claude is believed up.
 _claude_cooldown: dict | None = None
 
@@ -625,19 +669,35 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
     # a comfortable margin. Floor at 400 ensures small batches aren't starved.
     max_tokens = max(400, len(articles) * 60 + 64)
     try:
-        # One retry when Claude returns a well-formed but EMPTY classifications
+        # Retries when Claude returns a well-formed but EMPTY classifications
         # list for a non-empty batch. This is not a parsing failure — the 200 OK
         # forced-tool-use call legitimately came back with zero entries. Observed
-        # twice at the exact first news_cycle tick after a session boundary
-        # (2026-07-27 16:06-16:12 ET regular→afterhours, 2026-07-28 07:00-07:07 ET
-        # premarket scan start): 6-8 consecutive cycles, each returning [], while
-        # the backlog of unscored articles grew every cycle (since _mark_scored
-        # only fires on a successful score) until it self-recovered. A real
-        # catalyst published in that window would go unscored and untraded with
-        # no evidence beyond a WARNING log. One retry costs one extra call on the
-        # rare empty-batch case and would very likely have shortened both
-        # incidents.
-        for score_attempt in range(2):
+        # at the first news_cycle tick after a session boundary (2026-07-27
+        # 16:06-16:12 ET regular→afterhours, 2026-07-28 07:00-07:07 ET premarket
+        # scan start): 6-8 consecutive cycles, each returning [], while the
+        # backlog of unscored articles grew every cycle (since _mark_scored only
+        # fires on a successful score) until it self-recovered.
+        #
+        # v21.12 — the v21.7 SINGLE retry is not enough. 2026-08-04: 25 cycles
+        # across two windows (07:00-07:18 and 07:31-07:36 ET) in which BOTH the
+        # first call and its retry came back empty, every time. The backlog grew
+        # 10 → 36 articles and then shrank again as articles aged out via
+        # max_age_minutes — i.e. they were discarded WITHOUT EVER BEING SCORED.
+        # Impact was contained only because both windows fell before the 08:00 ET
+        # watchlist build; the same 25 minutes landing on 09:30-09:55 would blind
+        # the system through its most productive window.
+        #
+        # Two changes: retry _EMPTY_BATCH_ATTEMPTS times with a short backoff
+        # (the failure clearly persists across an immediate re-ask), and record a
+        # system_event when they are all exhausted. The 2026-08-04 outage left NO
+        # trace on any monitoring surface — no system_event, nothing in Grafana,
+        # only ERROR lines in the journal. A silent 25-minute blind spot in the
+        # one dependency that has no fallback must be visible.
+        #
+        # Budget: attempts run ~4-8s each and the backoff totals
+        # _EMPTY_BATCH_BACKOFF_SECONDS * 2, which keeps the worst case (~30s)
+        # inside the 60s news_cycle cadence.
+        for score_attempt in range(_EMPTY_BATCH_ATTEMPTS):
             msg = _claude.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=max_tokens,
@@ -670,12 +730,33 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
                     type(classifications).__name__,
                 )
                 return {}
-            if classifications or score_attempt == 1:
+            if classifications:
+                break
+            if score_attempt == _EMPTY_BATCH_ATTEMPTS - 1:
+                # All attempts exhausted. Fail closed (unscored → untraded) but
+                # make the blind spot VISIBLE — record_system_event de-dupes to
+                # one row per day, so this is one alert per outage, not per cycle.
+                logger.error(
+                    "Batch sentiment: Claude returned 0 classifications for a "
+                    "%d-article batch on all %d attempts — giving up this cycle. "
+                    "These articles stay unscored and will be re-offered next "
+                    "cycle until they age out of the freshness window UNSCORED.",
+                    len(articles), _EMPTY_BATCH_ATTEMPTS,
+                )
+                _record_claude_event(
+                    "claude_empty_batch",
+                    f"{_EMPTY_BATCH_ATTEMPTS} consecutive empty classification "
+                    f"lists for a {len(articles)}-article batch — news scoring "
+                    f"is blind while this persists",
+                )
                 break
             logger.error(
                 "Batch sentiment: Claude returned 0 classifications for a "
-                "%d-article batch — retrying once", len(articles),
+                "%d-article batch — retry %d/%d in %.1fs",
+                len(articles), score_attempt + 1, _EMPTY_BATCH_ATTEMPTS - 1,
+                _EMPTY_BATCH_BACKOFF_SECONDS,
             )
+            time.sleep(_EMPTY_BATCH_BACKOFF_SECONDS)
 
         results: dict[str, dict] = {}
         for r in classifications:
@@ -913,6 +994,16 @@ def fetch_all_news(
         if _DIGEST_RE.search(headline_raw):
             logger.info(
                 "Skipping digest/preview article (pre-Claude filter): %s",
+                headline_raw[:80],
+            )
+            continue
+
+        # Explainer/recap pre-filter: an article ABOUT a move that already
+        # happened is not the catalyst that caused it. Letting one through cost
+        # trade #25 (BE, 2026-08-04, −2.82%) — see _EXPLAINER_RE.
+        if _EXPLAINER_RE.search(headline_raw):
+            logger.info(
+                "Skipping explainer/recap article (pre-Claude filter): %s",
                 headline_raw[:80],
             )
             continue
