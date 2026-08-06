@@ -7,6 +7,100 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.13 — 2026-08-06 (retries don't fix an outage; entry slippage made visible)
+
+Deep-dive on 2026-08-06 (4 trades, **−£17.96** — worst day by trade count).
+All-time now −£111.57 over 29 trades.
+
+**The trading story: every gap faded, 4 for 4.** ITT, CEG and LAMR were bought
+in a five-minute window at the open (hitting `MAX_OPEN_POSITIONS=3` exactly), all
+on "company raised guidance" stories; MDT followed at 10:00. Relative to our
+fills they closed −4.65%, −3.83%, −2.77% and −0.80%. This was **not** a market
+move — SPY traded a 0.26% range across the whole window. The post-earnings
+gap-and-go setup simply failed that day.
+
+**Three of the four never showed a single positive tick** (MFE −0.12%, −0.36%,
+−1.91%). That is an entry-timing signature, not four unlucky trades.
+
+### Changed — Claude empty-batch handling (the important one)
+
+Retries do not work on this failure and the evidence is now unambiguous:
+
+| version | budget | outcome |
+|---|---|---|
+| v21.7 | 1 retry | 2026-08-04: **25** consecutive all-empty cycles |
+| v21.12 | 3 attempts | 2026-08-06: **58** consecutive all-empty cycles |
+
+2026-08-06 ran 07:00–08:38 ET — **98 minutes, ~174 wasted API calls, nothing
+scored** — and unlike 08-04 it overlapped the 08:00–09:30 ET premarket watchlist
+build by 38 minutes. Articles aged out of the freshness window unscored.
+
+- **`_EMPTY_BATCH_ATTEMPTS` 3 → 2.** The retry only ever earns its keep on a
+  genuinely isolated empty response; across 83 observed failing cycles the extra
+  attempts helped exactly zero times.
+- **New: after `_EMPTY_BATCH_COOLDOWN_TRIGGER` (2) consecutive all-empty
+  CYCLES, stand the classifier down for `_EMPTY_BATCH_COOLDOWN_SECONDS` (120)**
+  via the same `_enter_claude_cooldown` machinery already used for 529/billing
+  failures. The next two minutes then cost zero API calls instead of ~6, and the
+  articles stay eligible (`_mark_scored` only fires on success) so they are
+  re-offered when scoring resumes. Any successful cycle clears the streak.
+- Fail-closed is unchanged throughout: no scores → no signals → no trades.
+
+The v21.12 `claude_empty_batch` system_event did its job — the outage was visible
+in Grafana on both 08-05 and 08-06 rather than needing a journal grep.
+
+### Added — entry slippage instrumentation
+
+`main._record_entry_slippage()` logs the **signal→fill gap** on every entry and
+raises a WARNING + one `entry_slippage_high` system_event per day past
+`_ENTRY_SLIPPAGE_ALERT_PCT` (1.0%).
+
+LAMR made the case: sized at **$161.09**, filled at **$164.30** — **+1.99%**,
+after **34 seconds** (the day's other three entries filled in 3–4s). $164.30 was
+above LAMR's high for the *entire session*. The stop then sat 2% below a price we
+never chose; the stock drifted back to ~$161 — the price we actually wanted — and
+stopped us out 28 seconds after entry.
+
+Re-running all four trades at their signal prices: **−3.70pp vs the actual
+−6.17pp gross**. Roughly **£6 of the £17.96 was entry slippage**, and most of
+that was this one fill. Until now that was only recoverable by hand-diffing two
+log lines against external price data.
+
+**Audit context (18 trades with usable minute data):** 10 buys filled above the
+minute bar's high, but nine of those by +0.01% to +0.26% — that is ordinary
+bid-ask spread (bars record trades; a market buy pays the ask) and is NOT a
+fault. LAMR at +1.14% above the bar high is 5× the next largest and the only
+genuine outlier. ITT's *sell* at −1.19% below its bar low is the second.
+
+### Changed — portfolio gates
+
+- **`MAX_OPEN_POSITIONS` 3 → 8**, to stop concurrency capping the sample size
+  while the strategy is still being measured. Bounded: 8 × ~5% of portfolio =
+  ~40% deployed, and 8 simultaneous −2% stop-outs is ~0.8% of portfolio, well
+  inside `MAX_DAILY_LOSS_PCT` (2.0). `MAX_TRADES_PER_DAY` still caps the day at 10.
+- ⚠️ **This gate has never rejected a signal** (0 hits since 2026-08-01).
+  2026-08-06 hit 3 concurrent but no fourth signal arrived while they were open.
+  Throughput is limited by the price gates, not by concurrency, so expect little
+  or no change in trades/day from this alone.
+
+### Verified this release (not changed)
+
+- **`stale_volume` worked end-to-end on live data for the first time.** ITT
+  09:35:40 rejected (day +8.33%, RVOL 0.07 — implausible); 09:36:40 approved
+  (RVOL 0.98) once the volume feed caught up. Deferred, not discarded — exactly
+  the transient-code design.
+- **`stale_price` is NOT over-rejecting** (the v21.11 watch item, now closed).
+  53 firings across 5 tickers at ages 100–256s against a 90s bar. Net effect:
+  blocked one −2.00% loss (ESTA), cost one +0.91% (HROW). Keep 90s.
+- **The v21.12 distinct-symbol fix held** — zero frozen-feed false alarms.
+- `_EXPLAINER_RE` fired 3× (Datadog recap), no false positives observed.
+- **`MAX_DAY_MOVE_PCT` stays at 10.** ITT entered at +9.96%, 0.04pp under the
+  ceiling, and lost 2.19%. But the 9.9–10% bucket now holds ITT (−2.19%) AND
+  GRMN (+3.86%): dropping to 8% would save 2.19 and cost 3.86, still net
+  negative. Two points, opposite directions — no change earned.
+
+---
+
 ## v21.12 — 2026-08-05 (BE post-mortem: traded a recap; two guards mis-scoped)
 
 Deep-dive on 2026-08-04 (1 trade, −£7.04). Three findings, only one of which

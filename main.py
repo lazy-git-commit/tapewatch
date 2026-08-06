@@ -162,6 +162,54 @@ _no_quote_ticker_strikes: dict[str, int] = {}   # ticker → consecutive no-data
 _no_quote_blackout: set[str] = set()            # tickers suppressed for this session
 _no_quote_blackout_day: str | None = None       # ET date the sets above belong to
 
+# ── Entry slippage instrumentation (v21.13) ──────────────────────────────────
+# The gap between the price a signal was APPROVED at and the price we were
+# actually FILLED at is money lost before the thesis is even tested, and until
+# now it was only recoverable by hand-diffing two log lines against external
+# price data.
+#
+# 2026-08-06 made the case. LAMR: sized at $161.09, filled at $164.30 — +1.99%,
+# and 34 seconds elapsed between the two (the other three entries that day filled
+# in 3-4s). $164.30 was above LAMR's high for the ENTIRE session. The stop then
+# sat 2% below that inflated fill, the stock drifted back to ~$161 (the price we
+# actually wanted), and we were stopped out 28 seconds after entry. Of the day's
+# £17.96 loss, ~£6 was entry slippage and most of that was this one fill.
+#
+# Every entry now logs the gap; anything past the alert threshold also raises a
+# WARNING and one system_event per day, so a degrading fill path shows up in
+# Grafana rather than being reconstructed after the fact.
+_ENTRY_SLIPPAGE_ALERT_PCT = 1.0
+
+
+def _record_entry_slippage(ticker: str, signal_price: float, fill_price: float,
+                           elapsed_s: float | None = None) -> None:
+    """Log (and alert on) the signal→fill gap. Never raises."""
+    try:
+        if not signal_price or signal_price <= 0 or not fill_price or fill_price <= 0:
+            return
+        slip_pct = ((fill_price - signal_price) / signal_price) * 100
+        took = f" in {elapsed_s:.1f}s" if elapsed_s is not None else ""
+        if slip_pct >= _ENTRY_SLIPPAGE_ALERT_PCT:
+            logger.warning(
+                "Entry slippage [%s]: approved at $%.4f, FILLED at $%.4f%s "
+                "(%+.2f%%) — the stop now sits %.2f%% below a price we did not "
+                "decide on, so routine reversion to the signal price alone can "
+                "stop us out.",
+                ticker, signal_price, fill_price, took, slip_pct, slip_pct,
+            )
+            record_system_event(
+                "entry_slippage_high",
+                f"{ticker}: approved ${signal_price:.4f} → filled "
+                f"${fill_price:.4f} ({slip_pct:+.2f}%){took}",
+            )
+        else:
+            logger.info(
+                "Entry slippage [%s]: approved at $%.4f, filled at $%.4f%s (%+.2f%%)",
+                ticker, signal_price, fill_price, took, slip_pct,
+            )
+    except Exception as exc:   # observability must never break the entry path
+        logger.debug("Could not record entry slippage for %s: %s", ticker, exc)
+
 
 def _reset_no_quote_blackout_if_new_day() -> None:
     """Clear the no-quote blackout when the ET trading day rolls over."""
@@ -459,6 +507,7 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
     # quantity/order_id means the broker was already contacted; retrying that
     # risks a double order, so it is never retried here.
     result = None
+    buy_started_at = time.monotonic()
     for attempt in range(2):
         try:
             result = buy(
@@ -491,6 +540,12 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
         except Exception as exc:
             logger.warning("set_rejection_reason failed after buy failure: %s", exc)
         return False
+
+    # What did the decision price cost us against the price we actually got?
+    _record_entry_slippage(
+        item.ticker, confirmation.current_price, result.price,
+        time.monotonic() - buy_started_at,
+    )
 
     # ── Record trade ──────────────────────────────────────────────────────────
     # A buy that is not represented in the DB is an unmanaged live position.

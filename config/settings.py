@@ -285,7 +285,7 @@ class Settings:
     # Max simultaneous open positions. Momentum signals cluster (one macro
     # headline → 4 correlated semis trades on Jun 3); this caps the blast radius.
     max_open_positions: int = field(
-        default_factory=lambda: int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+        default_factory=lambda: int(os.getenv("MAX_OPEN_POSITIONS", "8"))
     )
     # Max new positions per calendar day.
     max_trades_per_day: int = field(

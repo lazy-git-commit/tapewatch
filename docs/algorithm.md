@@ -139,16 +139,37 @@ batched call** per cycle:
   `system_event`**, so the blind spot was invisible to Grafana and every other
   monitoring surface — only ERROR lines in the journal.
 
-  `_batch_score_sentiment` now makes `_EMPTY_BATCH_ATTEMPTS` (3) attempts with
-  a `_EMPTY_BATCH_BACKOFF_SECONDS` (2s) pause between them (logged at ERROR, not
-  WARNING — this is a data-loss risk, not routine), and records a
-  **`claude_empty_batch`** `system_events` row when all are exhausted before
-  returning `{}`. Worst case ~30s, comfortably inside the 60s news cycle.
-  `record_system_event` de-dupes per day, so this is one alert per outage rather
-  than one per cycle. A missing `tool_use` block is a *parsing* failure, not an
-  empty batch, and still returns immediately without burning the retry budget.
-  Root cause of the empty response itself remains unconfirmed — plausibly a
-  backlog/complexity edge in the first larger batch after an idle gap.
+  **v21.13 — retries are the wrong tool; cool down instead.** 2026-08-06 was
+  the same failure at twice the scale: **58 consecutive all-empty cycles**,
+  07:00-08:38 ET, with the v21.12 budget of THREE attempts each. 98 minutes,
+  ~174 wasted API calls, nothing scored — and unlike 08-04 it overlapped the
+  08:00-09:30 ET premarket watchlist build by 38 minutes. Across the 83 failing
+  cycles now observed, the extra attempts helped exactly zero times.
+
+  | version | budget | consecutive all-empty cycles |
+  |---|---|---|
+  | v21.7 | 1 retry | 25 (2026-08-04) |
+  | v21.12 | 3 attempts | 58 (2026-08-06) |
+
+  `_batch_score_sentiment` now makes `_EMPTY_BATCH_ATTEMPTS` (**2** — one retry,
+  for the genuinely isolated blip) with a `_EMPTY_BATCH_BACKOFF_SECONDS` (2s)
+  pause, records a **`claude_empty_batch`** `system_events` row when they are
+  exhausted, and — after `_EMPTY_BATCH_COOLDOWN_TRIGGER` (2) consecutive
+  all-empty **cycles** — stands the classifier down for
+  `_EMPTY_BATCH_COOLDOWN_SECONDS` (120) through the same `_enter_claude_cooldown`
+  path used for 529/billing failures. The next two minutes then cost zero API
+  calls instead of ~6; the articles stay eligible (`_mark_scored` only fires on
+  success) and are re-offered when scoring resumes; any successful cycle clears
+  `_consecutive_empty_batches`. Logged at ERROR, not WARNING — this is a
+  data-loss risk, not routine. `record_system_event` de-dupes per day, so this is
+  one alert per outage rather than one per cycle. A missing `tool_use` block is a
+  *parsing* failure, not an empty batch, and still returns immediately without
+  burning the retry budget. Root cause of the empty response itself remains
+  unconfirmed — plausibly a backlog/complexity edge in the first larger batch
+  after an idle gap. **This is the strongest argument for a second classifier
+  provider as a fallback** (see CHANGELOG v21.13): Claude is the only external
+  dependency with no alternative path, and it has now gone dark twice in three
+  sessions.
 - The rubric is a **decision tree**: (1) is this NEW information, or a
   recap/halt article describing a move that already happened? (2) is the tagged
   ticker the actual subject (acquirer-vs-target)? (3) is the catalyst binding

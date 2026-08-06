@@ -241,10 +241,36 @@ _EXPLAINER_RE = re.compile(
 _CLAUDE_OUTAGE_COOLDOWN_SECONDS = 120        # transient outage / overload / 529
 _CLAUDE_BILLING_COOLDOWN_SECONDS = 1800      # out-of-credits / auth — needs a human
 
-# Empty-classification retries (v21.12 — see the loop in _batch_score_sentiment).
-# 3 attempts + 2 backoffs keeps the worst case ~30s, inside the 60s news cycle.
-_EMPTY_BATCH_ATTEMPTS = 3
+# Empty-classification handling (see the loop in _batch_score_sentiment).
+#
+# v21.13 — RETRIES ALONE DO NOT WORK ON THIS FAILURE. History:
+#   v21.7  1 retry  → 2026-08-04: 25 consecutive cycles, both calls empty
+#   v21.12 3 attempts → 2026-08-06: 58 consecutive cycles, ALL THREE empty, every
+#          time, for 98 minutes (07:00-08:38 ET). 174 wasted API calls, and it
+#          overlapped the 08:00-09:30 ET premarket watchlist build by 38 min.
+#
+# The failure clearly persists on a timescale of tens of minutes, so hammering it
+# three times per 60s cycle is the wrong shape entirely. Two changes:
+#
+#   1. Back down to ONE retry. The retry only ever earns its keep on a genuinely
+#      isolated empty response; beyond that it is pure waste.
+#   2. After _EMPTY_BATCH_COOLDOWN_TRIGGER consecutive all-empty CYCLES, stand
+#      the classifier down via the SAME cooldown used for 529/billing failures.
+#      One cycle's articles are still lost, but the next ~2 minutes cost zero API
+#      calls instead of ~6, and the articles stay eligible (`_mark_scored` only
+#      fires on success) so they are re-offered when scoring resumes.
+#
+# Fail-closed is preserved throughout: no scores → no signals → no trades.
+_EMPTY_BATCH_ATTEMPTS = 2
 _EMPTY_BATCH_BACKOFF_SECONDS = 2.0
+_EMPTY_BATCH_COOLDOWN_TRIGGER = 2
+_EMPTY_BATCH_COOLDOWN_SECONDS = 120
+
+# Consecutive news cycles whose batch came back empty on every attempt. Reset by
+# ANY successful scoring pass (see _batch_score_sentiment) — a single good cycle
+# means the classifier is answering again.
+_consecutive_empty_batches = 0
+
 # {"until": monotonic deadline, "reason": str} — None means Claude is believed up.
 _claude_cooldown: dict | None = None
 
@@ -645,6 +671,8 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
              already_moved}. Empty dict on failure (fail-closed: unscored
              articles are never traded).
     """
+    global _consecutive_empty_batches
+
     if not articles:
         return {}
 
@@ -731,24 +759,44 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
                 )
                 return {}
             if classifications:
+                # The classifier is answering again — clear the streak so an
+                # earlier bad patch can't push a later isolated blip straight
+                # into a cooldown.
+                _consecutive_empty_batches = 0
                 break
             if score_attempt == _EMPTY_BATCH_ATTEMPTS - 1:
                 # All attempts exhausted. Fail closed (unscored → untraded) but
                 # make the blind spot VISIBLE — record_system_event de-dupes to
                 # one row per day, so this is one alert per outage, not per cycle.
+                _consecutive_empty_batches += 1
                 logger.error(
                     "Batch sentiment: Claude returned 0 classifications for a "
-                    "%d-article batch on all %d attempts — giving up this cycle. "
-                    "These articles stay unscored and will be re-offered next "
-                    "cycle until they age out of the freshness window UNSCORED.",
+                    "%d-article batch on all %d attempts (%d cycle(s) in a row) "
+                    "— giving up this cycle. These articles stay unscored and "
+                    "will be re-offered until they age out of the freshness "
+                    "window UNSCORED.",
                     len(articles), _EMPTY_BATCH_ATTEMPTS,
+                    _consecutive_empty_batches,
                 )
                 _record_claude_event(
                     "claude_empty_batch",
-                    f"{_EMPTY_BATCH_ATTEMPTS} consecutive empty classification "
-                    f"lists for a {len(articles)}-article batch — news scoring "
-                    f"is blind while this persists",
+                    f"empty classification lists on all {_EMPTY_BATCH_ATTEMPTS} "
+                    f"attempts for a {len(articles)}-article batch — news "
+                    f"scoring is blind while this persists",
                 )
+                # Repeated across cycles this is not a blip; stop paying for it.
+                if _consecutive_empty_batches >= _EMPTY_BATCH_COOLDOWN_TRIGGER:
+                    logger.error(
+                        "Batch sentiment: %d consecutive all-empty cycles — "
+                        "pausing sentiment scoring for %ds. On 2026-08-06 this "
+                        "state lasted 98 minutes and retrying through it cost "
+                        "174 API calls and scored nothing.",
+                        _consecutive_empty_batches, _EMPTY_BATCH_COOLDOWN_SECONDS,
+                    )
+                    _enter_claude_cooldown(
+                        _EMPTY_BATCH_COOLDOWN_SECONDS,
+                        f"{_consecutive_empty_batches} consecutive empty batches",
+                    )
                 break
             logger.error(
                 "Batch sentiment: Claude returned 0 classifications for a "

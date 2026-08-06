@@ -46,4 +46,10 @@ def _reset_process_level_state():
     # MFE/MAE excursion cache (v21.10)
     pm._excursion_seen.clear()
 
+    # Claude empty-batch streak + cooldown (v21.13) — a streak left by one test
+    # would push an unrelated later test into a cooldown it never triggered.
+    import news.fetcher as nf
+    nf._consecutive_empty_batches = 0
+    nf._claude_cooldown = None
+
     yield

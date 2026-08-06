@@ -4568,6 +4568,13 @@ class TestEmptyBatchRetryAndAlert:
     def _articles(self, n=3):
         return [{"id": str(i), "headline": f"h{i}", "teaser": "t"} for i in range(n)]
 
+    def setup_method(self):
+        import news.fetcher as nf
+        nf._consecutive_empty_batches = 0
+        nf._claude_cooldown = None
+
+    teardown_method = setup_method
+
     @patch("news.fetcher.time.sleep")
     @patch("news.fetcher._record_claude_event")
     @patch("news.fetcher._claude")
@@ -4590,8 +4597,9 @@ class TestEmptyBatchRetryAndAlert:
         good = [{"id": "0", "sentiment": "positive", "confidence": 0.8,
                  "catalyst_type": "guidance_raise", "already_moved": False,
                  "catalyst_magnitude": 3}]
+        # v21.13: the budget is 1 retry, so recovery must land on attempt 2.
         mock_claude.messages.create.side_effect = [
-            self._tool_msg([]), self._tool_msg([]), self._tool_msg(good),
+            self._tool_msg([]), self._tool_msg(good),
         ]
         scores = _batch_score_sentiment(self._articles())
         assert scores["0"]["catalyst_type"] == "guidance_raise"
@@ -4643,3 +4651,144 @@ class TestEmptyBatchRetryAndAlert:
         assert _batch_score_sentiment(self._articles()) == {}
         assert mock_claude.messages.create.call_count == 1
         mock_evt.assert_not_called()
+
+
+class TestEmptyBatchCooldown:
+    """
+    v21.13: retries alone do not work on this failure. 2026-08-04 saw 25
+    consecutive all-empty cycles with 1 retry; 2026-08-06 saw 58 with 3
+    attempts each — 98 minutes, 174 wasted API calls, nothing scored, and it
+    overlapped the premarket watchlist build by 38 minutes. Repeated failure
+    must stand the classifier DOWN, not retry harder.
+    """
+
+    def setup_method(self):
+        import news.fetcher as nf
+        nf._consecutive_empty_batches = 0
+        nf._claude_cooldown = None
+
+    teardown_method = setup_method
+
+    def _tool_msg(self, classifications):
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": classifications}
+        msg = MagicMock()
+        msg.content = [block]
+        return msg
+
+    def _articles(self, n=3):
+        return [{"id": str(i), "headline": f"h{i}", "teaser": "t"} for i in range(n)]
+
+    def _good(self):
+        return [{"id": "0", "sentiment": "positive", "confidence": 0.8,
+                 "catalyst_type": "guidance_raise", "already_moved": False,
+                 "catalyst_magnitude": 3}]
+
+    @patch("news.fetcher.time.sleep")
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_repeated_empty_cycles_enter_a_cooldown(self, mock_claude, _evt, _sleep):
+        import news.fetcher as nf
+        mock_claude.messages.create.return_value = self._tool_msg([])
+        for _ in range(nf._EMPTY_BATCH_COOLDOWN_TRIGGER):
+            nf._batch_score_sentiment(self._articles())
+        assert nf._consecutive_empty_batches == nf._EMPTY_BATCH_COOLDOWN_TRIGGER
+        assert nf._claude_available() is False
+
+    @patch("news.fetcher.time.sleep")
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_cooldown_stops_further_api_calls(self, mock_claude, _evt, _sleep):
+        """The whole point: 98 minutes of this cost 174 calls. Once the
+        cooldown is on, the next cycle must cost ZERO."""
+        import news.fetcher as nf
+        mock_claude.messages.create.return_value = self._tool_msg([])
+        for _ in range(nf._EMPTY_BATCH_COOLDOWN_TRIGGER):
+            nf._batch_score_sentiment(self._articles())
+        calls_before = mock_claude.messages.create.call_count
+        assert nf._batch_score_sentiment(self._articles()) == {}   # still fail-closed
+        assert mock_claude.messages.create.call_count == calls_before
+
+    @patch("news.fetcher.time.sleep")
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_one_isolated_empty_cycle_does_not_cool_down(self, mock_claude, _evt, _sleep):
+        """A single blip must stay cheap to recover from — the retry exists
+        precisely for the isolated case."""
+        import news.fetcher as nf
+        assert nf._EMPTY_BATCH_COOLDOWN_TRIGGER > 1
+        mock_claude.messages.create.return_value = self._tool_msg([])
+        nf._batch_score_sentiment(self._articles())
+        assert nf._claude_available() is True
+
+    @patch("news.fetcher.time.sleep")
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher._claude")
+    def test_a_successful_cycle_clears_the_streak(self, mock_claude, _evt, _sleep):
+        """Otherwise an earlier bad patch pushes a later isolated blip
+        straight into a cooldown it didn't earn."""
+        import news.fetcher as nf
+        mock_claude.messages.create.return_value = self._tool_msg([])
+        nf._batch_score_sentiment(self._articles())
+        assert nf._consecutive_empty_batches == 1
+        mock_claude.messages.create.return_value = self._tool_msg(self._good())
+        nf._batch_score_sentiment(self._articles())
+        assert nf._consecutive_empty_batches == 0
+        assert nf._claude_available() is True
+
+    def test_retry_budget_is_back_to_one_retry(self):
+        """3 attempts never once helped across 83 observed failing cycles."""
+        import news.fetcher as nf
+        assert nf._EMPTY_BATCH_ATTEMPTS == 2
+
+
+class TestEntrySlippageInstrumentation:
+    """
+    v21.13: the signal→fill gap is money lost before the thesis is tested.
+    LAMR (2026-08-06): approved $161.09, filled $164.30 (+1.99%) after 34s —
+    above the stock's high for the entire session. The stop then sat 2% below
+    a price we never chose, and a drift back to the signal price stopped us out
+    28 seconds after entry.
+    """
+
+    @patch("main.record_system_event")
+    def test_large_slippage_warns_and_records_an_event(self, mock_evt):
+        import main
+        main._record_entry_slippage("LAMR_US_EQ", 161.09, 164.30, 34.0)
+        assert mock_evt.call_count == 1
+        assert mock_evt.call_args.args[0] == "entry_slippage_high"
+        assert "LAMR_US_EQ" in mock_evt.call_args.args[1]
+
+    @patch("main.record_system_event")
+    def test_normal_slippage_is_logged_but_not_alerted(self, mock_evt):
+        import main
+        # ITT the same morning: +0.12%, ordinary spread crossing.
+        main._record_entry_slippage("ITT_US_EQ", 224.41, 224.69, 4.0)
+        mock_evt.assert_not_called()
+
+    @patch("main.record_system_event")
+    def test_favourable_fill_never_alerts(self, mock_evt):
+        import main
+        main._record_entry_slippage("X_US_EQ", 100.0, 98.0, 3.0)
+        mock_evt.assert_not_called()
+
+    @patch("main.record_system_event")
+    def test_threshold_is_inclusive_at_the_boundary(self, mock_evt):
+        import main
+        main._record_entry_slippage("X_US_EQ", 100.0, 101.0, 3.0)   # exactly +1.0%
+        assert mock_evt.call_count == 1
+
+    @patch("main.record_system_event")
+    def test_garbage_prices_never_raise(self, mock_evt):
+        """Observability must never break the entry path."""
+        import main
+        for sig, fill in [(0, 100.0), (100.0, 0), (None, 100.0), (100.0, None),
+                          (-5.0, 100.0), (float("nan"), 100.0)]:
+            main._record_entry_slippage("X_US_EQ", sig, fill, 1.0)
+        mock_evt.assert_not_called()
+
+    @patch("main.record_system_event", side_effect=RuntimeError("db down"))
+    def test_event_failure_is_swallowed(self, _evt):
+        import main
+        main._record_entry_slippage("X_US_EQ", 100.0, 105.0, 3.0)   # must not raise
