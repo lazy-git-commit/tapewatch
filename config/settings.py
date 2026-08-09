@@ -31,6 +31,15 @@ class Settings:
     twelvedata_api_key: str = field(default_factory=lambda: os.getenv("TWELVEDATA_API_KEY", ""))
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
 
+    # Qwen (Alibaba Cloud Model Studio) — OPTIONAL, and deliberately absent from
+    # validate()'s required list. Used only by the offline classifier-comparison
+    # harness (analysis/qwen_eval.py). The live trading path never reads these,
+    # so a missing or misnamed secret must degrade to "can't run the eval",
+    # never to a startup crash-loop.
+    qwen_api_key: str = field(default_factory=lambda: os.getenv("QWEN_API_KEY", ""))
+    qwen_base_url: str = field(default_factory=lambda: os.getenv("QWEN_BASE_URL", ""))
+    qwen_model: str = field(default_factory=lambda: os.getenv("QWEN_MODEL", "qwen-flash"))
+
     # ── Trading Mode ──────────────────────────────────────────────────────────
     trading_mode: str = field(default_factory=lambda: os.getenv("TRADING_MODE", "demo"))
 

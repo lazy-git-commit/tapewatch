@@ -202,6 +202,93 @@ FROM heartbeat WHERE job = 'news_cycle';
 
 ---
 
+## `classifier_calls` (v21.14)
+
+One row per classifier API call, for **both** providers. This is the latency and
+liveness dataset behind shadow mode.
+
+**Failed calls are recorded as faithfully as successful ones** — the `ok = false`
+rows *are* the outage record. The 2026-08-04 and 08-06 Claude blind spots (25 and
+58 consecutive empty-classification cycles) left no trace on any monitoring
+surface except journal lines; this table is what makes the next one queryable.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | SERIAL PK | |
+| `provider` | TEXT | `claude` or `qwen`. |
+| `model` | TEXT | Exact model id used. |
+| `called_at` | TEXT | ISO 8601 (London). |
+| `batch_size` | INTEGER | Articles sent. |
+| `latency_ms` | INTEGER | Wall-clock round trip. |
+| `ok` | BOOLEAN | False for exceptions, missing tool call, bad JSON, empty batch. |
+| `scored_count` | INTEGER | Articles actually classified. |
+| `error_type` | TEXT | `empty_batch`, `no_tool_call`, `bad_json`, `no_tool_use`, `bad_shape`, or an exception class name. |
+| `error_detail` | TEXT | First 500 chars. |
+| `tokens_in` / `tokens_out` / `tokens_cached` | INTEGER | Cost + cache-hit tracking. |
+
+```sql
+-- Latency and liveness by provider. p95 matters more than the mean (the news
+-- cycle is 60s and the mean hides the tail that would blow it).
+SELECT provider,
+       count(*)                                        AS calls,
+       avg(ok::int)                                    AS success_rate,
+       percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms) AS p50_ms,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms
+FROM classifier_calls
+WHERE called_at >= to_char(now() - interval '30 days', 'YYYY-MM-DD"T"HH24:MI:SS')
+GROUP BY provider;
+```
+
+⚠️ **Judge liveness on the longest consecutive failure streak, not the success
+rate.** 58 dead cycles in one unbroken run is a 98-minute blind spot but barely
+moves a monthly average. `analysis/classifier_compare.py` reports both.
+
+---
+
+## `qwen_scores` (v21.14)
+
+Shadow-mode classifications from Qwen-Flash. **Never consulted by any trading
+decision** — Claude's `sentiment_scores` row is the only one that can open a
+position.
+
+`UNIQUE(article_id)` with `ON CONFLICT DO NOTHING`, so a retried or overlapping
+batch cannot double-count and skew agreement statistics against Claude.
+
+**Deliberately carries no forward-return columns.** A forward return is a
+property of the ticker and timestamp, not of the model that classified the
+article, so comparisons join `sentiment_scores` on `article_id` and reuse the
+values already computed there. Two copies would drift.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | SERIAL PK | |
+| `article_id` | TEXT UNIQUE | Join key to `sentiment_scores`. |
+| `ticker` / `headline` | TEXT | Denormalised for standalone inspection. |
+| `sentiment` | TEXT | `positive` / `neutral` / `negative`. |
+| `confidence` | REAL | 0.0–1.0. |
+| `catalyst_type` | TEXT | One of the 14 classes; invalid values are rejected, never clamped. |
+| `already_moved` | INTEGER | 0/1. |
+| `catalyst_magnitude` | INTEGER | 1–5, NULL if out of range. |
+| `model` | TEXT | e.g. `qwen-flash`. |
+| `scored_at` | TEXT | ISO 8601 (London). |
+
+```sql
+-- The deciding metric: forward returns of each model's OWN tradeable set.
+-- Agreement is necessary but NOT sufficient — a model can agree 90% of the time
+-- and still differ on exactly the calls TRADEABLE_CATALYSTS acts on.
+SELECT 'claude' AS model, count(*) AS n, avg(s.fwd_return_60m) AS mean_60m
+FROM sentiment_scores s
+WHERE s.catalyst_type IN ('fda_approval','guidance_raise')
+  AND s.sentiment = 'positive' AND s.already_moved = 0
+UNION ALL
+SELECT 'qwen', count(*), avg(s.fwd_return_60m)
+FROM qwen_scores q JOIN sentiment_scores s ON s.article_id = q.article_id
+WHERE q.catalyst_type IN ('fda_approval','guidance_raise')
+  AND q.sentiment = 'positive' AND q.already_moved = 0;
+```
+
+---
+
 ## `system_events` (v17)
 
 Degradation and outage markers. The heartbeat catches a *dead* process, but the

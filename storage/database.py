@@ -259,6 +259,71 @@ def init_db() -> None:
                 ALTER TABLE sentiment_scores
                 ADD COLUMN IF NOT EXISTS fwd_return_eod REAL
             """)
+            # ── Classifier shadow mode (v21.14) ───────────────────────────────
+            # Qwen-Flash runs alongside EVERY Claude batch. Claude's verdict is
+            # the only one that ever reaches a trading decision; Qwen's is
+            # recorded here so the two can be compared on real production
+            # traffic instead of a synthetic benchmark.
+            #
+            # Motivation: Claude is the sole external dependency with no
+            # fallback, and it returned empty classification lists for 25
+            # consecutive cycles on 2026-08-04 and 58 cycles (98 min) on
+            # 2026-08-06. Before trusting a fallback we need evidence on three
+            # axes — latency, liveness, and prediction quality.
+            #
+            # One row per classifier API CALL, both providers. This is the
+            # latency + liveness record: `ok=false` rows ARE the outage data,
+            # so failures must be written just as faithfully as successes.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS classifier_calls (
+                    id            SERIAL PRIMARY KEY,
+                    provider      TEXT    NOT NULL,
+                    model         TEXT,
+                    called_at     TEXT    NOT NULL,
+                    batch_size    INTEGER NOT NULL,
+                    latency_ms    INTEGER,
+                    ok            BOOLEAN NOT NULL,
+                    scored_count  INTEGER NOT NULL DEFAULT 0,
+                    error_type    TEXT,
+                    error_detail  TEXT,
+                    tokens_in     INTEGER,
+                    tokens_out    INTEGER,
+                    tokens_cached INTEGER
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_classifier_calls_provider_time
+                ON classifier_calls (provider, called_at)
+            """)
+            # One row per article Qwen classified. Deliberately does NOT carry
+            # forward-return columns: a forward return is a property of the
+            # ticker and timestamp, not of the model that scored it, so the
+            # comparison joins to sentiment_scores on article_id and reuses the
+            # values already computed there. Duplicating them would let the two
+            # copies drift.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS qwen_scores (
+                    id                 SERIAL PRIMARY KEY,
+                    article_id         TEXT,
+                    ticker             TEXT    NOT NULL,
+                    headline           TEXT,
+                    sentiment          TEXT    NOT NULL,
+                    confidence         REAL    NOT NULL,
+                    catalyst_type      TEXT,
+                    already_moved      INTEGER NOT NULL DEFAULT 0,
+                    catalyst_magnitude INTEGER,
+                    model              TEXT,
+                    scored_at          TEXT    NOT NULL
+                )
+            """)
+            # An article is scored once per provider. The UNIQUE index lets the
+            # writer use ON CONFLICT DO NOTHING, so a retried or overlapping
+            # batch can never double-count and skew the agreement statistics.
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_qwen_scores_article
+                ON qwen_scores (article_id)
+            """)
+
             # Pre-market watchlist: news scored before the open, evaluated at
             # open + open_block with gap/momentum confirmation. status:
             # pending → traded | rejected | expired.
@@ -970,6 +1035,80 @@ _CRITICAL_EVENT_TYPES = {
     "claude_auth_error",
     "zero_trade_session",
 }
+
+
+def record_classifier_call(provider: str, model: str, batch_size: int,
+                           latency_ms: int | None, ok: bool,
+                           scored_count: int = 0,
+                           error_type: str | None = None,
+                           error_detail: str | None = None,
+                           tokens_in: int | None = None,
+                           tokens_out: int | None = None,
+                           tokens_cached: int | None = None) -> None:
+    """
+    Record one classifier API call — the latency and liveness dataset.
+
+    Best-effort: any failure here is swallowed. Observability must never break
+    the news path, and it especially must not turn a Claude outage into a
+    second, self-inflicted failure.
+
+    FAILED calls matter as much as successful ones — `ok=false` rows are the
+    liveness record. Never skip writing one because the call errored.
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO classifier_calls
+                       (provider, model, called_at, batch_size, latency_ms, ok,
+                        scored_count, error_type, error_detail,
+                        tokens_in, tokens_out, tokens_cached)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (provider, model, _now_london(), batch_size, latency_ms, ok,
+                     scored_count, error_type,
+                     (error_detail or "")[:500] or None,
+                     tokens_in, tokens_out, tokens_cached),
+                )
+    except Exception as exc:
+        logger.debug("Could not record classifier_call for %s: %s", provider, exc)
+
+
+def save_qwen_scores(rows: list[dict], model: str) -> int:
+    """
+    Persist shadow-mode Qwen classifications. Returns rows actually inserted.
+
+    ON CONFLICT DO NOTHING against the UNIQUE(article_id) index: an article is
+    scored once per provider, so a retried or overlapping batch cannot
+    double-count and skew the agreement statistics against Claude.
+
+    Best-effort — shadow data is never worth failing a news cycle over.
+    """
+    if not rows:
+        return 0
+    now = _now_london()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """INSERT INTO qwen_scores
+                       (article_id, ticker, headline, sentiment, confidence,
+                        catalyst_type, already_moved, catalyst_magnitude,
+                        model, scored_at)
+                       VALUES (%(article_id)s, %(ticker)s, %(headline)s,
+                               %(sentiment)s, %(confidence)s, %(catalyst_type)s,
+                               %(already_moved)s, %(catalyst_magnitude)s,
+                               %(model)s, %(scored_at)s)
+                       ON CONFLICT (article_id) DO NOTHING""",
+                    [{**r,
+                      "already_moved": int(r.get("already_moved", False)),
+                      "catalyst_magnitude": r.get("catalyst_magnitude"),
+                      "model": model, "scored_at": now}
+                     for r in rows],
+                )
+                return cur.rowcount or 0
+    except Exception as exc:
+        logger.debug("Could not save qwen_scores: %s", exc)
+        return 0
 
 
 def record_system_event(event_type: str, detail: str = "") -> None:

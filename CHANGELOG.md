@@ -7,6 +7,85 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.14 — 2026-08-07 (shadow-mode second classifier: Qwen alongside Claude)
+
+Claude is the only external dependency with **no fallback path**, and it has now
+failed twice in three sessions in a way retries provably cannot fix (25
+consecutive empty-classification cycles on 08-04; 58 cycles / 98 minutes on
+08-06, overlapping the premarket watchlist build). Picking a fallback needs
+evidence, so this release starts collecting it from live production traffic.
+
+**Every batch sent to Claude is now also sent to Qwen-Flash. Claude's verdict
+remains the only one that reaches a trading decision** — nothing in the shadow
+path returns a value to the news pipeline.
+
+### Added — `news/shadow_classifier.py`
+
+Fire-and-forget second classifier, with four deliberate safety properties:
+
+1. **Runs on a background thread.** The news cycle never waits for Qwen, so a
+   slow or hung provider cannot delay a trading decision by a millisecond.
+2. **Single worker, bounded queue** (`_MAX_PENDING=2`). If Qwen is slow enough
+   to back up, batches are DROPPED rather than queued — an unbounded queue would
+   turn a provider slowdown into a memory leak and a thread explosion. The gap
+   in the data is itself the signal.
+3. **Every exception caught and recorded.** A shadow failure is data, never an
+   incident.
+4. **Disabled unless `QWEN_API_KEY` + `QWEN_BASE_URL` are both set**, and
+   `cfg.validate()` deliberately does NOT require them — a missing secret
+   degrades to "no shadow data", never to a startup crash-loop.
+
+Records are validated exactly as the live path does — out-of-range values are
+**rejected, never clamped**. A model emitting nonsense must score as having
+emitted nonsense rather than being quietly corrected into looking competent.
+
+### Added — two tables
+
+- **`classifier_calls`** — one row per API call, **both providers**: latency,
+  ok/failed, error type, batch size, tokens (incl. cached). The `ok=false` rows
+  ARE the liveness record; failures are written as faithfully as successes.
+  Claude's half comes from `fetcher._record_claude_call()`, added here — without
+  it we would have Qwen's numbers with nothing to compare them to.
+- **`qwen_scores`** — one row per article Qwen classified, `UNIQUE(article_id)`
+  with `ON CONFLICT DO NOTHING` so a retried or overlapping batch cannot
+  double-count and skew agreement statistics. Deliberately carries **no**
+  forward-return columns: a forward return is a property of the ticker and
+  timestamp, not of the model, so the comparison joins to `sentiment_scores` and
+  reuses the values already computed there rather than letting two copies drift.
+
+### Added — `analysis/classifier_compare.py`
+
+Read-only assessment over the shadow data. No API calls, no cost, no side
+effects. Design choices that matter:
+
+- **Latency as p50/p95, not mean.** The cycle is 60s; the mean hides the tail
+  that would blow it.
+- **Liveness as success rate AND longest consecutive failure streak.** The
+  streak is the more important figure — 08-06's 58 dead cycles in an unbroken
+  run barely move a monthly success rate, yet they are a 98-minute blind spot.
+- **Prediction judged on forward returns, not agreement.** A model can agree
+  with Claude 90% of the time and still differ on exactly the
+  `fda_approval`/`guidance_raise` calls that `TRADEABLE_CATALYSTS` acts on. The
+  report shows each model's own tradeable set's forward returns, plus a
+  "where they disagreed, who was right" panel.
+- **Refuses to imply a verdict the sample can't support** — prints an explicit
+  readiness check against `_MIN_CALLS_FOR_VERDICT` (200) and
+  `_MIN_PAIRS_FOR_VERDICT` (300).
+
+### Notes
+
+- Qwen reaches Alibaba Model Studio over its **OpenAI-compatible** endpoint
+  (their Anthropic-compatible shim would likely ignore our `cache_control`
+  blocks, and their caching/function-calling docs are written for the OpenAI
+  path). `openai==1.109.1` added to requirements — the live trading path does
+  not import it.
+- The workspace endpoint is **EU-hosted** (`eu-central-1`, Frankfurt), which
+  settles the data-residency question raised when Qwen was first proposed.
+- Use the **dedicated workspace Base URL** from the Model Studio console, not
+  the shared `dashscope-intl` one; a Token Plan requires it.
+
+---
+
 ## v21.13 — 2026-08-06 (retries don't fix an outage; entry slippage made visible)
 
 Deep-dive on 2026-08-06 (4 trades, **−£17.96** — worst day by trade count).

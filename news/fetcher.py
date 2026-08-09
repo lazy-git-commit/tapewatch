@@ -43,6 +43,7 @@ import anthropic
 import pytz
 from config.settings import cfg
 from storage.database import is_article_seen, save_sentiment_scores
+from news.shadow_classifier import shadow_score
 from trading.executor import resolve_t212_ticker
 
 _LONDON = pytz.timezone("Europe/London")
@@ -300,6 +301,37 @@ def _enter_claude_cooldown(seconds: float, reason: str) -> None:
     """Suppress Claude calls for `seconds`; record the reason for logging."""
     global _claude_cooldown
     _claude_cooldown = {"until": time.monotonic() + seconds, "reason": reason}
+
+
+def _record_claude_call(articles: list, latency_ms: int, msg, ok: bool,
+                        scored_count: int = 0,
+                        error_type: str | None = None) -> None:
+    """
+    Record one Claude classification call to `classifier_calls` (v21.14).
+
+    This is Claude's half of the shadow comparison — without it we would have
+    Qwen's latency and liveness with nothing to compare them against. Failed
+    calls are recorded too: the `ok=false` rows ARE the outage record that the
+    2026-08-04 and 08-06 blind spots lacked.
+
+    Best-effort and import-local, exactly like _record_claude_event.
+    """
+    try:
+        from storage.database import record_classifier_call
+        usage = getattr(msg, "usage", None)
+        cached = None
+        if usage is not None:
+            read = getattr(usage, "cache_read_input_tokens", None) or 0
+            cached = read or None
+        record_classifier_call(
+            "claude", "claude-haiku-4-5-20251001", len(articles), latency_ms,
+            ok=ok, scored_count=scored_count, error_type=error_type,
+            tokens_in=getattr(usage, "input_tokens", None) if usage else None,
+            tokens_out=getattr(usage, "output_tokens", None) if usage else None,
+            tokens_cached=cached,
+        )
+    except Exception as exc:
+        logger.debug("Could not record classifier_call for claude: %s", exc)
 
 
 def _record_claude_event(event_type: str, detail: str) -> None:
@@ -725,7 +757,18 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
         # Budget: attempts run ~4-8s each and the backoff totals
         # _EMPTY_BATCH_BACKOFF_SECONDS * 2, which keeps the worst case (~30s)
         # inside the 60s news_cycle cadence.
+        # Shadow-mode second opinion (v21.14). Fire-and-forget on a background
+        # thread BEFORE the Claude call so both providers see the same batch at
+        # the same moment — a like-for-like latency comparison. Claude's answer
+        # remains the only one that reaches a trading decision; nothing is read
+        # back from here. Silently a no-op unless QWEN_* are configured.
+        try:
+            shadow_score(articles, user_content)
+        except Exception as exc:      # must never affect the Claude path
+            logger.debug("Shadow classifier dispatch failed: %s", exc)
+
         for score_attempt in range(_EMPTY_BATCH_ATTEMPTS):
+            _claude_started = time.monotonic()
             msg = _claude.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=max_tokens,
@@ -744,6 +787,7 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
                 # FORCE the tool call — the model cannot reply with prose.
                 tool_choice={"type": "tool", "name": "classify_articles"},
             )
+            _claude_latency_ms = int((time.monotonic() - _claude_started) * 1000)
             classifications = None
             for block in msg.content:
                 if getattr(block, "type", None) == "tool_use":
@@ -751,13 +795,22 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
                     break
             if classifications is None:
                 logger.error("Batch sentiment: no tool_use block in Claude response")
+                _record_claude_call(articles, _claude_latency_ms, msg,
+                                    ok=False, error_type="no_tool_use")
                 return {}
             if not isinstance(classifications, list):
                 logger.error(
                     "Batch sentiment: classifications is %s, not a list — discarding",
                     type(classifications).__name__,
                 )
+                _record_claude_call(articles, _claude_latency_ms, msg,
+                                    ok=False, error_type="bad_shape")
                 return {}
+            _record_claude_call(
+                articles, _claude_latency_ms, msg,
+                ok=bool(classifications), scored_count=len(classifications),
+                error_type=None if classifications else "empty_batch",
+            )
             if classifications:
                 # The classifier is answering again — clear the streak so an
                 # earlier bad patch can't push a later isolated blip straight

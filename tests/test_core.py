@@ -13,6 +13,8 @@ Run with: pytest tests/
 """
 
 import pytest
+import json
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
@@ -4741,6 +4743,188 @@ class TestEmptyBatchCooldown:
         """3 attempts never once helped across 83 observed failing cycles."""
         import news.fetcher as nf
         assert nf._EMPTY_BATCH_ATTEMPTS == 2
+
+
+class TestShadowClassifier:
+    """
+    v21.14: Qwen runs alongside every Claude batch, Claude alone decides.
+
+    The safety properties are the whole point — a shadow that can delay, break
+    or influence a trading decision is worse than no shadow at all. These tests
+    exist to keep that true as the module changes.
+    """
+
+    def setup_method(self):
+        import news.shadow_classifier as sc
+        from config.settings import cfg
+        sc._pending = 0
+        sc._client = None
+        sc._unavailable_logged = False
+
+    teardown_method = setup_method
+
+    def _articles(self, n=3):
+        return [{"id": str(i), "ticker": f"T{i}", "headline": f"h{i}",
+                 "teaser": "t"} for i in range(n)]
+
+    def test_disabled_without_credentials(self):
+        """A missing secret must degrade to 'no shadow data', never break."""
+        import news.shadow_classifier as sc
+        from config.settings import cfg
+        with patch.object(cfg, "qwen_api_key", ""), \
+             patch.object(cfg, "qwen_base_url", ""):
+            assert sc.shadow_enabled() is False
+            sc.shadow_score(self._articles(), "msg")      # must not raise
+
+    def test_dispatch_never_blocks_the_caller(self):
+        """The news cycle must never wait on the shadow provider."""
+        import news.shadow_classifier as sc
+        from config.settings import cfg
+        started = threading.Event()
+        release = threading.Event()
+
+        def _slow(*_a, **_k):
+            started.set()
+            release.wait(5)
+
+        with patch.object(cfg, "qwen_api_key", "k"), \
+             patch.object(cfg, "qwen_base_url", "u"), \
+             patch.object(sc, "_run", _slow):
+            t0 = time.monotonic()
+            sc.shadow_score(self._articles(), "msg")
+            elapsed = time.monotonic() - t0
+            assert started.wait(5), "job never started"
+            assert elapsed < 0.5, f"dispatch blocked for {elapsed:.2f}s"
+            release.set()
+
+    def test_backlog_is_dropped_not_queued(self):
+        """An unbounded queue would turn a slow provider into a memory leak."""
+        import news.shadow_classifier as sc
+        from config.settings import cfg
+        with patch.object(cfg, "qwen_api_key", "k"), \
+             patch.object(cfg, "qwen_base_url", "u"):
+            sc._pending = sc._MAX_PENDING
+            with patch.object(sc, "_get_pool") as pool:
+                sc.shadow_score(self._articles(), "msg")
+                pool.assert_not_called()
+
+    def test_provider_exception_is_recorded_not_raised(self):
+        """A shadow failure is DATA (the liveness signal), never an incident."""
+        import news.shadow_classifier as sc
+        from config.settings import cfg
+        client = MagicMock()
+        client.chat.completions.create.side_effect = RuntimeError("503")
+        with patch.object(cfg, "qwen_api_key", "k"), \
+             patch.object(cfg, "qwen_base_url", "u"), \
+             patch.object(sc, "_get_client", return_value=client), \
+             patch("storage.database.record_classifier_call") as rec:
+            sc._run(self._articles(), "msg")       # must not raise
+            assert rec.call_count == 1
+            assert rec.call_args.kwargs["ok"] is False
+            assert rec.call_args.kwargs["error_type"] == "RuntimeError"
+
+    def test_missing_tool_call_recorded_as_failure(self):
+        """The same failure shape we hedge against on the Claude side."""
+        import news.shadow_classifier as sc
+        from config.settings import cfg
+        resp = MagicMock()
+        resp.choices = [MagicMock(message=MagicMock(tool_calls=[]))]
+        resp.usage = None
+        client = MagicMock()
+        client.chat.completions.create.return_value = resp
+        with patch.object(cfg, "qwen_api_key", "k"), \
+             patch.object(cfg, "qwen_base_url", "u"), \
+             patch.object(sc, "_get_client", return_value=client), \
+             patch("storage.database.record_classifier_call") as rec:
+            sc._run(self._articles(), "msg")
+            assert rec.call_args.kwargs["error_type"] == "no_tool_call"
+            assert rec.call_args.kwargs["ok"] is False
+
+    def test_valid_response_is_persisted(self):
+        import news.shadow_classifier as sc
+        from config.settings import cfg
+        good = {"classifications": [
+            {"id": "0", "sentiment": "positive", "confidence": 0.8,
+             "catalyst_type": "guidance_raise", "already_moved": False,
+             "catalyst_magnitude": 3},
+        ]}
+        call = MagicMock()
+        call.function.arguments = json.dumps(good)
+        resp = MagicMock()
+        resp.choices = [MagicMock(message=MagicMock(tool_calls=[call]))]
+        resp.usage = MagicMock(prompt_tokens=100, completion_tokens=20,
+                               prompt_tokens_details=MagicMock(cached_tokens=80))
+        client = MagicMock()
+        client.chat.completions.create.return_value = resp
+        with patch.object(cfg, "qwen_api_key", "k"), \
+             patch.object(cfg, "qwen_base_url", "u"), \
+             patch.object(sc, "_get_client", return_value=client), \
+             patch("storage.database.save_qwen_scores", return_value=1) as save, \
+             patch("storage.database.record_classifier_call") as rec:
+            sc._run(self._articles(), "msg")
+            rows = save.call_args.args[0]
+            assert len(rows) == 1
+            assert rows[0]["catalyst_type"] == "guidance_raise"
+            assert rows[0]["ticker"] == "T0"          # joined back to the article
+            assert rec.call_args.kwargs["ok"] is True
+            assert rec.call_args.kwargs["tokens_cached"] == 80
+
+    def test_invalid_records_are_rejected_not_clamped(self):
+        """A model emitting nonsense must SCORE as having emitted nonsense."""
+        import news.shadow_classifier as sc
+        from config.settings import cfg
+        payload = {"classifications": [
+            {"id": "0", "sentiment": "bullish", "confidence": 0.8,          # bad enum
+             "catalyst_type": "guidance_raise", "already_moved": False},
+            {"id": "1", "sentiment": "positive", "confidence": 8.0,         # out of range
+             "catalyst_type": "guidance_raise", "already_moved": False},
+            {"id": "2", "sentiment": "positive", "confidence": 0.8,
+             "catalyst_type": "not_a_catalyst", "already_moved": False},    # bad class
+        ]}
+        call = MagicMock()
+        call.function.arguments = json.dumps(payload)
+        resp = MagicMock()
+        resp.choices = [MagicMock(message=MagicMock(tool_calls=[call]))]
+        resp.usage = None
+        client = MagicMock()
+        client.chat.completions.create.return_value = resp
+        with patch.object(cfg, "qwen_api_key", "k"), \
+             patch.object(cfg, "qwen_base_url", "u"), \
+             patch.object(sc, "_get_client", return_value=client), \
+             patch("storage.database.save_qwen_scores", return_value=0) as save, \
+             patch("storage.database.record_classifier_call"):
+            sc._run(self._articles(), "msg")
+            assert save.call_args.args[0] == []
+
+    def test_shadow_never_influences_claude_scores(self):
+        """The contract: shadow_score returns nothing the pipeline can read."""
+        import news.shadow_classifier as sc
+        from config.settings import cfg
+        assert sc.shadow_score(self._articles(), "msg") is None
+
+    @patch("news.fetcher.time.sleep")
+    @patch("news.fetcher._record_claude_event")
+    @patch("news.fetcher.shadow_score", side_effect=RuntimeError("shadow blew up"))
+    @patch("news.fetcher._claude")
+    def test_shadow_failure_cannot_break_scoring(
+        self, mock_claude, _shadow, _evt, _sleep
+    ):
+        """Even a synchronous explosion in dispatch must not affect Claude."""
+        from news.fetcher import _batch_score_sentiment
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": [
+            {"id": "0", "sentiment": "positive", "confidence": 0.9,
+             "catalyst_type": "guidance_raise", "already_moved": False,
+             "catalyst_magnitude": 3},
+        ]}
+        msg = MagicMock()
+        msg.content = [block]
+        mock_claude.messages.create.return_value = msg
+        scores = _batch_score_sentiment(
+            [{"id": "0", "headline": "h", "teaser": "t"}]
+        )
+        assert scores["0"]["catalyst_type"] == "guidance_raise"
 
 
 class TestEntrySlippageInstrumentation:

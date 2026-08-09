@@ -18,7 +18,35 @@ passed, but went from ~80 seconds to just under 8 hours.
 Resetting this state before every test keeps tests independent and fast.
 """
 
+from unittest.mock import patch
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_real_db_observability():
+    """
+    Stub the two best-effort observability writers for every test.
+
+    Both are called from deep inside the news path and both open a real
+    connection. With no database reachable, `get_conn()` retries with backoff —
+    which is how the v21.10 tripwires once turned an 80-second suite into an
+    8-hour one (see the module docstring).
+
+    v21.14 reintroduced the same hazard from a new direction:
+    `record_classifier_call()` fires on EVERY Claude call, so every scoring test
+    paid three connection retries. That alone took the suite from 7m52s to
+    17m37s, and — because `patch("news.fetcher.time.sleep")` patches the shared
+    `time` module object rather than a fetcher-local name — the DB's retry
+    sleeps were also counted by tests asserting on backoff behaviour, failing
+    them for the wrong reason.
+
+    Tests that want to assert on these calls patch them locally, which takes
+    precedence over this fixture.
+    """
+    with patch("storage.database.record_classifier_call"), \
+         patch("storage.database.save_qwen_scores", return_value=0):
+        yield
 
 
 @pytest.fixture(autouse=True)

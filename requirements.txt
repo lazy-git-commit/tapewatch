@@ -4,6 +4,11 @@ requests==2.32.3
 # Sentiment classification
 anthropic==0.54.0
 
+# Offline classifier comparison only (analysis/qwen_eval.py). Alibaba Model
+# Studio speaks the OpenAI protocol, so the OpenAI SDK is the client for it.
+# The live trading path does NOT import this.
+openai==1.109.1
+
 # Market data & price confirmation
 yfinance==1.3.0
 pandas==2.3.2
