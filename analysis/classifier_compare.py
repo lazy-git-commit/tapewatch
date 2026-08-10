@@ -126,19 +126,32 @@ def prediction(days: int) -> dict:
     ticker and timestamp, not of the model that classified the article, so both
     models are scored against the identical outcome data.
     """
-    placeholders = ",".join(["%s"] * len(_TRADEABLE))
+    # DISTINCT ON (article_id) is load-bearing, not tidiness.
+    #
+    # sentiment_scores holds one row per (article, TICKER) — the same Claude
+    # classification fanned out across up to 3 tagged tickers — while
+    # qwen_scores is UNIQUE per ARTICLE. A plain join therefore emits one pair
+    # per ticker, so a 3-ticker article would contribute its single
+    # classification THREE times and triple-weight itself in every agreement
+    # percentage and forward-return mean below. Both models classify per
+    # article, so the comparison must be per article too.
+    #
+    # The kept row is the earliest ticker for that article, chosen
+    # deterministically so repeated runs give identical numbers.
     pairs = _rows(
-        f"""SELECT s.article_id, s.ticker, s.headline,
-                   s.sentiment       AS c_sent,  q.sentiment       AS q_sent,
-                   s.catalyst_type   AS c_cat,   q.catalyst_type   AS q_cat,
-                   s.already_moved   AS c_moved, q.already_moved   AS q_moved,
-                   s.confidence      AS c_conf,  q.confidence      AS q_conf,
-                   s.fwd_return_5m, s.fwd_return_60m,
-                   s.fwd_return_120m, s.fwd_return_eod
-            FROM sentiment_scores s
-            JOIN qwen_scores q ON q.article_id = s.article_id
-            WHERE s.scored_at >= to_char(now() - (%s || ' days')::interval,
-                                         'YYYY-MM-DD"T"HH24:MI:SS')""",
+        """SELECT DISTINCT ON (s.article_id)
+                  s.article_id, s.ticker, s.headline,
+                  s.sentiment       AS c_sent,  q.sentiment       AS q_sent,
+                  s.catalyst_type   AS c_cat,   q.catalyst_type   AS q_cat,
+                  s.already_moved   AS c_moved, q.already_moved   AS q_moved,
+                  s.confidence      AS c_conf,  q.confidence      AS q_conf,
+                  s.fwd_return_5m, s.fwd_return_60m,
+                  s.fwd_return_120m, s.fwd_return_eod
+           FROM sentiment_scores s
+           JOIN qwen_scores q ON q.article_id = s.article_id
+           WHERE s.scored_at >= to_char(now() - (%s || ' days')::interval,
+                                        'YYYY-MM-DD"T"HH24:MI:SS')
+           ORDER BY s.article_id, s.ticker, s.id""",
         (days,),
     )
     if not pairs:

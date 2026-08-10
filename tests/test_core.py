@@ -4902,6 +4902,55 @@ class TestShadowClassifier:
         from config.settings import cfg
         assert sc.shadow_score(self._articles(), "msg") is None
 
+    def test_batch_entries_carry_a_ticker_for_attribution(self):
+        """
+        qwen_scores.ticker is NOT NULL and the batch dicts historically carried
+        only id/headline/teaser — so the shadow writer would have stored an
+        empty string for every row, silently destroying the ticker dimension of
+        the dataset. The prompt does not use this key; attribution does.
+        """
+        import news.fetcher as nf
+        from datetime import datetime as _dt, timezone as _tz
+        article = {
+            "benzinga_id": "a1",
+            "title": "ITT Raises FY2026 Adj EPS Guidance",
+            "teaser": "Guidance raised.",
+            "published": _dt.now(_tz.utc).isoformat(),
+            "tickers": ["ITT"],
+        }
+        with patch.object(nf, "_batch_score_sentiment", return_value={}) as batch, \
+             patch.object(nf, "_fetch", return_value=[article]), \
+             patch.object(nf, "_already_scored", return_value=False):
+            nf.fetch_all_news(seen_checker=lambda *_a: False)
+
+        assert batch.call_args, "the batch was never built — test setup is stale"
+        entries = batch.call_args.args[0]
+        assert entries, "no eligible articles reached the classifier"
+        for entry in entries:
+            assert entry.get("ticker"), f"no ticker on batch entry: {entry}"
+
+    @patch("news.fetcher.shadow_score")
+    @patch("news.fetcher._claude")
+    def test_shadow_still_runs_during_a_claude_cooldown(self, mock_claude, mock_shadow):
+        """
+        The most important data point of the whole exercise.
+
+        A Claude cooldown means Claude is FAILING — precisely the scenario a
+        fallback exists for. If the shadow were gated behind the cooldown check
+        we would never collect a single observation of how Qwen behaves during a
+        Claude outage, which is the question this is meant to answer.
+        """
+        import news.fetcher as nf
+        nf._enter_claude_cooldown(120, "simulated outage")
+        assert nf._claude_available() is False
+
+        scores = nf._batch_score_sentiment(
+            [{"id": "0", "headline": "h", "teaser": "t", "ticker": "AAPL"}]
+        )
+        assert scores == {}                          # Claude still fails closed
+        mock_claude.messages.create.assert_not_called()
+        mock_shadow.assert_called_once()             # ...but Qwen was asked
+
     @patch("news.fetcher.time.sleep")
     @patch("news.fetcher._record_claude_event")
     @patch("news.fetcher.shadow_score", side_effect=RuntimeError("shadow blew up"))

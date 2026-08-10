@@ -35,6 +35,7 @@ Press Ctrl+C to stop gracefully.
 """
 
 import logging
+import math
 import os
 import signal
 import sys
@@ -185,7 +186,13 @@ def _record_entry_slippage(ticker: str, signal_price: float, fill_price: float,
                            elapsed_s: float | None = None) -> None:
     """Log (and alert on) the signal→fill gap. Never raises."""
     try:
-        if not signal_price or signal_price <= 0 or not fill_price or fill_price <= 0:
+        # math.isfinite rejects NaN, which slips past every comparison below
+        # (NaN <= 0 is False, `not NaN` is False) and would otherwise log a
+        # meaningless "nan%" slippage line.
+        if (not signal_price or not fill_price
+                or not math.isfinite(float(signal_price))
+                or not math.isfinite(float(fill_price))
+                or signal_price <= 0 or fill_price <= 0):
             return
         slip_pct = ((fill_price - signal_price) / signal_price) * 100
         took = f" in {elapsed_s:.1f}s" if elapsed_s is not None else ""

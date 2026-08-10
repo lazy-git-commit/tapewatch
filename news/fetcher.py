@@ -708,12 +708,6 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
     if not articles:
         return {}
 
-    # Skip the call while a prior outage/billing failure cooldown is active —
-    # returning {} fails closed (no scores → no trades) without re-hitting a
-    # known-down API every cycle.
-    if not _claude_available():
-        return {}
-
     # Per-cycle content goes in the user message; the static rubric stays in
     # the cached system block.
     lines = []
@@ -724,6 +718,28 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
             line += f'\n   PRIOR ARTICLE(S) TODAY ON THIS TICKER: {prior}'
         lines.append(line)
     user_content = "Articles to classify:\n\n" + "\n\n".join(lines)
+
+    # Shadow-mode second opinion (v21.14). Fire-and-forget on a background
+    # thread; Claude's answer remains the only one that reaches a trading
+    # decision and nothing is read back from here. No-op unless QWEN_* are set.
+    #
+    # Deliberately dispatched BEFORE the Claude cooldown check below. A cooldown
+    # means Claude is FAILING, which is precisely the scenario a fallback exists
+    # for — gating the shadow behind it would guarantee we never collect a
+    # single data point about how Qwen behaves during a Claude outage, the one
+    # question this whole exercise is meant to answer. The cost is bounded: the
+    # cooldown is 120s, Qwen is ~20x cheaper per token, and UNIQUE(article_id)
+    # + ON CONFLICT DO NOTHING means re-offered articles never double-count.
+    try:
+        shadow_score(articles, user_content)
+    except Exception as exc:          # must never affect the Claude path
+        logger.debug("Shadow classifier dispatch failed: %s", exc)
+
+    # Skip the Claude call while a prior outage/billing failure cooldown is
+    # active — returning {} fails closed (no scores → no trades) without
+    # re-hitting a known-down API every cycle.
+    if not _claude_available():
+        return {}
 
     # Tool-use JSON output runs ~55 tokens per article empirically; 60 gives
     # a comfortable margin. Floor at 400 ensures small batches aren't starved.
@@ -757,16 +773,6 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
         # Budget: attempts run ~4-8s each and the backoff totals
         # _EMPTY_BATCH_BACKOFF_SECONDS * 2, which keeps the worst case (~30s)
         # inside the 60s news_cycle cadence.
-        # Shadow-mode second opinion (v21.14). Fire-and-forget on a background
-        # thread BEFORE the Claude call so both providers see the same batch at
-        # the same moment — a like-for-like latency comparison. Claude's answer
-        # remains the only one that reaches a trading decision; nothing is read
-        # back from here. Silently a no-op unless QWEN_* are configured.
-        try:
-            shadow_score(articles, user_content)
-        except Exception as exc:      # must never affect the Claude path
-            logger.debug("Shadow classifier dispatch failed: %s", exc)
-
         for score_attempt in range(_EMPTY_BATCH_ATTEMPTS):
             _claude_started = time.monotonic()
             msg = _claude.messages.create(
@@ -1122,6 +1128,12 @@ def fetch_all_news(
             "id": article_id,
             "headline": html.unescape(article.get("title") or ""),
             "teaser": html.unescape(article.get("teaser") or (article.get("body") or "")[:200]),
+            # Not used to build the Claude prompt (which is id/headline/teaser
+            # only) — carried so shadow mode can attribute its row to a ticker.
+            # Claude's own ticker attribution happens later, when score_rows is
+            # fanned out one row per (article, ticker); qwen_scores is one row
+            # per ARTICLE, so it records the primary tag.
+            "ticker": tickers[0] if tickers else "",
         }
         # Surface today's already-scored articles for the same ticker(s) so a
         # reversal/respin of the same story gets read with that context
