@@ -7,6 +7,79 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.14.2 — 2026-08-11 (a stale minute bar is not "no coverage")
+
+Investigating a three-session zero-trade stretch (08-07, 08-10, 08-11). The
+stretch itself turned out to be the gates working — see the note below — but it
+surfaced one real fault.
+
+**SRRK (Scholar Rock, `fda_approval`, conf 0.75) and NVO were both blacklisted
+for the entire 2026-08-10 session with "no Finnhub/Twelvedata coverage" — over a
+minute bar that was 14.4 minutes old.** They were two of only four
+regular-hours tradeable-catalyst candidates that day. Both are liquid, fully
+covered listings.
+
+The journal line one above the blacklist says it plainly:
+
+```
+Twelvedata: stale bar for SRRK — newest today-bar is 14.4 min old; momentum
+            unavailable, session aggregates kept
+Price check [SRRK]: momentum baseline unavailable and not in open window
+Signal [SRRK_US_EQ] blacklisted for today — no quote after 2 retries
+                    (no Finnhub/Twelvedata coverage)
+```
+
+The provider answered. `get_session_analysis()` returned usable aggregates. What
+was missing was a bar recent enough to measure a 5-minute momentum window
+against — which happens on any name whose minute stream has gaps, and says
+nothing about coverage. But `confirm_price_signal()` returned `None` for it, and
+`main._queue_retry()` counts a `None` as "no provider carries this instrument".
+Two of those blacklist the ticker for the rest of the day.
+
+**This is the fourth appearance of one bug.** A blackout strike asserts a
+specific claim, and only a miss that actually proves that claim may count one:
+
+| | Miss that doesn't prove it |
+|---|---|
+| v21.6 | extended-session miss (our plan has no pre/post bars at all) |
+| v21.11 | miss during a demonstrably frozen feed |
+| v21.12 | one dead ticker polled in a loop, mistaken for a frozen feed |
+| **v21.14.2** | **stale bar — the provider answered, the bar is just old** |
+
+Fixed by routing it through the normal transient path as `stale_bars`: parked in
+the 15-minute re-eval queue, no strike, and — unlike a `None` — it leaves a
+`news_signals` row with a `reason_code`, so the next occurrence is queryable
+instead of journal-only.
+
+**The fix is deliberately narrow.** `sa is None` (the session pull returned
+nothing) is still a hard data failure and still returns `None` — that is the
+EGGF/OXAC infinite-retry loop the blackout was built for. Only a pull that
+SUCCEEDED without a recent bar gets the transient treatment.
+
+### On the zero-trade stretch itself — no changes made, deliberately
+
+Every other rejection over those three sessions was correct, and loosening a
+gate to manufacture trades would undo thresholds that were calibrated on real
+losses:
+
+- **CDNL** (2026-08-11, `guidance_raise` conf 0.85, mag 4) — `dead_cat`: the
+  stock was **−20.03%** on the day. A guidance raise on a name down 20% is the
+  falling knife that guard exists for.
+- **AAON** (2026-08-10, `guidance_raise` conf 0.88, mag 4) — `low_momentum` at
+  −3.77%, then `dead_cat` at −3.45%. It raised guidance and sold off.
+- **YPF** (2026-08-11, `guidance_raise`) — re-evaluated 15 times over the full
+  TTL; momentum oscillated between +0.02% and +0.29% against a +0.2% floor with
+  RVOL 0.2–0.3. There was no participation to confirm.
+- **SCWO** — `penny_stock` at $2.23.
+
+The structural observation, flagged rather than acted on because it is a
+strategy decision: **most tradeable-catalyst news prints premarket**
+(07:00–09:00 ET — 12 of the 19 `fda_approval`/`guidance_raise` positives over
+these three sessions), and premarket entries are off. By the 09:30 open the move
+has usually resolved, sometimes violently against the catalyst (CDNL −20%).
+
+---
+
 ## v21.14.1 — 2026-08-11 (review pass: the comparison tool was measuring nothing)
 
 A `/code-review max` sweep over v21.14. Nothing here changes a trading rule.

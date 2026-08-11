@@ -442,3 +442,87 @@ class TestShadowParityAndFailureRecording:
             assert sc.shadow_score([{"id": "1", "ticker": "T",
                                      "headline": "h"}], "m") is None
         assert sc._pending == 0                  # counter released on failure
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v21.14.2 — a stale minute bar is not "no coverage"
+# ─────────────────────────────────────────────────────────────────────────────
+class TestStaleBarsIsNotMissingCoverage:
+    """
+    2026-08-10: SRRK (Scholar Rock, fda_approval conf 0.75) and NVO were both
+    blacklisted for the whole session with "no Finnhub/Twelvedata coverage"
+    because the newest Twelvedata minute bar was 14.4 minutes old — while the
+    SAME response carried usable session aggregates. Two of only four
+    regular-hours tradeable-catalyst candidates that day, on liquid listings.
+
+    A blackout strike asserts "no provider carries this instrument". A stale
+    bar proves the opposite: the provider answered. This is the fourth version
+    of that same confusion (v21.6 extended sessions, v21.11 frozen feeds,
+    v21.12 the detector itself).
+    """
+
+    @staticmethod
+    def _now_et():
+        from datetime import datetime as _dt
+        import pytz
+        return pytz.timezone("America/New_York").localize(
+            _dt(2026, 8, 10, 12, 4, 0))        # well past the 15-min open window
+
+    def test_stale_bar_defers_instead_of_reporting_no_data(self):
+        """
+        The key assertion is `conf is not None`: returning None is what
+        main._queue_retry counts a blacklist strike against.
+        """
+        from tests.test_core import _confirm_with, _mk_sa
+        conf, _ = _confirm_with(
+            self._now_et(), {"c": 10.5, "o": 10.0, "pc": 10.0},
+            _mk_sa(past_price=None),
+        )
+        assert conf is not None, "None here is read as 'no provider coverage'"
+        assert conf.is_confirmed is False
+        assert conf.reason_code == "stale_bars"
+
+    def test_stale_bars_is_transient_so_it_never_blacklists(self):
+        import main
+        assert "stale_bars" in main._TRANSIENT_REJECT_CODES
+
+    def test_a_real_data_outage_still_returns_none(self):
+        """
+        The guard must stay narrow: when NOTHING comes back, a strike is
+        still the correct response — that is the EGGF/OXAC loop the blackout
+        was built for.
+        """
+        import market.price_check as pc
+        from unittest.mock import MagicMock as _MM
+        fake_dt = _MM()
+        fake_dt.now.side_effect = lambda tz=None: self._now_et()
+        with patch.object(pc, "datetime", fake_dt), \
+             patch.object(pc, "get_trading_session", return_value="regular"), \
+             patch.object(pc, "get_quote_with_fallback", return_value=None):
+            assert pc.confirm_price_signal("ACME_US_EQ") is None
+
+    def test_early_session_still_falls_back_to_the_open(self):
+        """Inside the first 15 min the open price is a fair baseline — unchanged."""
+        from datetime import datetime as _dt
+        import pytz
+        from tests.test_core import _confirm_with, _mk_sa
+        early = pytz.timezone("America/New_York").localize(
+            _dt(2026, 8, 10, 9, 40, 0))
+        conf, _ = _confirm_with(
+            early, {"c": 10.5, "o": 10.0, "pc": 10.0},
+            _mk_sa(past_price=None),
+        )
+        assert conf is not None
+        assert conf.reason_code != "stale_bars"
+
+    def test_a_failed_session_pull_still_returns_none(self):
+        """
+        The narrow half of the fix. `sa is None` means Twelvedata returned
+        nothing — a genuine data failure, and the strike toward the no-quote
+        blackout is correct. Only a pull that SUCCEEDED without a recent bar
+        gets the transient treatment.
+        """
+        from tests.test_core import _confirm_with
+        conf, _ = _confirm_with(
+            self._now_et(), {"c": 10.5, "o": 10.0, "pc": 10.28}, None)
+        assert conf is None

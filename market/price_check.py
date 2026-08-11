@@ -816,10 +816,53 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
                     "Price check [%s]: no momentum window yet — using open=%.4f as baseline",
                     symbol, open_price,
                 )
+            elif sa is not None:
+                # v21.14.2: a REJECTION, not a None — but ONLY when the session
+                # pull itself succeeded.
+                #
+                # The distinction is the whole point. `sa is None` means
+                # Twelvedata gave us nothing and a strike is justified (that is
+                # the EGGF/OXAC loop the blackout was built for, and it still
+                # returns None below). `sa is not None` with no usable
+                # `past_price` means the provider ANSWERED — the log line
+                # immediately above is "stale bar … session aggregates kept" —
+                # and we simply lack a bar recent enough to measure a momentum
+                # window against. That happens on any name whose minute stream
+                # has gaps and says nothing whatsoever about coverage.
+                #
+                # Returning None for that second case meant "no provider
+                # carries this instrument", which is what main._queue_retry
+                # counts strikes against; two strikes blacklist the ticker for
+                # the rest of the day.
+                #
+                # 2026-08-10: SRRK (Scholar Rock, fda_approval conf 0.75) and
+                # NVO were both blacklisted for the day with "no
+                # Finnhub/Twelvedata coverage" over a bar 14.4 minutes old, on
+                # two of only four regular-hours tradeable-catalyst candidates
+                # that session. Both are liquid, fully-covered listings.
+                #
+                # This is the fourth instance of one bug: a strike asserts "no
+                # provider carries this instrument", so only a miss that
+                # actually proves that may count one (cf. v21.6 extended
+                # sessions, v21.11 frozen feeds, v21.12 the detector itself).
+                # A stale bar proves the opposite. Routed through the normal
+                # transient path instead: parked in the 15-min re-eval queue,
+                # no strike, and — unlike a None — it leaves a news_signals row
+                # with a reason_code, so the next occurrence is queryable
+                # rather than journal-only.
+                return _reject(
+                    base, "stale_bars",
+                    f"Momentum baseline unavailable: no recent {symbol} minute "
+                    "bar to measure against (feed gap, not missing coverage) "
+                    "— re-checking while the signal is fresh",
+                )
             else:
+                # The session pull returned nothing at all. This IS a hard data
+                # failure, and a strike toward the no-quote blackout is the
+                # correct response — unchanged.
                 logger.warning(
-                    "Price check [%s]: momentum baseline unavailable and not in "
-                    "open window — cannot evaluate",
+                    "Price check [%s]: no session data and not in open window "
+                    "— cannot evaluate",
                     symbol,
                 )
                 return None

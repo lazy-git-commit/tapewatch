@@ -124,9 +124,15 @@ _retry_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"ite
 # stale_price / stale_volume (v21.11) are data states, not market states: the
 # feed is behind, not the stock. Both clear on their own within minutes, so
 # discarding the signal would throw away a catalyst over a vendor hiccup.
+# stale_bars (v21.14.2) is the same kind of data state — the session pull
+# succeeded but carries no bar recent enough to measure momentum against. It
+# used to return None, which _queue_retry counts as "no provider carries this
+# instrument" and blacklists the ticker for the day after two of them: SRRK and
+# NVO were both lost that way on 2026-08-10 over a 14-minute-old bar, on two of
+# only four regular-hours tradeable candidates that session.
 _TRANSIENT_REJECT_CODES = frozenset(
     {"low_volume", "low_momentum", "overextended", "opening_block",
-     "stale_price", "stale_volume"}
+     "stale_price", "stale_volume", "stale_bars"}
 )
 _REEVAL_TTL_MINUTES = 15
 _reeval_queue: dict[tuple[str, str], dict] = {}  # (article_id, ticker) → {"item", "signal_id", "expires_at"}
