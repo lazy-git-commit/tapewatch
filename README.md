@@ -155,7 +155,7 @@ The system deploys automatically to a Linux VM via GitHub Actions on every push 
 | `DEPLOY_USER` | SSH user (e.g. `root`) |
 | `DEPLOY_SSH_KEY` | SSH private key |
 | `NETWORK_OAUTH_CLIENT_ID` | the private network OAuth client ID — used by `deploy.yml` to join the CI runner to the private network |
-| `NETWORK_OAUTH_CLIENT_SECRET` | Matching OAuth client secret. Scope: **Auth Keys → Write** only. Unlike an auth key it never expires — auth keys cap at 90 days, and when the old one lapsed on 2026-08-11 deploys failed *before* rsync, so the VM silently kept serving the previous build while pushes looked successful. Requires `tag:ci` in the private network policy file (`tagOwners`) with access to the VM on port 22 |
+| `NETWORK_OAUTH_CLIENT_SECRET` | Matching OAuth client secret. Scope: **Auth Keys → Write** only. Unlike an auth key it never expires — auth keys cap at 90 days, and when the old one lapsed on 2026-08-11 deploys failed *before* rsync, so the VM silently kept serving the previous build while pushes looked successful. Requires `tag:deploy-runner` in the private network policy file (`tagOwners`) with access to the VM on port 22 — that tag is applied to the CI runner, not to the VM |
 | ~~`NETWORK_AUTH_KEY`~~ | **Deleted 2026-08-11.** Was only still referenced by `setup_vm.yml` (manual-only, already ran). Re-create it *at the time you rebuild a VM* — that workflow joins the VM as a **persistent** node, so it needs a real auth key, not an OAuth client whose derived keys are ephemeral and would drop the VM off the private network whenever it went offline |
 | `TRADING212_API_KEY` | Trading 212 live API key |
 | `TRADING212_API_KEY_ID` | Trading 212 live API key ID |
