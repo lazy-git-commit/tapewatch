@@ -7,6 +7,169 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.14.1 — 2026-08-11 (review pass: the comparison tool was measuring nothing)
+
+A `/code-review max` sweep over v21.14. Nothing here changes a trading rule.
+Almost everything here changes what the shadow-mode data *says*, and the whole
+point of shadow mode is to make a decision from that data.
+
+Three of these were silent in the worst way — the code ran, wrote rows, and
+printed a report. The report was wrong.
+
+### 1. The comparison tool read every column as its own name (critical)
+
+`analysis/classifier_compare.py::_rows()` did `dict(zip(cols, row))` over
+`cur.fetchall()`. But `get_conn()` sets `cursor_factory = RealDictCursor`, so
+rows are **already dicts** — and iterating a dict yields its KEYS. Every row
+came back as `{'provider': 'provider', 'latency_ms': 'latency_ms', …}`.
+
+Consequences: the liveness loop compared the string `"provider"` against
+`"claude"`, matched nothing, and printed `(no data yet)` for both providers
+regardless of how much data had been collected; the prediction panel did
+`float("fwd_return_5m")` and died with a `ValueError` the moment one paired
+article existed. Every other reader in the repo already used `dict(r)`; this
+one function did not. **The v21.14 `DISTINCT ON` fix could not have changed a
+single reported number until this was fixed.**
+
+### 2. Claude's failures were absent from the liveness record
+
+Claude wrote a `classifier_calls` row only when the HTTP call succeeded *and*
+returned a parseable body. It wrote nothing when suppressed by a cooldown, and
+nothing from any of its five exception handlers (403 billing, 401 auth, 429,
+`APIStatusError`/`APIConnectionError`, generic). Qwen, meanwhile, recorded every
+one of its own failures.
+
+`latency_and_liveness()` computes `success_rate` and `worst_failure_streak` per
+provider **over the rows that exist**. So a total Claude blackout rendered as
+`success_rate = 100%`, `worst_failure_streak = 0` — and the module docstring
+tells the reader to weigh that streak above everything else. The fallback
+decision would have been made on a dataset with Claude's outages deleted.
+
+Now: `_record_claude_failure()` fires on all six paths, with `latency_ms = NULL`
+for a suppressed cycle so the percentiles never see a fake zero. Qwen's
+queue-pressure drops and unusable-client returns are recorded too, for the same
+reason — those were the periods when Qwen was *most* degraded and they were
+being excluded from Qwen's own denominator.
+
+The drop row is buffered in memory and written by the next background job:
+detecting a drop happens on the news-cycle thread, where `get_conn()`'s
+three-attempt backoff could block the trading loop on a database blip.
+
+### 3. A NaN fill price silently disarmed the stop loss (trading safety)
+
+`float("NaN")` raises nothing, and `_parse_fill()` only caught `TypeError` /
+`ValueError`. A NaN made it into `OrderResult.price`, so
+`stop_price = price × (1 − stop_loss_pct/100)` was NaN, the broker rejected the
+resting stop, and **the position held with no stop at all**. Every downstream
+comparison is False against NaN — `current <= stop`, `current >= buy × 1.05`,
+the MFE/MAE band, and the executor's own `abs(slippage) > 3.0` sanity check — so
+nothing else caught it either. The position could only ever exit via the
+time-stop or the EOD flatten.
+
+v21.13 had added a `math.isfinite` guard to the entry-slippage *logging* helper
+only. The guard belongs at the boundary: `_parse_fill()` now returns `None` for
+any non-finite or non-positive price, routing to the known-safe signal-price
+fallback that a missing fill already used.
+
+### 4. Backtest replays wrote into production shadow tables
+
+`backtest/backtest.py` calls `_batch_score_sentiment()`, which dispatches shadow
+scoring unconditionally. `python -m backtest.backtest --week` with `QWEN_*` set
+therefore replayed historical articles into `qwen_scores` — and because that
+table is `UNIQUE(article_id)` with `ON CONFLICT DO NOTHING`, **a replayed row
+permanently blocks the real one for the same article**. Replay latency over
+20-article batches also entered the p50/p95 that decides whether a provider fits
+inside the 60s news cycle, and inflated `min(calls)` toward the readiness
+threshold.
+
+`_batch_score_sentiment(live=False)` now governs both shadow dispatch and
+`classifier_calls` recording. The backtest passes it, and supplies a ticker.
+
+### 5. The tradeable-set comparison did not match the live gates
+
+`would_trade` reproduced three of the four live gates and used a different
+confidence test:
+
+- **Gate 4 (`catalyst_magnitude`) was missing entirely**, though both tables
+  carry the column — so signals production drops were counted as trades.
+- `confidence >= min/10` instead of production's
+  `round(confidence × 10) >= min`. With the deployed threshold of 7 those
+  disagree across the whole `[0.65, 0.70)` band: the model says 0.68,
+  production rounds to 7 and **trades**, the comparison did not count it.
+
+Both errors fed the forward-return panel the module itself calls *the deciding
+metric*. Extracted to `_would_trade()` with all four gates.
+
+### 6. `DISTINCT ON` could keep the leg with no forward returns
+
+`ORDER BY s.article_id, s.ticker, s.id` picked alphabetically.
+`forward_returns.py` measures per (article, ticker) **row**, and yfinance
+regularly has no bars for one leg of a multi-ticker article — so the kept row
+could have all four horizons NULL while the other leg had a measured +3.1%, and
+the article then contributed **zero** samples to either model. On an M&A article
+the alphabetical pick is as likely to land on the flat acquirer as on the target
+that ran 18%. `_MIN_PAIRS_FOR_VERDICT` counts pairs, not returns, so the report
+could print "ENOUGH DATA to judge" over a panel silently thinned this way.
+Now ordered by `(s.fwd_return_60m IS NULL)` first.
+
+### 7. Shadow validation diverged from the live validator, in both directions
+
+The comment claimed parity; there were four mismatches, and each one reshapes
+Qwen's stored distribution for reasons unrelated to model quality. Anything
+rejected here but kept by Claude vanishes from the INNER JOIN — which removes
+Qwen's **worst** answers from the paired sample and flatters the challenger by
+pure survivorship.
+
+| Case | Live path | Shadow (was) |
+|---|---|---|
+| `sentiment: "Positive"` | lowercased, kept | hard-rejected |
+| missing `confidence` | defaults to 0.5 | whole record dropped |
+| `catalyst_magnitude: 3.0` (JSON float) | `int()` → 3 | NULLed (`isinstance(3.0, int)` is False) |
+| `catalyst_magnitude: 7` | whole record rejected | kept with magnitude NULL |
+
+Out-of-range values are still **rejected, never clamped** — that rule was right
+and is unchanged.
+
+Separately, `ok`/`scored_count` are now computed on the **raw** parsed list on
+both sides. Computing them post-validation meant a batch of well-formed answers
+that all missed the taxonomy was filed under the same `empty_batch` error as a
+genuine outage, while Claude emitting identical answers recorded `ok = true`.
+
+### 8. Truncated shadow completions were blamed on the provider
+
+The shadow request sent no `max_tokens` while the live Claude call sizes its
+budget explicitly (`max(400, n × 60 + 64)`). A 30-article batch needs ~1,900
+tokens of tool arguments; the provider default cut the completion mid-object,
+`json.loads` failed, and the row was written as Qwen's own `bad_json`. That
+attributes **our** missing parameter to the provider in the exact liveness
+dataset this feature exists to produce — and because batch size tracks news
+volume, the bias concentrated on the busiest cycles. Now sends the same budget
+and distinguishes `finish_reason == "length"` as `truncated`.
+
+### 9. Tests fired real, billable API calls
+
+v21.14 moved shadow dispatch above the Claude cooldown check, so the cooldown
+tests — which previously returned before any dispatch — began submitting real
+requests to Model Studio on fire-and-forget threads that outlive the test, on
+any machine with `QWEN_*` in `.env` (i.e. the machine used to populate the
+deploy secrets). The autouse fixture that already guarded the DB writers now
+also stubs `news.fetcher.shadow_score` and resets the shadow module's
+process-lifetime state.
+
+### Also
+
+- Stale docs corrected. `config/settings.py`, `.env.example` and
+  `deploy.yml` all still said the `QWEN_*` secrets were read "only by the
+  offline harness `analysis/qwen_eval.py`" and that "the live trading path never
+  reads these" — a file that does not exist, and a claim that v21.14 had
+  inverted. `docs/database_schema.md` documented a comparison query without the
+  fan-out or NULL-leg protections, so the doc and the tool answered the same
+  question with different numbers.
+- 33 regression tests added (`tests/test_review_v21_14_1.py`). Suite: 443
+  passing, 7m32s.
+
+---
+
 ## v21.14 — 2026-08-07 (shadow-mode second classifier: Qwen alongside Claude)
 
 Claude is the only external dependency with **no fallback path**, and it has now

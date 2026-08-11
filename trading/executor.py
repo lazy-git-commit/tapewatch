@@ -353,12 +353,33 @@ def _fetch_fill(order_id: str) -> dict | None:
 
 
 def _parse_fill(fill: dict) -> tuple[float | None, float | None, float | None, float | None]:
-    """Extract (filled_price, net_gbp, fx_rate, fees_gbp) from a Trading 212 fill dict."""
+    """
+    Extract (filled_price, net_gbp, fx_rate, fees_gbp) from a Trading 212 fill dict.
+
+    filled_price is validated finite AND positive here, at the boundary, rather
+    than at each consumer. `float("NaN")` raises nothing, and a NaN price is far
+    worse than a missing one: it propagates into `OrderResult.price`, and from
+    there `stop_price = price * (1 - stop_loss_pct/100)` is NaN, so the resting
+    stop is rejected by the broker and the position is left with NO stop at all.
+    Every downstream comparison (`current <= stop`, `current >= buy * 1.05`, the
+    MFE/MAE band, the executor's own `abs(slippage_pct) > 3.0` sanity check) is
+    False against NaN, so nothing else catches it either and the position can
+    only ever exit via the time-stop or the EOD flatten.
+
+    Returning None instead means the caller falls back to the signal price —
+    the same path an absent fill already takes, which is known-safe.
+    """
     if not fill:
         return None, None, None, None
     try:
         filled_price = float(fill["price"]) if fill.get("price") is not None else None
     except (TypeError, ValueError):
+        filled_price = None
+    if filled_price is not None and not (math.isfinite(filled_price) and filled_price > 0):
+        logger.warning(
+            "Fill carried a non-usable price (%r) — falling back to the signal "
+            "price so the stop is placed against a real number", fill.get("price"),
+        )
         filled_price = None
     impact = fill.get("walletImpact", {})
     try:

@@ -305,7 +305,8 @@ def _enter_claude_cooldown(seconds: float, reason: str) -> None:
 
 def _record_claude_call(articles: list, latency_ms: int, msg, ok: bool,
                         scored_count: int = 0,
-                        error_type: str | None = None) -> None:
+                        error_type: str | None = None,
+                        live: bool = True) -> None:
     """
     Record one Claude classification call to `classifier_calls` (v21.14).
 
@@ -314,8 +315,14 @@ def _record_claude_call(articles: list, latency_ms: int, msg, ok: bool,
     calls are recorded too: the `ok=false` rows ARE the outage record that the
     2026-08-04 and 08-06 blind spots lacked.
 
+    `live=False` (backtest replay) skips the write entirely — see the `live`
+    parameter of _batch_score_sentiment for why replay traffic must stay out of
+    this table.
+
     Best-effort and import-local, exactly like _record_claude_event.
     """
+    if not live:
+        return
     try:
         from storage.database import record_classifier_call
         usage = getattr(msg, "usage", None)
@@ -332,6 +339,40 @@ def _record_claude_call(articles: list, latency_ms: int, msg, ok: bool,
         )
     except Exception as exc:
         logger.debug("Could not record classifier_call for claude: %s", exc)
+
+
+def _record_claude_failure(articles: list, error_type: str,
+                           detail: str | None = None,
+                           latency_ms: int | None = None,
+                           live: bool = True) -> None:
+    """
+    Record a Claude batch that produced NO usable classification (v21.14.1).
+
+    Without this, Claude writes a `classifier_calls` row only when the HTTP
+    call succeeded and returned a parseable body — so every 403/401/429/5xx and
+    every cooldown-suppressed cycle left NO row at all, while the shadow
+    provider records one for each of its own failures. `latency_and_liveness()`
+    computes `success_rate` and `worst_failure_streak` per provider over the
+    rows that exist, so the effect was not a small bias: a total Claude outage
+    rendered as success_rate=100%, worst_failure_streak=0 — the outage rows
+    were simply absent. The module docstring tells the reader to weigh
+    worst_failure_streak above everything else, so the fallback decision would
+    have been made on a dataset with Claude's outages deleted.
+
+    `latency_ms` stays None for a suppressed cycle (no call was made, so there
+    is no latency to report and the percentiles must not see a zero).
+    """
+    if not live:
+        return
+    try:
+        from storage.database import record_classifier_call
+        record_classifier_call(
+            "claude", "claude-haiku-4-5-20251001", len(articles), latency_ms,
+            ok=False, scored_count=0, error_type=error_type,
+            error_detail=(str(detail)[:500] if detail else None),
+        )
+    except Exception as exc:
+        logger.debug("Could not record classifier_call failure for claude: %s", exc)
 
 
 def _record_claude_event(event_type: str, detail: str) -> None:
@@ -693,12 +734,27 @@ def _fetch(lookback_minutes: int) -> list[dict]:
         return []
 
 
-def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
+def _batch_score_sentiment(articles: list[dict],
+                           live: bool = True) -> dict[str, dict]:
     """
     Score sentiment for multiple articles in a single Claude call.
 
-    articles: list of dicts with keys 'id', 'headline', 'teaser', and
+    articles: list of dicts with keys 'id', 'headline', 'teaser', 'ticker', and
               optionally 'prior_context' (see _prior_ticker_context).
+    live:     this batch is production traffic. Governs BOTH shadow dispatch
+              and `classifier_calls` recording, because both write production
+              observability datasets. OFFLINE callers (backtest replays) MUST
+              pass False:
+                * `qwen_scores` is UNIQUE per article with ON CONFLICT DO
+                  NOTHING, so a replayed row permanently blocks the real one
+                  for that article;
+                * `classifier_calls` feeds the p50/p95 that decides whether a
+                  provider fits inside the 60s news cycle — replay latency and
+                  20-article replay batches are not production traffic and
+                  must not be mixed in;
+                * replay volume would also push `min(calls)` past
+                  `_MIN_CALLS_FOR_VERDICT` and invite a verdict on data that
+                  never came from the live path.
     Returns: dict mapping article id → {sentiment, confidence, catalyst_type,
              already_moved}. Empty dict on failure (fail-closed: unscored
              articles are never traded).
@@ -727,18 +783,31 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
     # means Claude is FAILING, which is precisely the scenario a fallback exists
     # for — gating the shadow behind it would guarantee we never collect a
     # single data point about how Qwen behaves during a Claude outage, the one
-    # question this whole exercise is meant to answer. The cost is bounded: the
-    # cooldown is 120s, Qwen is ~20x cheaper per token, and UNIQUE(article_id)
-    # + ON CONFLICT DO NOTHING means re-offered articles never double-count.
-    try:
-        shadow_score(articles, user_content)
-    except Exception as exc:          # must never affect the Claude path
-        logger.debug("Shadow classifier dispatch failed: %s", exc)
+    # question this whole exercise is meant to answer.
+    #
+    # Cost, stated honestly: the empty-batch cooldown is 120s (2 cycles), but
+    # the SAME gate also covers the 1800s billing/auth cooldown — 30 cycles,
+    # each now firing a paid Qwen batch that previously cost nothing, and
+    # because _mark_scored() only fires on Claude success the same (growing)
+    # backlog is re-offered every one of them. That is accepted deliberately:
+    # Qwen-Flash is ~20x cheaper per token, UNIQUE(article_id) + ON CONFLICT DO
+    # NOTHING means re-offered articles never double-count in qwen_scores, and
+    # a billing outage is exactly the event the fallback is being evaluated for.
+    if live:
+        try:
+            shadow_score(articles, user_content)
+        except Exception as exc:      # must never affect the Claude path
+            logger.debug("Shadow classifier dispatch failed: %s", exc)
 
     # Skip the Claude call while a prior outage/billing failure cooldown is
     # active — returning {} fails closed (no scores → no trades) without
     # re-hitting a known-down API every cycle.
     if not _claude_available():
+        # Recorded as a liveness failure even though no HTTP call was made:
+        # from the pipeline's point of view this cycle got no answer from
+        # Claude, which is precisely what the comparison must capture. Omitting
+        # it made a multi-cycle outage invisible in Claude's failure streak.
+        _record_claude_failure(articles, "cooldown_suppressed", live=live)
         return {}
 
     # Tool-use JSON output runs ~55 tokens per article empirically; 60 gives
@@ -802,7 +871,8 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
             if classifications is None:
                 logger.error("Batch sentiment: no tool_use block in Claude response")
                 _record_claude_call(articles, _claude_latency_ms, msg,
-                                    ok=False, error_type="no_tool_use")
+                                    ok=False, error_type="no_tool_use",
+                                    live=live)
                 return {}
             if not isinstance(classifications, list):
                 logger.error(
@@ -810,12 +880,14 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
                     type(classifications).__name__,
                 )
                 _record_claude_call(articles, _claude_latency_ms, msg,
-                                    ok=False, error_type="bad_shape")
+                                    ok=False, error_type="bad_shape",
+                                    live=live)
                 return {}
             _record_claude_call(
                 articles, _claude_latency_ms, msg,
                 ok=bool(classifications), scored_count=len(classifications),
                 error_type=None if classifications else "empty_batch",
+                live=live,
             )
             if classifications:
                 # The classifier is answering again — clear the streak so an
@@ -929,6 +1001,7 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
             )
         _enter_claude_cooldown(_CLAUDE_BILLING_COOLDOWN_SECONDS, f"403 {err_type}")
         _record_claude_event("claude_billing_error", f"403 {err_type}: {exc}")
+        _record_claude_failure(articles, f"403_{err_type}", exc, live=live)
         return {}
     except anthropic.AuthenticationError as exc:
         logger.critical(
@@ -938,6 +1011,7 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
         )
         _enter_claude_cooldown(_CLAUDE_BILLING_COOLDOWN_SECONDS, "401 auth")
         _record_claude_event("claude_auth_error", f"401: {exc}")
+        _record_claude_failure(articles, "401_auth", exc, live=live)
         return {}
 
     # ── Outage / overload / network: transient — short back-off, auto-resume ──
@@ -954,6 +1028,7 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
         # must be visible to the degradation alert, not just the zero-trade
         # tripwire 3 sessions later.
         _record_claude_event("claude_outage", f"429 rate limit: {exc}")
+        _record_claude_failure(articles, "429_rate_limit", exc, live=live)
         return {}
     except (anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
         status = getattr(exc, "status_code", None)
@@ -966,12 +1041,14 @@ def _batch_score_sentiment(articles: list[dict]) -> dict[str, dict]:
             _CLAUDE_OUTAGE_COOLDOWN_SECONDS, f"API status {status}"
         )
         _record_claude_event("claude_outage", f"status {status}: {exc}")
+        _record_claude_failure(articles, f"api_status_{status}", exc, live=live)
         return {}
     except Exception as exc:
         # Unknown failure (malformed response, schema parse, etc.) — fail closed,
         # but DON'T enter a cooldown: this may be a one-off bad batch, and we
         # don't want a single odd article to silence scoring for minutes.
         logger.error("Batch sentiment classification failed: %s", exc, exc_info=True)
+        _record_claude_failure(articles, type(exc).__name__, exc, live=live)
         return {}
 
 
@@ -1130,10 +1207,20 @@ def fetch_all_news(
             "teaser": html.unescape(article.get("teaser") or (article.get("body") or "")[:200]),
             # Not used to build the Claude prompt (which is id/headline/teaser
             # only) — carried so shadow mode can attribute its row to a ticker.
-            # Claude's own ticker attribution happens later, when score_rows is
-            # fanned out one row per (article, ticker); qwen_scores is one row
-            # per ARTICLE, so it records the primary tag.
-            "ticker": tickers[0] if tickers else "",
+            # Claude's own attribution happens later, when score_rows is fanned
+            # out one row per (article, ticker); qwen_scores is one row per
+            # ARTICLE, so it needs a single representative ticker.
+            #
+            # This is the first ELIGIBLE ticker, not the article's primary
+            # Benzinga tag: `tickers` here is already filtered by
+            # resolve_t212_ticker(), the blocklist, and the seen-checker. A
+            # blocklisted TSLA article that also tags LCID is therefore
+            # attributed to LCID. That is acceptable for a shadow row —
+            # comparisons join on article_id, and forward returns are read from
+            # sentiment_scores, which keeps the full per-ticker fan-out.
+            # `eligible` is only appended to when eligible_tickers is non-empty,
+            # so the list is never empty here.
+            "ticker": tickers[0],
         }
         # Surface today's already-scored articles for the same ticker(s) so a
         # reversal/respin of the same story gets read with that context

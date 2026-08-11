@@ -41,11 +41,22 @@ def _no_real_db_observability():
     sleeps were also counted by tests asserting on backoff behaviour, failing
     them for the wrong reason.
 
+    The shadow dispatch is stubbed for a different and worse reason: NETWORK,
+    not latency. `_batch_score_sentiment` fires `shadow_score()` before the
+    Claude cooldown check, so every scoring test — including the cooldown tests
+    that used to return before any dispatch — would submit a real, billable
+    request to Alibaba Model Studio on a fire-and-forget thread that outlives
+    the test, on any machine with QWEN_* in its `.env` (which is exactly the
+    machine used to populate the deploy secrets). `cfg` is read at import, so
+    `shadow_enabled()` is True there. Patching the name as bound in
+    `news.fetcher` leaves `news.shadow_classifier` itself fully testable.
+
     Tests that want to assert on these calls patch them locally, which takes
     precedence over this fixture.
     """
     with patch("storage.database.record_classifier_call"), \
-         patch("storage.database.save_qwen_scores", return_value=0):
+         patch("storage.database.save_qwen_scores", return_value=0), \
+         patch("news.fetcher.shadow_score"):
         yield
 
 
@@ -79,5 +90,14 @@ def _reset_process_level_state():
     import news.fetcher as nf
     nf._consecutive_empty_batches = 0
     nf._claude_cooldown = None
+
+    # Shadow-mode module state (v21.14). _pending is decremented on a background
+    # thread, so a test that leaves a job in flight can strand the counter and
+    # make a later test silently DROP its batch instead of dispatching it.
+    import news.shadow_classifier as sc
+    sc._pending = 0
+    sc._dropped.clear()
+    sc._client = None
+    sc._unavailable_logged = False
 
     yield

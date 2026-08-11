@@ -56,11 +56,49 @@ _MIN_PAIRS_FOR_VERDICT = 300
 
 
 def _rows(sql: str, params=()) -> list[dict]:
+    # get_conn() sets cursor_factory = RealDictCursor, so fetchall() already
+    # yields dict-like rows. Re-zipping them against cur.description would
+    # iterate each row's KEYS and map every column to its own name — silently
+    # producing {'provider': 'provider', ...} for every row.
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
+            return [dict(r) for r in cur.fetchall()]
+
+
+def _would_trade(sentiment, confidence, catalyst, already_moved, magnitude) -> bool:
+    """
+    Reproduce the four live trade gates from news/fetcher.py Step 3.
+
+    This is the only comparison that maps to a real decision, so it has to
+    match production exactly rather than approximately:
+
+      * confidence is compared as `round(conf * 10) >= min_sentiment_confidence`,
+        NOT `conf >= min/10`. With the deployed threshold of 7 those differ for
+        every confidence in [0.65, 0.70) — the model says 0.68, production
+        rounds to 7 and TRADES, a naive float compare says no.
+      * the magnitude floor (Gate 4) is a real gate, not an optional extra;
+        omitting it counts signals production would have dropped.
+    """
+    if (sentiment or "").lower() != "positive":
+        return False
+    if catalyst not in _TRADEABLE:
+        return False
+    if already_moved:
+        return False
+    try:
+        if round(float(confidence or 0) * 10) < cfg.min_sentiment_confidence:
+            return False
+    except (TypeError, ValueError):
+        return False
+    # A NULL magnitude cannot clear a floor > 0. Live rows always carry one;
+    # a shadow row can be NULL only if the model omitted it, which is a miss.
+    if magnitude is None:
+        return cfg.min_catalyst_magnitude <= 0
+    try:
+        return int(magnitude) >= cfg.min_catalyst_magnitude
+    except (TypeError, ValueError):
+        return False
 
 
 def _pct(values: list[float], q: float):
@@ -125,6 +163,15 @@ def prediction(days: int) -> dict:
     Forward returns come from sentiment_scores only — they are a property of the
     ticker and timestamp, not of the model that classified the article, so both
     models are scored against the identical outcome data.
+
+    The join is deliberately INNER. Shadow dispatch happens before the Claude
+    cooldown check, so during a Claude outage Qwen writes `qwen_scores` rows for
+    articles that have no `sentiment_scores` row at all — there is no Claude
+    verdict to compare them against, and (because articles age out of the 3-min
+    freshness window long before a 30-min billing cooldown lifts) there never
+    will be. Excluding them from the PREDICTION panel is correct: a comparison
+    needs both answers. Those cycles are not lost — they are what the LIVENESS
+    panel measures, and that is where a Claude outage is supposed to show up.
     """
     # DISTINCT ON (article_id) is load-bearing, not tidiness.
     #
@@ -136,8 +183,13 @@ def prediction(days: int) -> dict:
     # percentage and forward-return mean below. Both models classify per
     # article, so the comparison must be per article too.
     #
-    # The kept row is the earliest ticker for that article, chosen
-    # deterministically so repeated runs give identical numbers.
+    # Which ticker's row is kept matters, so it is NOT chosen alphabetically.
+    # forward_returns.py measures per (article, ticker) ROW, and yfinance
+    # regularly has no bars for one leg of a multi-ticker article — so an
+    # alphabetical pick can land on a leg whose returns are all NULL and
+    # silence an article that DID have a measured outcome. Rows with a measured
+    # 60m return sort first; s.id breaks the remaining tie deterministically so
+    # repeated runs give identical numbers.
     pairs = _rows(
         """SELECT DISTINCT ON (s.article_id)
                   s.article_id, s.ticker, s.headline,
@@ -145,13 +197,14 @@ def prediction(days: int) -> dict:
                   s.catalyst_type   AS c_cat,   q.catalyst_type   AS q_cat,
                   s.already_moved   AS c_moved, q.already_moved   AS q_moved,
                   s.confidence      AS c_conf,  q.confidence      AS q_conf,
+                  s.catalyst_magnitude AS c_mag, q.catalyst_magnitude AS q_mag,
                   s.fwd_return_5m, s.fwd_return_60m,
                   s.fwd_return_120m, s.fwd_return_eod
            FROM sentiment_scores s
            JOIN qwen_scores q ON q.article_id = s.article_id
            WHERE s.scored_at >= to_char(now() - (%s || ' days')::interval,
                                         'YYYY-MM-DD"T"HH24:MI:SS')
-           ORDER BY s.article_id, s.ticker, s.id""",
+           ORDER BY s.article_id, (s.fwd_return_60m IS NULL), s.id""",
         (days,),
     )
     if not pairs:
@@ -176,12 +229,10 @@ def prediction(days: int) -> dict:
         if bool(p["c_moved"]) == bool(p["q_moved"]):
             agree["already_moved"] += 1
 
-        # "Would this have been traded?" — the only comparison that maps to a
-        # real decision. Mirrors the live gates in news/fetcher.py.
-        c_trade = (p["c_cat"] in _TRADEABLE and p["c_sent"] == "positive"
-                   and not p["c_moved"] and (p["c_conf"] or 0) >= cfg.min_sentiment_confidence / 10)
-        q_trade = (p["q_cat"] in _TRADEABLE and p["q_sent"] == "positive"
-                   and not p["q_moved"] and (p["q_conf"] or 0) >= cfg.min_sentiment_confidence / 10)
+        c_trade = _would_trade(p["c_sent"], p["c_conf"], p["c_cat"],
+                               p["c_moved"], p["c_mag"])
+        q_trade = _would_trade(p["q_sent"], p["q_conf"], p["q_cat"],
+                               p["q_moved"], p["q_mag"])
         would_trade["claude"] += c_trade
         would_trade["qwen"] += q_trade
         would_trade["both"] += (c_trade and q_trade)

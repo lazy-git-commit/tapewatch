@@ -307,6 +307,7 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
                 "id": str(a.get("benzinga_id", "")),
                 "headline": html.unescape(a.get("title", "")),
                 "teaser": html.unescape(a.get("teaser") or a.get("body", "")[:200]),
+                "ticker": (a.get("_tickers") or [""])[0],
             }
             for a in pre_filtered
         ]
@@ -314,7 +315,11 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
         chunk_size = 20
         for i in range(0, len(to_score), chunk_size):
             chunk = to_score[i:i + chunk_size]
-            chunk_scores = _batch_score_sentiment(chunk)
+            # live=False: this is a REPLAY. It must not dispatch shadow-mode
+            # scoring or write classifier_calls — both are production
+            # observability datasets, and qwen_scores is UNIQUE per article, so
+            # a replayed row would permanently block the real one.
+            chunk_scores = _batch_score_sentiment(chunk, live=False)
             scores.update(chunk_scores)
             print(f"  Scored {min(i + chunk_size, len(to_score))}/{len(to_score)} articles...", end="\r", flush=True)
         print()

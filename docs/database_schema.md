@@ -219,10 +219,10 @@ surface except journal lines; this table is what makes the next one queryable.
 | `model` | TEXT | Exact model id used. |
 | `called_at` | TEXT | ISO 8601 (London). |
 | `batch_size` | INTEGER | Articles sent. |
-| `latency_ms` | INTEGER | Wall-clock round trip. |
-| `ok` | BOOLEAN | False for exceptions, missing tool call, bad JSON, empty batch. |
-| `scored_count` | INTEGER | Articles actually classified. |
-| `error_type` | TEXT | `empty_batch`, `no_tool_call`, `bad_json`, `no_tool_use`, `bad_shape`, or an exception class name. |
+| `latency_ms` | INTEGER | Wall-clock round trip. **NULL when no HTTP call was made** (a suppressed or dropped batch) so those rows can't drag the percentiles. |
+| `ok` | BOOLEAN | False for exceptions, missing tool call, bad JSON, empty batch, a suppressed cycle, or a dropped batch. |
+| `scored_count` | INTEGER | Records the model returned, counted **pre-validation on both providers** (v21.14.1) — a batch of well-formed answers that all miss the taxonomy is a scored batch, not an outage, and must not look like a dead API. |
+| `error_type` | TEXT | `empty_batch`, `no_tool_call`, `bad_json`, `truncated`, `no_tool_use`, `bad_shape`, `cooldown_suppressed`, `401_auth`, `403_*`, `429_rate_limit`, `api_status_*`, `dropped_backlog`, `client_unavailable`, or an exception class name. |
 | `error_detail` | TEXT | First 500 chars. |
 | `tokens_in` / `tokens_out` / `tokens_cached` | INTEGER | Cost + cache-hit tracking. |
 
@@ -242,6 +242,26 @@ GROUP BY provider;
 ⚠️ **Judge liveness on the longest consecutive failure streak, not the success
 rate.** 58 dead cycles in one unbroken run is a 98-minute blind spot but barely
 moves a monthly average. `analysis/classifier_compare.py` reports both.
+
+⚠️ **A missing row is not a passing row.** v21.14.1 closed three holes where a
+provider's degraded periods were excluded from its own denominator, which is the
+one failure mode that silently inverts the comparison:
+
+| Hole | Was | Now |
+|---|---|---|
+| Claude in cooldown | no row at all | `cooldown_suppressed`, `latency_ms` NULL |
+| Claude 401/403/429/5xx | no row at all (all five handlers returned early) | one row per failure |
+| Qwen batch dropped for backlog | no row at all | `dropped_backlog`, written by the next background job |
+
+Before this, a **total Claude outage rendered as `success_rate = 100%`,
+`worst_failure_streak = 0`** — the rows describing the outage simply did not
+exist, so the fallback decision would have been made on a dataset with Claude's
+failures deleted. Treat any pre-v21.14.1 rows accordingly.
+
+Note the unit difference when reading streaks: Claude retries an empty batch
+within one cycle and each attempt is a real API call, so it writes up to
+`_EMPTY_BATCH_ATTEMPTS` rows per cycle where Qwen writes one. A Claude streak of
+116 and a Qwen streak of 58 can describe the same 58 dead cycles.
 
 ---
 
@@ -268,23 +288,51 @@ values already computed there. Two copies would drift.
 | `confidence` | REAL | 0.0–1.0. |
 | `catalyst_type` | TEXT | One of the 14 classes; invalid values are rejected, never clamped. |
 | `already_moved` | INTEGER | 0/1. |
-| `catalyst_magnitude` | INTEGER | 1–5, NULL if out of range. |
+| `catalyst_magnitude` | INTEGER | 1–5. A record whose magnitude is out of range is rejected outright (v21.14.1 — matching the live path, which rejects the whole record rather than NULLing the field). |
 | `model` | TEXT | e.g. `qwen-flash`. |
 | `scored_at` | TEXT | ISO 8601 (London). |
+
+**Prefer `python -m analysis.classifier_compare` over hand-written SQL here.**
+Two things make the obvious query wrong, and both are easy to miss:
+
+1. **`sentiment_scores` is one row per (article, TICKER)**; `qwen_scores` is one
+   row per ARTICLE. A plain join fans out, so a 3-ticker article triple-weights
+   its single classification in every mean. The tool uses
+   `DISTINCT ON (s.article_id)`.
+2. **Which ticker leg survives matters.** `forward_returns.py` measures per
+   (article, ticker) row and yfinance often has no bars for one leg, so an
+   arbitrary pick can keep an all-NULL leg and silence an article that *did*
+   have a measured outcome. The tool orders by `(s.fwd_return_60m IS NULL)`
+   first.
 
 ```sql
 -- The deciding metric: forward returns of each model's OWN tradeable set.
 -- Agreement is necessary but NOT sufficient — a model can agree 90% of the time
 -- and still differ on exactly the calls TRADEABLE_CATALYSTS acts on.
-SELECT 'claude' AS model, count(*) AS n, avg(s.fwd_return_60m) AS mean_60m
-FROM sentiment_scores s
-WHERE s.catalyst_type IN ('fda_approval','guidance_raise')
-  AND s.sentiment = 'positive' AND s.already_moved = 0
+--
+-- NOTE: this illustrates the shape only. It omits the confidence and magnitude
+-- gates, and `round(confidence * 10) >= MIN_SENTIMENT_CONFIDENCE` is NOT the
+-- same as `confidence >= 0.7` — they disagree across the whole [0.65, 0.70)
+-- band, which production trades. classifier_compare._would_trade() applies all
+-- four live gates.
+WITH one_row_per_article AS (
+    SELECT DISTINCT ON (s.article_id)
+           s.article_id, s.fwd_return_60m,
+           s.catalyst_type AS c_cat, s.sentiment AS c_sent, s.already_moved AS c_moved,
+           q.catalyst_type AS q_cat, q.sentiment AS q_sent, q.already_moved AS q_moved
+    FROM sentiment_scores s
+    JOIN qwen_scores q ON q.article_id = s.article_id
+    ORDER BY s.article_id, (s.fwd_return_60m IS NULL), s.id
+)
+SELECT 'claude' AS model, count(*) AS n, avg(fwd_return_60m) AS mean_60m
+FROM one_row_per_article
+WHERE c_cat IN ('fda_approval','guidance_raise')
+  AND c_sent = 'positive' AND c_moved = 0
 UNION ALL
-SELECT 'qwen', count(*), avg(s.fwd_return_60m)
-FROM qwen_scores q JOIN sentiment_scores s ON s.article_id = q.article_id
-WHERE q.catalyst_type IN ('fda_approval','guidance_raise')
-  AND q.sentiment = 'positive' AND q.already_moved = 0;
+SELECT 'qwen', count(*), avg(fwd_return_60m)
+FROM one_row_per_article
+WHERE q_cat IN ('fda_approval','guidance_raise')
+  AND q_sent = 'positive' AND q_moved = 0;
 ```
 
 ---

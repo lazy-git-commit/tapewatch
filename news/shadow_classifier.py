@@ -28,7 +28,11 @@ SAFETY PROPERTIES (all deliberate)
    or hung provider cannot delay a trading decision by even a millisecond.
 2. Single worker with a bounded queue. If Qwen is slow enough that work piles
    up, batches are DROPPED rather than queued — an unbounded queue would turn a
-   provider slowdown into a memory leak and a thread explosion.
+   provider slowdown into a memory leak and a thread explosion. Each drop is
+   still RECORDED (`error_type='dropped_backlog'`), because a drop means the
+   provider is degraded and the liveness figures are computed over the rows
+   that exist: leaving a gap would have excluded Qwen's worst periods from its
+   own success-rate denominator.
 3. Every exception is caught and recorded. A shadow failure is data, never an
    incident.
 4. Disabled entirely unless QWEN_API_KEY and QWEN_BASE_URL are both set, so a
@@ -52,10 +56,14 @@ PROVIDER = "qwen"
 # backlog — see safety property 2.
 _MAX_PENDING = 2
 _REQUEST_TIMEOUT = 45
+# Drops are counted on the news-cycle thread and persisted on the background
+# thread (see _flush_drops). This caps that hand-off buffer.
+_MAX_DROPS_BUFFERED = 64
 
 _pool: ThreadPoolExecutor | None = None
 _pool_lock = threading.Lock()
 _pending = 0
+_dropped: list[tuple[int, int]] = []
 _pending_lock = threading.Lock()
 _client = None
 _client_lock = threading.Lock()
@@ -125,6 +133,34 @@ def _extract_usage(resp) -> dict:
     return out
 
 
+def _flush_drops() -> None:
+    """
+    Write one `classifier_calls` row per batch dropped since the last flush.
+
+    Called from the BACKGROUND thread only. The drop itself is detected on the
+    news-cycle thread, where a DB write is not allowed: `get_conn()` retries
+    three times with backoff, so a database blip would block the news cycle for
+    seconds — exactly the coupling safety property 1 exists to prevent. So the
+    drop is counted in memory and persisted here, on the next job to run.
+
+    A drop only ever happens while a job is in flight, and that job flushes on
+    its way out, so the counter is bounded by the drops of one job's duration.
+    """
+    from storage.database import record_classifier_call
+    global _dropped
+    with _pending_lock:
+        pending, _dropped = _dropped, []
+    for batch_size, backlog in pending:
+        try:
+            record_classifier_call(
+                PROVIDER, cfg.qwen_model, batch_size, None, ok=False,
+                error_type="dropped_backlog",
+                error_detail=f"{backlog} job(s) already pending",
+            )
+        except Exception as exc:
+            logger.debug("Could not record shadow drop: %s", exc)
+
+
 def _run(articles: list[dict], user_message: str) -> None:
     """Body of one shadow scoring job. Runs on the background thread."""
     # Imported here rather than at module scope to avoid a circular import
@@ -134,6 +170,14 @@ def _run(articles: list[dict], user_message: str) -> None:
 
     client = _get_client()
     if client is None:
+        # Recorded, not silently dropped: a permanently dead client (typo'd
+        # QWEN_BASE_URL, `openai` not installed) would otherwise be
+        # indistinguishable from "shadow was never enabled", because the
+        # warning inside _get_client latches once per process.
+        record_classifier_call(
+            PROVIDER, cfg.qwen_model, len(articles), None, ok=False,
+            error_type="client_unavailable",
+        )
         return
 
     by_id = {str(a.get("id")): a for a in articles}
@@ -142,6 +186,14 @@ def _run(articles: list[dict], user_message: str) -> None:
         resp = client.chat.completions.create(
             model=cfg.qwen_model,
             temperature=0,
+            # Sized exactly as the live Claude call. Omitting it lets the
+            # provider apply its own default, which truncates a large batch
+            # mid-object — the completion then fails to parse and gets recorded
+            # as Qwen's own `bad_json` failure, attributing our missing
+            # parameter to the provider in the very liveness dataset this
+            # module exists to produce. Batch size tracks news volume, so the
+            # bias would concentrate on the busiest cycles.
+            max_tokens=max(400, len(articles) * 60 + 64),
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -173,44 +225,71 @@ def _run(articles: list[dict], user_message: str) -> None:
             error_type="no_tool_call", **usage,
         )
         return
+    # A completion truncated by the output cap lands here as invalid JSON.
+    # Distinguish it so a sizing problem on our side is never filed as the
+    # provider being unreliable.
+    finish = getattr(resp.choices[0], "finish_reason", None) if resp.choices else None
     try:
         payload = json.loads(calls[0].function.arguments)
     except (json.JSONDecodeError, TypeError) as exc:
         record_classifier_call(
             PROVIDER, cfg.qwen_model, len(articles), latency_ms, ok=False,
-            error_type="bad_json", error_detail=str(exc), **usage,
+            error_type="truncated" if finish == "length" else "bad_json",
+            error_detail=f"finish_reason={finish}: {exc}", **usage,
         )
         return
 
+    # ok/scored_count are computed on the RAW list, exactly as the Claude path
+    # does (news/fetcher.py records before its own per-record validation loop).
+    # Computing them post-validation instead made the two providers'
+    # liveness columns incomparable: a batch of well-formed answers that all
+    # missed the taxonomy would have been filed under the same `empty_batch`
+    # error_type as a genuine outage, while Claude emitting the identical
+    # answers records ok=true.
+    parsed = payload.get("classifications") or []
+
     rows = []
-    for rec in payload.get("classifications") or []:
+    for rec in parsed:
         if not isinstance(rec, dict):
             continue
         art = by_id.get(str(rec.get("id")))
         if art is None:
             continue
-        # Validate exactly as the live path does: reject out-of-range values,
-        # never clamp them. A model that emits nonsense should score as having
-        # emitted nonsense, not be quietly corrected into looking competent.
-        if rec.get("catalyst_type") not in CATALYST_TYPES:
+        # Validate exactly as the live path does — same coercions, same
+        # accept/reject boundaries. Divergence here is not a small mismatch:
+        # anything rejected on this side but kept on Claude's disappears from
+        # the INNER JOIN in classifier_compare.prediction(), which would
+        # remove Qwen's WORST answers from the paired sample and flatter the
+        # challenger with pure survivorship bias.
+        #
+        # Out-of-range values are rejected, never clamped — a confidence of 7
+        # is more likely a mis-scaled 0-10 answer than a genuine 100%, and
+        # guessing the scale is worse than not scoring the article.
+        sentiment = str(rec.get("sentiment", "neutral")).lower()
+        if sentiment not in ("positive", "neutral", "negative"):
             continue
-        if rec.get("sentiment") not in ("positive", "neutral", "negative"):
+        catalyst = str(rec.get("catalyst_type", "other"))
+        if catalyst not in CATALYST_TYPES:
             continue
         try:
-            conf = float(rec.get("confidence"))
+            # Same defaults as fetcher.py: a missing field is a default, not a
+            # dropped record, or a model that simply omits `confidence` would
+            # be scored as having failed rather than as having answered.
+            conf = float(rec.get("confidence", 0.5))
+            # int(3.0) == 3: JSON has no integer type, so a magnitude that
+            # round-trips as a float is still a valid magnitude.
+            mag = int(rec.get("catalyst_magnitude", 1))
         except (TypeError, ValueError):
             continue
-        if not 0.0 <= conf <= 1.0:
+        if not (0.0 <= conf <= 1.0) or not (1 <= mag <= 5):
             continue
-        mag = rec.get("catalyst_magnitude")
-        mag = mag if isinstance(mag, int) and 1 <= mag <= 5 else None
         rows.append({
             "article_id": str(rec.get("id")),
             "ticker": art.get("ticker") or "",
             "headline": art.get("headline"),
-            "sentiment": rec["sentiment"],
+            "sentiment": sentiment,
             "confidence": conf,
-            "catalyst_type": rec["catalyst_type"],
+            "catalyst_type": catalyst,
             "already_moved": bool(rec.get("already_moved", False)),
             "catalyst_magnitude": mag,
         })
@@ -218,11 +297,12 @@ def _run(articles: list[dict], user_message: str) -> None:
     saved = save_qwen_scores(rows, cfg.qwen_model)
     record_classifier_call(
         PROVIDER, cfg.qwen_model, len(articles), latency_ms,
-        ok=bool(rows), scored_count=len(rows),
-        error_type=None if rows else "empty_batch", **usage,
+        ok=bool(parsed), scored_count=len(parsed),
+        error_type=None if parsed else "empty_batch", **usage,
     )
-    logger.info("Shadow [qwen]: %d/%d scored in %dms (%d new rows)",
-                len(rows), len(articles), latency_ms, saved)
+    logger.info("Shadow [qwen]: %d returned, %d valid of %d articles in %dms "
+                "(%d new rows)",
+                len(parsed), len(rows), len(articles), latency_ms, saved)
 
 
 def shadow_score(articles: list[dict], user_message: str) -> None:
@@ -237,12 +317,29 @@ def shadow_score(articles: list[dict], user_message: str) -> None:
         return
     with _pending_lock:
         if _pending >= _MAX_PENDING:
-            # Dropping is the correct behaviour: shadow data is a nice-to-have,
-            # an unbounded queue is a memory leak, and a backlog means the
-            # provider is degraded — which the gap in the data will itself show.
-            logger.debug("Shadow [qwen]: %d job(s) pending — dropping batch", _pending)
-            return
-        _pending += 1
+            dropped = _pending
+        else:
+            _pending += 1
+            dropped = None
+    if dropped is not None:
+        # Dropping is still the correct behaviour: shadow data is a
+        # nice-to-have, an unbounded queue is a memory leak, and a backlog
+        # means the provider is degraded.
+        #
+        # But the drop is RECORDED rather than left as a gap. The original
+        # reasoning — "the gap in the data will itself show it" — was wrong as
+        # implemented: latency_and_liveness() computes success_rate over the
+        # rows that EXIST, so a provider slow enough to saturate the single
+        # worker for an hour would report a high success rate and a
+        # worst_failure_streak of 0. The periods when Qwen is degraded were
+        # precisely the periods excluded from its own denominator.
+        logger.debug("Shadow [qwen]: %d job(s) pending — dropping batch", dropped)
+        with _pending_lock:
+            # Bounded: capped well above the drops one job's duration can
+            # produce, so a pathological stall can never grow this without end.
+            if len(_dropped) < _MAX_DROPS_BUFFERED:
+                _dropped.append((len(articles), dropped))
+        return
 
     def _job():
         global _pending
@@ -251,6 +348,10 @@ def shadow_score(articles: list[dict], user_message: str) -> None:
         except Exception as exc:                      # belt and braces
             logger.debug("Shadow [qwen] job failed: %s", exc)
         finally:
+            try:
+                _flush_drops()
+            except Exception as exc:
+                logger.debug("Shadow [qwen] drop flush failed: %s", exc)
             with _pending_lock:
                 _pending -= 1
 
