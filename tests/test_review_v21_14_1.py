@@ -372,8 +372,16 @@ class TestShadowParityAndFailureRecording:
         assert rec.call_args.kwargs["error_type"] == "bad_json"
 
     def test_a_max_tokens_budget_is_sent(self):
-        """The live Claude call sizes its budget; the shadow must match it."""
+        """
+        The live Claude call sizes its budget; the shadow must match it.
+
+        Asserted against the live CONSTANTS, not a copied formula. The original
+        version of this test hard-coded `max(400, n*60+64)` — so when that
+        formula turned out to be the cause of the empty-batch outages (v21.15),
+        the test defended the bug instead of catching it.
+        """
         import news.shadow_classifier as sc
+        import news.fetcher as f
         client = MagicMock()
         client.chat.completions.create.side_effect = RuntimeError("stop here")
         with self._enabled(), \
@@ -382,7 +390,8 @@ class TestShadowParityAndFailureRecording:
             sc._run([{"id": str(i), "ticker": "T", "headline": "h"}
                      for i in range(30)], "msg")
         sent = client.chat.completions.create.call_args.kwargs["max_tokens"]
-        assert sent == max(400, 30 * 60 + 64)
+        assert sent == max(f._MIN_OUTPUT_TOKENS,
+                           30 * f._TOKENS_PER_ARTICLE + 256)
 
     def test_dropped_batches_are_recorded_off_the_caller_thread(self):
         """
@@ -526,3 +535,156 @@ class TestStaleBarsIsNotMissingCoverage:
         conf, _ = _confirm_with(
             self._now_et(), {"c": 10.5, "o": 10.0, "pc": 10.28}, None)
         assert conf is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v21.15 — "empty batch" was our own truncation all along
+# ─────────────────────────────────────────────────────────────────────────────
+class TestOutputBudgetAndTruncation:
+    """
+    The 2026-08-04 (25 cycles) and 2026-08-06 (58 cycles / 98 min) outages were
+    diagnosed three times as Claude returning an empty classification list, and
+    "fixed" three times (v21.7 one retry, v21.12 three retries, v21.13 a
+    cooldown). None of those addressed the cause.
+
+    Production `classifier_calls` rows over 2026-08-12..14: 26 Claude calls had
+    tokens_out EXACTLY equal to `max(400, n*60+64)`, all 26 recorded
+    scored_count=0, and there were exactly 26 `empty_batch` errors. The measured
+    cost of a classification is 68-72 tokens/article — above the 60 allowed. We
+    were cutting the response off mid tool-call; a truncated forced-tool-use
+    response still returns 200 OK with a tool_use block whose `input` never
+    finished serialising, so it reads as an empty answer.
+
+    That also explains why retries never worked (deterministic — same batch,
+    same truncation), why it self-reinforced (`_mark_scored` only fires on
+    success, so the next batch is BIGGER), and why it always self-healed
+    (articles aged out, shrinking the batch until it fit).
+    """
+
+    def _articles(self, n):
+        return [{"id": str(i), "headline": f"h{i}", "teaser": "t",
+                 "ticker": f"T{i}_US_EQ"} for i in range(n)]
+
+    def test_budget_exceeds_measured_cost_per_article(self):
+        """
+        The regression that caused the outages: a per-article allowance BELOW
+        what a classification actually costs. Measured 68-72; anything at or
+        under that truncates once fixed overhead stops covering the gap.
+        """
+        import news.fetcher as f
+        assert f._TOKENS_PER_ARTICLE >= 100, (
+            "measured cost is 68-72 tokens/article — a budget near that has no "
+            "headroom and truncates large batches"
+        )
+        # A 25-article batch is the size that actually broke in production.
+        budget = max(f._MIN_OUTPUT_TOKENS, 25 * f._TOKENS_PER_ARTICLE + 256)
+        assert budget > 25 * 72, "no headroom over the worst measured rate"
+
+    def test_large_batch_gets_a_bigger_budget_than_the_old_formula(self):
+        import news.fetcher as f
+        for n in (8, 16, 21, 25):
+            old = max(400, n * 60 + 64)          # the formula that truncated
+            new = max(f._MIN_OUTPUT_TOKENS, n * f._TOKENS_PER_ARTICLE + 256)
+            assert new > old, f"batch {n}: {new} is not more than {old}"
+
+    def test_truncation_is_recorded_as_truncated_not_empty_batch(self):
+        """
+        The misdiagnosis itself. Filing this as `empty_batch` is what sent three
+        releases chasing retries and cooldowns instead of the budget.
+        """
+        import news.fetcher as f
+        msg = MagicMock()
+        msg.stop_reason = "max_tokens"
+        msg.content = []
+        msg.usage = MagicMock(input_tokens=100, output_tokens=1564,
+                              cache_read_input_tokens=0)
+        with patch.object(f, "_claude_available", return_value=True), \
+             patch.object(f, "_claude") as claude, \
+             patch.object(f, "_record_claude_event") as evt, \
+             patch.object(f, "_record_claude_call") as rec:
+            claude.messages.create.return_value = msg
+            assert f._batch_score_sentiment(self._articles(25)) == {}
+
+        assert rec.call_args.kwargs["error_type"] == "truncated"
+        assert rec.call_args.kwargs["ok"] is False
+        assert evt.call_args.args[0] == "claude_truncated_batch"
+
+    def test_truncation_does_not_burn_the_retry_budget(self):
+        """
+        Retrying a truncation is pointless — same batch, same size, same
+        deterministic cut-off. It must fail fast, exactly once.
+        """
+        import news.fetcher as f
+        msg = MagicMock()
+        msg.stop_reason = "max_tokens"
+        msg.content = []
+        msg.usage = None
+        with patch.object(f, "_claude_available", return_value=True), \
+             patch.object(f, "_claude") as claude, \
+             patch.object(f, "_record_claude_event"), \
+             patch.object(f, "_record_claude_call"):
+            claude.messages.create.return_value = msg
+            f._batch_score_sentiment(self._articles(20))
+        assert claude.messages.create.call_count == 1
+
+    def test_truncation_does_not_trip_the_empty_batch_cooldown(self):
+        """
+        A budget bug must not stand the classifier down for 120s — that would
+        turn our own misconfiguration into a self-inflicted outage.
+        """
+        import news.fetcher as f
+        msg = MagicMock()
+        msg.stop_reason = "max_tokens"
+        msg.content = []
+        msg.usage = None
+        with patch.object(f, "_claude_available", return_value=True), \
+             patch.object(f, "_claude") as claude, \
+             patch.object(f, "_record_claude_event"), \
+             patch.object(f, "_record_claude_call"), \
+             patch.object(f, "_enter_claude_cooldown") as cooldown:
+            claude.messages.create.return_value = msg
+            f._batch_score_sentiment(self._articles(20))
+        cooldown.assert_not_called()
+        assert f._consecutive_empty_batches == 0
+
+    def test_a_complete_response_is_unaffected(self):
+        """stop_reason of a normal completion must not be mistaken for truncation."""
+        import news.fetcher as f
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": [
+            {"id": "0", "sentiment": "positive", "confidence": 0.8,
+             "catalyst_type": "guidance_raise", "already_moved": False,
+             "catalyst_magnitude": 3},
+        ]}
+        msg = MagicMock()
+        msg.stop_reason = "tool_use"
+        msg.content = [block]
+        msg.usage = None
+        with patch.object(f, "_claude_available", return_value=True), \
+             patch.object(f, "_claude") as claude, \
+             patch.object(f, "_record_claude_call"):
+            claude.messages.create.return_value = msg
+            out = f._batch_score_sentiment(self._articles(1))
+        assert out["0"]["catalyst_type"] == "guidance_raise"
+
+    def test_shadow_shares_the_live_budget(self):
+        """
+        The shadow must not carry its own copy of the number. A shadow scored
+        under a different budget is not a like-for-like comparison, and the
+        v21.14.1 hard-coded duplicate is what truncated 10 Qwen batches and
+        filed them as the provider's fault.
+        """
+        import news.shadow_classifier as sc
+        import news.fetcher as f
+        from config.settings import cfg
+        client = MagicMock()
+        client.chat.completions.create.side_effect = RuntimeError("stop")
+        with patch.object(cfg, "qwen_api_key", "k"), \
+             patch.object(cfg, "qwen_base_url", "u"), \
+             patch.object(sc, "_get_client", return_value=client), \
+             patch("storage.database.record_classifier_call"):
+            sc._run(self._articles(25), "msg")
+        sent = client.chat.completions.create.call_args.kwargs["max_tokens"]
+        assert sent == max(f._MIN_OUTPUT_TOKENS,
+                           25 * f._TOKENS_PER_ARTICLE + 256)

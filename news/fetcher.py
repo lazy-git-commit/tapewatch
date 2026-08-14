@@ -267,6 +267,17 @@ _EMPTY_BATCH_BACKOFF_SECONDS = 2.0
 _EMPTY_BATCH_COOLDOWN_TRIGGER = 2
 _EMPTY_BATCH_COOLDOWN_SECONDS = 120
 
+# Classification output budget (v21.15). Measured from production
+# `classifier_calls` rows: a real classification costs 68-72 output tokens per
+# article, so the old 60/article allowance was BELOW cost and truncated large
+# batches mid tool-call — which is what every "empty batch" outage actually was
+# (see the long note in _batch_score_sentiment). These are deliberately ~2x the
+# measured need: max_tokens is a ceiling, only generated tokens are billed, and
+# forced tool use with a strict schema means the model cannot ramble to fill it.
+# Under-budgeting has cost entire sessions; over-budgeting costs nothing.
+_TOKENS_PER_ARTICLE = 150
+_MIN_OUTPUT_TOKENS = 1024
+
 # Consecutive news cycles whose batch came back empty on every attempt. Reset by
 # ANY successful scoring pass (see _batch_score_sentiment) — a single good cycle
 # means the classifier is answering again.
@@ -811,8 +822,43 @@ def _batch_score_sentiment(articles: list[dict],
         return {}
 
     # Tool-use JSON output runs ~55 tokens per article empirically; 60 gives
-    # a comfortable margin. Floor at 400 ensures small batches aren't starved.
-    max_tokens = max(400, len(articles) * 60 + 64)
+    # ── Output budget (v21.15 — this was THE "empty batch" bug) ──────────────
+    #
+    # The old budget was `max(400, n * 60 + 64)`, from a claimed "~55 tokens per
+    # article empirically". Measured against real production rows in
+    # `classifier_calls`, the true cost is 68-72 tokens/article — ABOVE the
+    # allowance. So on any batch big enough for the fixed overhead to stop
+    # covering the gap, the response hit the ceiling and was cut off mid
+    # tool-call.
+    #
+    # A truncated forced-tool-use response still returns 200 OK with a tool_use
+    # block, but its `input` never finished serialising, so
+    # `block.input.get("classifications", [])` yields []. That is the entire
+    # "well-formed but EMPTY classifications list" mystery below: not Claude
+    # declining to answer, us cutting it off mid-sentence.
+    #
+    # Proof, 2026-08-12..14: 26 Claude calls had tokens_out EXACTLY equal to
+    # this cap; all 26 recorded scored_count=0; and there were exactly 26
+    # `empty_batch` errors in the same window. A 1:1 match.
+    #
+    # It also explains every property of the outages that never fit the old
+    # theory:
+    #   * why retries never helped (v21.7/v21.12) — same batch, same size, same
+    #     deterministic truncation, so a retry is a re-run of the failure;
+    #   * why it SELF-REINFORCED — `_mark_scored()` only fires on success, so a
+    #     failed cycle returns a BIGGER batch next minute, which truncates
+    #     harder: a death spiral, not a flaky API;
+    #   * why it always self-recovered without intervention — articles aged out
+    #     via `max_age_minutes`, shrinking the batch until it fit again;
+    #   * why it clustered at premarket and session boundaries (2026-08-04
+    #     07:00 ET, 2026-08-06 07:00-08:38 ET) — that is when the overnight
+    #     backlog makes batches largest.
+    #
+    # max_tokens is a CEILING, not a charge — only tokens actually generated
+    # are billed, and forced tool use with a strict schema means the model
+    # cannot ramble to fill it. So the budget is now generous on purpose:
+    # under-budgeting costs whole trading sessions, over-budgeting costs zero.
+    max_tokens = max(_MIN_OUTPUT_TOKENS, len(articles) * _TOKENS_PER_ARTICLE + 256)
     try:
         # Retries when Claude returns a well-formed but EMPTY classifications
         # list for a non-empty batch. This is not a parsing failure — the 200 OK
@@ -863,6 +909,30 @@ def _batch_score_sentiment(articles: list[dict],
                 tool_choice={"type": "tool", "name": "classify_articles"},
             )
             _claude_latency_ms = int((time.monotonic() - _claude_started) * 1000)
+
+            # v21.15: a response cut off at the ceiling is a BUDGET failure, not
+            # a model failure, and must never again be filed as `empty_batch`.
+            # Truncation returns 200 OK with a tool_use block whose input never
+            # finished serialising, so it is indistinguishable from a genuine
+            # empty answer unless stop_reason is read — which is exactly how it
+            # went misdiagnosed across v21.7, v21.12 and v21.13.
+            if getattr(msg, "stop_reason", None) == "max_tokens":
+                logger.error(
+                    "Batch sentiment: Claude response TRUNCATED at max_tokens=%d "
+                    "for a %d-article batch — the classification list is "
+                    "incomplete and is being discarded. This is our output "
+                    "budget, not a Claude fault; raise _TOKENS_PER_ARTICLE.",
+                    max_tokens, len(articles),
+                )
+                _record_claude_call(articles, _claude_latency_ms, msg,
+                                    ok=False, error_type="truncated", live=live)
+                _record_claude_event(
+                    "claude_truncated_batch",
+                    f"response hit max_tokens={max_tokens} on a "
+                    f"{len(articles)}-article batch — output budget too small",
+                )
+                return {}
+
             classifications = None
             for block in msg.content:
                 if getattr(block, "type", None) == "tool_use":

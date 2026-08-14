@@ -7,6 +7,97 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.15 — 2026-08-14 (the "empty batch" outages were our own truncation)
+
+**The single most consequential bug found so far.** Three releases "fixed" it
+without touching the cause.
+
+`_batch_score_sentiment` budgeted `max(400, n * 60 + 64)` output tokens, from a
+code comment claiming "~55 tokens per article empirically". Measured against
+real `classifier_calls` rows, a classification actually costs **68-72 tokens per
+article** — *above* the allowance. So once a batch grew past the point where the
+fixed overhead stopped covering the gap, Claude's response was cut off mid
+tool-call.
+
+A truncated forced-tool-use response still returns **200 OK with a `tool_use`
+block**, but its `input` never finished serialising — so
+`block.input.get("classifications", [])` yields `[]`. Indistinguishable from a
+genuine empty answer unless you read `stop_reason`.
+
+### The evidence
+
+Production rows, 2026-08-12..14:
+
+| | |
+|---|---|
+| Claude calls with `tokens_out` **exactly equal** to the cap | 26 |
+| Of those, calls recording `scored_count = 0` | **26** |
+| `empty_batch` errors in the same window | **26** |
+
+A 1:1 match, with `tokens_out` landing on the cap to the token
+(`25×60+64 = 1564`, `21×60+64 = 1324`, `16×60+64 = 1024`, …).
+
+### Why this explains everything the old theory did not
+
+- **Why retries never worked** (v21.7 one retry, v21.12 three). Same batch, same
+  size, same deterministic truncation — a retry re-runs the failure. 2026-08-06
+  burned ~174 API calls across 58 cycles proving this.
+- **Why it self-reinforced.** `_mark_scored()` only fires on success, so a failed
+  cycle re-offers the same articles *plus* new ones. The batch grows, truncates
+  harder, and the next one grows again. A death spiral, not a flaky API.
+- **Why it always self-healed without intervention.** Articles aged out via
+  `max_age_minutes`, shrinking the batch until it fit again.
+- **Why it clustered at premarket and session boundaries** (2026-08-04 07:00 ET,
+  2026-08-06 07:00-08:38 ET, 2026-07-27 16:06 ET). That is exactly when the
+  overnight/boundary backlog makes batches largest.
+
+The v21.13 cooldown, ironically, was the closest thing to a real mitigation —
+standing the classifier down let the backlog age out, which shrank the batch.
+It treated the symptom by accident.
+
+### Fixes
+
+1. **Budget raised and named**: `_TOKENS_PER_ARTICLE = 150`,
+   `_MIN_OUTPUT_TOKENS = 1024` — roughly 2× measured need. `max_tokens` is a
+   ceiling, not a charge: only generated tokens are billed, and forced tool use
+   with a strict schema means the model cannot ramble to fill it. Under-budgeting
+   has cost entire sessions; over-budgeting costs nothing.
+2. **Truncation is now visible**: `stop_reason == "max_tokens"` is detected,
+   logged as our budget fault, recorded as `error_type='truncated'`, and raises a
+   `claude_truncated_batch` system_event. It returns immediately without
+   consuming a retry and **without tripping the empty-batch cooldown** — a
+   configuration bug must not stand the classifier down for 120s.
+3. **Shadow shares the live constants** by import rather than a copied formula.
+   The v21.14.1 duplicate truncated 10 Qwen batches in three days, every one with
+   `tokens_out` exactly at the cap, all filed as Qwen's own `truncated` failure —
+   our sizing blamed on the provider, concentrated on the busiest cycles, biasing
+   the paired sample toward small batches.
+4. The v21.14.1 test that asserted the old formula was **defending the bug**. It
+   now asserts parity against the live constants instead.
+
+### Zero-trade investigation (08-12, 08-13) — no gates changed
+
+12 tradeable-catalyst positives; **10 printed premarket**, the same structural
+pattern as the previous stretch. The two that reached regular-hours confirmation
+were both correctly rejected on the `extended_move` ceiling:
+
+- **SMCI** — `guidance_raise`, already **+13.99%** on the day.
+- **BIRK** — `guidance_raise`, already **+17.39%** on the day.
+
+**RIGL** (`fda_approval`, conf 0.90, mag 4 — the strongest signal of the period)
+graduated to the at-open evaluation and was rejected on `low_momentum`: −0.38%
+with RVOL 0.1 and a day change of +0.05%. An FDA approval the tape ignored
+entirely.
+
+The `confidence` gate was checked as a possible cause and ruled out: every
+rejection at 5.5-6.5/10 was a `contract_win`/`product_launch`/`other` headline
+that Gate 2 would have dropped anyway. No tradeable catalyst was lost to it.
+
+`stale_bars` (v21.14.2) did not fire in this window — neither exercised nor
+contradicted.
+
+---
+
 ## v21.14.2 — 2026-08-11 (a stale minute bar is not "no coverage")
 
 Investigating a three-session zero-trade stretch (08-07, 08-10, 08-11). The

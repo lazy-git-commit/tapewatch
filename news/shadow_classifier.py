@@ -165,7 +165,9 @@ def _run(articles: list[dict], user_message: str) -> None:
     """Body of one shadow scoring job. Runs on the background thread."""
     # Imported here rather than at module scope to avoid a circular import
     # (fetcher imports this module).
-    from news.fetcher import CATALYST_TYPES, _CLASSIFY_TOOL, _SYSTEM_PROMPT
+    from news.fetcher import (CATALYST_TYPES, _CLASSIFY_TOOL,
+                             _MIN_OUTPUT_TOKENS, _SYSTEM_PROMPT,
+                             _TOKENS_PER_ARTICLE)
     from storage.database import record_classifier_call, save_qwen_scores
 
     client = _get_client()
@@ -186,14 +188,19 @@ def _run(articles: list[dict], user_message: str) -> None:
         resp = client.chat.completions.create(
             model=cfg.qwen_model,
             temperature=0,
-            # Sized exactly as the live Claude call. Omitting it lets the
-            # provider apply its own default, which truncates a large batch
-            # mid-object — the completion then fails to parse and gets recorded
-            # as Qwen's own `bad_json` failure, attributing our missing
-            # parameter to the provider in the very liveness dataset this
-            # module exists to produce. Batch size tracks news volume, so the
-            # bias would concentrate on the busiest cycles.
-            max_tokens=max(400, len(articles) * 60 + 64),
+            # Same budget as the live Claude call, IMPORTED rather than
+            # duplicated so the two can never drift — a shadow scored under a
+            # different budget is not a like-for-like comparison.
+            #
+            # v21.15: the v21.14.1 version hard-coded Claude's old
+            # `n * 60 + 64`, which was BELOW the 68-72 tokens/article both
+            # models actually need. Ten Qwen batches truncated in three days,
+            # every one with tokens_out exactly equal to the cap, all recorded
+            # as Qwen's own `truncated` failure — our sizing blamed on the
+            # provider. Batch size tracks news volume, so it landed on the
+            # busiest cycles and biased the paired sample toward small batches.
+            max_tokens=max(_MIN_OUTPUT_TOKENS,
+                           len(articles) * _TOKENS_PER_ARTICLE + 256),
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
