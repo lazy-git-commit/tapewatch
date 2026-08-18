@@ -258,10 +258,11 @@ A positive classification only becomes a tradeable signal if **all** pass:
 
 1. **Confidence** ≥ `MIN_SENTIMENT_CONFIDENCE` (default 7/10). This setting
    existed since v1 but was never enforced until v14.
-2. **Catalyst class** in `TRADEABLE_CATALYSTS` — v20 default:
-   **fda_approval, guidance_raise** only. Pruned 2026-07-10 using the
-   system's own eval loop: forward returns of every positive,
-   not-already-moved, confidence≥0.7 signal over 60 days (avg @5/15/60 min):
+2. **Catalyst class** in `TRADEABLE_CATALYSTS` — **v21.16 default:
+   `guidance_raise` only** (v20 default was fda_approval + guidance_raise).
+   Pruned 2026-07-10 using the system's own eval loop: forward returns of every
+   positive, not-already-moved, confidence≥0.7 signal over 60 days
+   (avg @5/15/60 min):
 
    | class          | n   | 5m     | 15m    | 60m    | verdict |
    |----------------|-----|--------|--------|--------|---------|
@@ -283,6 +284,25 @@ A positive classification only becomes a tradeable signal if **all** pass:
    2 and was deliberately NOT raised. Every class is still scored and
    persisted, so a class can be re-enabled the moment fresh forward-return
    evidence supports it — and only then.
+
+   **v21.16 — fda_approval removed.** The table above ranks classes by RAW
+   forward return, which answers "does the stock drift up?" and not "does a
+   trade with our stop survive long enough to collect the drift?". Re-running
+   the same population as an actual simulation (entry at the signal, −2% stop,
+   +5% take-profit, 120-min hold, 0.46pp round-trip costs) separates them:
+
+   | class          | n   | gross   | **net/trade** | win rate | t    |
+   |----------------|-----|---------|---------------|----------|------|
+   | guidance_raise | 193 | +1.127% | **+0.667%**   | 50%      | 5.51 |
+   | fda_approval   | 106 | +0.314% | **−0.146%**   | 32%      | 1.44 |
+
+   fda_approval's +1.42%/60m is real but too small and too volatile to clear a
+   2% stop plus costs: a 32% win rate sits below the **33% break-even** the FX
+   round trip imposes (§11). t=1.44 means *no measurable edge in either
+   direction* — not "proven to lose" — so this is capital allocation, not a
+   verdict: at ~0.5 trades/day, splitting throughput with a zero-edge class
+   halves the sample on the class that measures +0.667%. Live P&L cannot
+   arbitrate: fda_approval has exactly one closed trade (−0.38%).
 3. **`already_moved` is false** — the model's own judgement that the move
    pre-dates the article.
 
@@ -371,7 +391,7 @@ Checks run cheapest-first; each rejection records a `reason_code`:
 | 5 | `extended_move` | > **+10%** vs **prev close** (was 25% until v21.11) | Closes the v13 hole: stock up 80% on the day but flat in the last 5 min passed the 5-min ceiling. v21.11 retuned it on the realized record — see "Day-move ceiling" below |
 | 5.5 | `stale_volume` | \|day move\| ≥ **5%** while RVOL < **0.5** — **TRANSIENT (v21.11)** | NVT: +15.59% on the day reported alongside RVOL 0.28, while the first minute alone traded ~10% of an average day. Price and volume disagreeing that hard means the volume feed is behind — see below |
 | 6 | `illiquid` | 20-day ADV × price < **$5M** | **ADV-based on purpose**: spike-day volume explodes and would pass exactly the halt patterns this blocks. Exit slippage depends on the NORMAL book (GOAI: $390k ADV → −18.99% stop fill) |
-| 7 | `low_momentum` | < +0.2% over ~5 min (v15: dead-tape noise floor only) | Just rejects "the catalyst moved nothing"; VWAP does the real work (step 10). Moves below −0.2% log as "tape moving against the signal" (same code) |
+| 7 | `low_momentum` | < +0.2% over ~5 min (v15: dead-tape noise floor only). **v21.16: SKIPPED on flat tape for `SKIP_MOMENTUM_CATALYSTS`** | Just rejects "the catalyst moved nothing"; VWAP does the real work (step 10). Moves below −0.2% log as "tape moving against the signal" (same code) — and that branch is **still enforced** for skipped classes. See "The momentum gate's bill" below |
 | 8 | `high_momentum` | > +15% over ~5 min | Post-halt spike — halt articles publish AFTER the 30–120% pop. Runs before VWAP to save a credit |
 | 9 | `low_volume` / `high_volume` | RVOL outside [1.5, 20] | See RVOL section (v20: session minute-bar volume is THE numerator — current, unlike the lagging daily bar the v19.2 "rescue" had to work around. v20.2: the FLOOR only bypasses to a held-VWAP check above `RVOL_BYPASS_MIN_ADV_DOLLAR` — see below) |
 | 10 | `below_vwap` | price < session VWAP (− small tol) | v15: size-neutral accumulation test — see below |
@@ -698,6 +718,64 @@ so "bar #5" could silently be 20 minutes old, stretching the momentum window
 per-stock. The baseline is the newest bar at least `MOMENTUM_LOOKBACK_MINUTES`
 old, with a 10-minute staleness guard on the freshest bar (the VECO incident:
 a bar from 09:56 served at 11:42 produced a false +1.20% momentum reading).
+
+### The momentum gate's bill — why `SKIP_MOMENTUM_CATALYSTS` exists (v21.16)
+
+The `low_momentum` floor is a genuine filter. Measured on its own decisions,
+signals that eventually cleared it returned **+0.86%/60m (n=20)** against
+**+0.11% (n=66)** for signals that never did. It selects better stocks.
+
+It is also, by construction, a *delay*. A signal that fails the floor goes into
+the 15-min re-eval queue and is only bought once the tape has moved — which
+means we buy **after** the move rather than into it. That delay is paid for in
+entry price, and the entry price is where the stop lives:
+
+> Enter ~2% higher and the −2% stop sits at the price the news originally fired
+> at. Ordinary reversion to that price — the price the market has already
+> agreed on — is then enough to stop us out.
+
+LAMR (2026-08-06) is the clean instance: signalled at $161.09, filled at
+$164.30 (above the stock's high for the *entire* session), stopped out 28
+seconds later on a drift back to ~$161. It is not a one-off — of the last five
+closed trades, **three never traded above their own entry price at any point**
+(`max_favorable_pct`: ITT −0.12%, CEG −0.36%, LAMR −1.91%). The failure is not
+in the exit rules; those trades were losses from the instant they filled.
+
+Simulated over 2026-06→08 with the live exit rules, entering at the signal
+price gives **+0.667%/trade net** for `guidance_raise` (50% win, t=5.51)
+against a live record of **−1.65%/trade at 21%**. The whole mechanism is the
+stop-out rate: **48% live → 33% simulated**. The filter is worth less than the
+2% it costs to obtain.
+
+So for the classes in `SKIP_MOMENTUM_CATALYSTS` the floor is skipped —
+**narrowly**:
+
+- **Flat tape only.** The gate always distinguished "nobody has reacted yet"
+  from "sellers are in control despite the positive catalyst" (the `−0.2%`
+  branch). Only the first is what the delay costs us. The simulation *cannot*
+  tell them apart — it sampled prices at 5/15/60/120 min, so a signal that was
+  −4% at the moment of entry is indistinguishable from a flat one — so buying
+  into active selling was never the measured strategy. That branch still
+  rejects, and stays TRANSIENT so the signal keeps its second chance.
+- **The floor only.** The momentum *ceiling*, VWAP, RVOL, liquidity, spread,
+  day-move ceiling and entry-quote freshness are untouched.
+- **Regular-hours signals only.** `premarket/scanner.py` deliberately does not
+  pass `catalyst_type`, so gap-and-go candidates keep the floor: a gap
+  candidate is on the watchlist *because* the move already happened, which is
+  the opposite of the case that was measured.
+
+`cfg.validate()` refuses `SKIP_MOMENTUM_CATALYSTS` without
+`REQUIRE_VWAP_CONFIRMATION`. Once the floor is off, VWAP is the only remaining
+market-agreement evidence behind an entry; with both off the signal would be
+Claude's opinion and nothing else, and nothing but that check coupled two
+otherwise independent knobs.
+
+**⚠️ The open risk.** The 33% simulated stop-out rate is optimistic by
+construction (4-point sampling cannot see intra-window dips), and the edge
+survives only until the true rate reaches ~50%. Live is 48%. `trades.signal_price`
+(§9) exists to settle this from real rows rather than sampling; Grafana panels
+25/26 are the read-out, and ~20 post-v21.16 trades are needed before they mean
+anything. Reverting is `SKIP_MOMENTUM_CATALYSTS=` with no code change.
 
 ---
 

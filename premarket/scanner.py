@@ -497,6 +497,16 @@ def evaluate_premarket_candidates() -> tuple[list[tuple[dict, PriceConfirmation]
     # finishes harmlessly in a daemon-ish background thread; we simply ignore its
     # result. This keeps the news cycle returning promptly (well under its 60s
     # interval) so the fast candidates' verdicts get acted on immediately.
+    # NOTE (v21.16): `catalyst_type` is deliberately NOT passed here, so the
+    # momentum floor stays enforced on the gap-and-go path. The buy-at-signal
+    # measurement that motivates cfg.skip_momentum_catalysts was made on
+    # regular-hours news signals, where the catalyst has just published and the
+    # tape has not reacted yet. A gap candidate is the opposite case by
+    # construction — the move ALREADY happened overnight, which is what put it
+    # on the watchlist — so "don't wait for the move" does not transfer, and
+    # the gap band is not a substitute for it. Candidates that graduate into
+    # the regular-hours re-eval queue do get the skip, because at that point
+    # they are being evaluated as ordinary intraday signals.
     confs: dict[int, PriceConfirmation | None] = {}
     workers = min(_EVAL_MAX_WORKERS, len(live))
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pmc-eval")

@@ -45,6 +45,11 @@ cheapest checks first so we fail fast and spend fewer API credits):
                        look-back window. v15: this is now only a DEAD-TAPE
                        noise floor (default 0.2%); the real accumulation
                        judgement is VWAP (step 10), which is size-neutral.
+                       v21.16: SKIPPED for cfg.skip_momentum_catalysts when
+                       the tape is flat — waiting for the floor to clear costs
+                       ~2% of entry price, which is more than the filter is
+                       worth. Still enforced when the tape is moving AGAINST
+                       the signal, and still enforced for every other class.
   8. high_momentum   — but NOT up more than cfg.max_price_move_pct in that
                        window — that is a post-halt spike, not an entry.
                        Runs before VWAP so spikes don't waste a VWAP credit.
@@ -604,6 +609,14 @@ class PriceConfirmation:
                                     # drives extended-hours order routing,
                                     # half-sizing and the no-resting-stop
                                     # regime downstream
+    # v21.16: did this confirmation reach approval only because the momentum
+    # FLOOR was skipped for its catalyst class? Persisted on the trade row as
+    # `entry_reason`, because otherwise the two entry paths are
+    # indistinguishable after the fact: a trade that confirmed on its first
+    # look WITH momentum present and one that confirmed because the floor was
+    # bypassed both show a zero wait cost. Separating them is the whole
+    # treatment-vs-control comparison for the v21.16 change.
+    momentum_skipped: bool = False
 
 
 def _reject(base: dict, code: str, reason: str) -> "PriceConfirmation":
@@ -619,7 +632,11 @@ def _reject(base: dict, code: str, reason: str) -> "PriceConfirmation":
     return PriceConfirmation(**base, is_confirmed=False, reason=reason, reason_code=code)
 
 
-def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmation | None:
+def confirm_price_signal(
+    t212_ticker: str,
+    fast: bool = False,
+    catalyst_type: str | None = None,
+) -> PriceConfirmation | None:
     """
     Check whether a ticker is experiencing active, tradeable upward momentum
     that corroborates a bullish news signal.
@@ -627,6 +644,14 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
     Returns None only when a hard data failure makes it impossible to evaluate
     the signal (Finnhub down, Twelvedata down). Confirmed/rejected signals
     are returned as PriceConfirmation with is_confirmed set accordingly.
+
+    `catalyst_type` (v21.16) is the class Claude assigned to the article. It is
+    used by exactly one gate: a class listed in cfg.skip_momentum_catalysts
+    bypasses the `low_momentum` FLOOR, entering at the price the catalyst was
+    published at instead of waiting in the re-eval queue for the tape to
+    confirm. Passing None keeps the historical behaviour (floor enforced), so
+    every caller that has no catalyst in hand is unaffected. See the gate
+    itself (step 7) for the measurement behind this.
 
     `fast` (default False) is for the time-boxed pre-market eval window: it makes
     EVERY Twelvedata call non-blocking (no retry backoff) — the quote fallback/
@@ -701,6 +726,9 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
             recent_move_pct=0.0, current_volume=0, avg_volume=0,
             rvol=0.0, avg_dollar_volume=None, spread_proxy_pct=None,
             session=session,
+            # Flipped by gate 7 when the floor is bypassed; flows into both the
+            # approve and reject constructors via **base.
+            momentum_skipped=False,
         )
 
         # ── 0. Entry-price freshness (v21.11) ────────────────────────────────
@@ -1008,7 +1036,45 @@ def confirm_price_signal(t212_ticker: str, fast: bool = False) -> PriceConfirmat
         # With VWAP confirmation on (step 9), this only rejects dead-flat tape —
         # a catalyst that produced literally no move. The "is it being
         # accumulated?" judgement is VWAP's job, not a fixed % threshold's.
-        if recent_move_pct < cfg.min_price_move_pct:
+        #
+        # v21.16: for the classes in cfg.skip_momentum_catalysts the floor is
+        # skipped entirely. It is a real filter — signals that eventually
+        # cleared it returned +0.86%/60m vs +0.11% for those that never did —
+        # but clearing it takes TIME, and the re-eval queue means we buy after
+        # the move rather than into it. That pushes the entry ~2% higher, which
+        # leaves the −2% stop sitting at the price the news originally fired
+        # at, where ordinary reversion takes us out (LAMR 2026-08-06: signalled
+        # $161.09, filled $164.30, stopped 28s later on a drift back to $161).
+        # Three of the last five closed trades never traded above their own
+        # entry price at any point. Simulated over 193 guidance_raise signals,
+        # entering at the signal is +0.667%/trade net vs the live −1.65%.
+        #
+        # ⚠️ The skip covers FLAT tape only. The gate already distinguished two
+        # states (see below) and only one of them is what costs us: "nobody has
+        # reacted yet" is exactly the moment we want to buy, but "sellers are in
+        # control despite the positive catalyst" is a falling knife, and the
+        # backtest that motivated this cannot see it — it sampled the price at
+        # 5/15/60/120 min, so a signal that was −4% at the moment of entry looks
+        # identical to one that was flat. Buying active selling is not the
+        # measured strategy, so the against-the-tape branch keeps rejecting
+        # (and stays TRANSIENT, so it still re-evaluates for the full window).
+        skip_floor = (
+            bool(catalyst_type)
+            and catalyst_type in cfg.skip_momentum_catalysts
+            and recent_move_pct >= -cfg.min_price_move_pct
+        )
+        if skip_floor and recent_move_pct < cfg.min_price_move_pct:
+            # Recorded on the trade row so this entry is identifiable as a
+            # v21.16 bypass forever, not just in today's journal.
+            base["momentum_skipped"] = True
+            logger.info(
+                "Momentum floor SKIPPED [%s] catalyst=%s: %+.2f%% over ~%d min is "
+                "below the %.2f%% floor, but this class enters at the signal price "
+                "rather than waiting for the tape (VWAP + RVOL still enforced)",
+                symbol, catalyst_type, recent_move_pct,
+                cfg.momentum_lookback_minutes, cfg.min_price_move_pct,
+            )
+        elif recent_move_pct < cfg.min_price_move_pct:
             # Same gate, two distinct market states worth telling apart in the
             # logs: flat tape (catalyst ignored so far — retriable) vs tape
             # actively moving AGAINST the signal (observed 2026-07-07: DOCN

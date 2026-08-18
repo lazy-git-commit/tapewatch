@@ -497,14 +497,42 @@ class TestDigestPrefilter:
 class TestCatalystPrune:
     """v20: TRADEABLE_CATALYSTS default pruned to measured-positive classes."""
 
-    def test_default_is_evidence_backed_pair(self):
+    def test_default_excludes_every_measured_negative_class(self):
         # Defaults matter: a missing env var must not silently re-enable the
-        # classes the forward-return data measured as negative.
+        # classes the forward-return data measured as negative. Asserted as an
+        # invariant over the excluded set rather than an equality against the
+        # current list — the point of the test is that these classes cannot
+        # come back by accident, not that the default has one particular value.
         import os
         from config.settings import Settings
         old = os.environ.pop("TRADEABLE_CATALYSTS", None)
         try:
-            assert Settings().tradeable_catalysts == ["fda_approval", "guidance_raise"]
+            enabled = set(Settings().tradeable_catalysts)
+        finally:
+            if old is not None:
+                os.environ["TRADEABLE_CATALYSTS"] = old
+        measured_negative = {
+            "contract_win", "ma_target", "earnings_beat", "product_launch",
+            "short_squeeze", "analyst_action", "recap_explainer",
+            "offering_dilution", "ma_acquirer", "halt_or_resume",
+        }
+        assert not (enabled & measured_negative), (
+            "a class with measured-negative forward returns is tradeable by default"
+        )
+        assert enabled, "TRADEABLE_CATALYSTS default must not be empty"
+
+    def test_default_is_the_simulated_profitable_class(self):
+        # v21.16: fda_approval dropped. Its +1.42%/60m raw drift is real but
+        # does not survive a 2% stop plus 0.46pp round-trip costs — simulated
+        # net −0.146%/trade at a 32% win rate against a 33% break-even, vs
+        # guidance_raise at +0.667% and 50%. Live P&L cannot arbitrate this
+        # (fda_approval has exactly one closed trade), so the default encodes
+        # the simulation and this test pins it against a silent revert.
+        import os
+        from config.settings import Settings
+        old = os.environ.pop("TRADEABLE_CATALYSTS", None)
+        try:
+            assert Settings().tradeable_catalysts == ["guidance_raise"]
         finally:
             if old is not None:
                 os.environ["TRADEABLE_CATALYSTS"] = old

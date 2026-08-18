@@ -146,7 +146,9 @@ two earlier releases duplicated the arithmetic and the copies drifted.
 | `catalyst_type` | one of 14 classes (`earnings_beat`, `fda_approval`, `ma_target`, `halt_or_resume`, `offering_dilution`, ...) |
 | `already_moved` | `true` if the move pre-dates the article (halt/recap pattern) |
 
-**Trade gates (code, not model):** a positive only trades if `confidence ≥ MIN_SENTIMENT_CONFIDENCE`, `catalyst_type ∈ TRADEABLE_CATALYSTS`, and `already_moved == false`. **Every** classification is persisted to `sentiment_scores` for the nightly forward-returns eval loop (`analysis/forward_returns.py`).
+**Trade gates (code, not model):** a positive only trades if `confidence ≥ MIN_SENTIMENT_CONFIDENCE`, `catalyst_type ∈ TRADEABLE_CATALYSTS` (**v21.16: `guidance_raise` only** — see docs/algorithm.md §3.3), and `already_moved == false`. **Every** classification is persisted to `sentiment_scores` for the nightly forward-returns eval loop (`analysis/forward_returns.py`), including classes that are switched off — so a class can be re-enabled on fresh evidence.
+
+**Prompt caching (v21.16):** the rubric ships in a `cache_control: ephemeral` system block. This is a request **hint**, not a guarantee — Claude Haiku 4.5 will not cache a prefix below **4,096 tokens** and silently ignores the field below it (200 OK, `usage` reports zero cached tokens, no error of any kind). It was a no-op for the first 1,140 calls. The cached prefix is `tools + system`, so **both** `_SYSTEM_PROMPT` and `_CLASSIFY_TOOL` count toward the threshold; keep their combined size above ~14.3k characters and verify with `tokens_cached` in `classifier_calls` rather than by estimate.
 
 ---
 

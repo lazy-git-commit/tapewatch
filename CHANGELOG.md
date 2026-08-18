@@ -7,6 +7,189 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.16 — 2026-08-18 (enter at the signal; drop the class that doesn't pay; the prompt cache was never on)
+
+Three changes from one review. The entry gates were never the binding
+constraint — **the entry price was**.
+
+### 1. The momentum gate is a real filter that costs more than it is worth
+
+`low_momentum` parks a signal in the 15-min re-eval queue until the tape starts
+moving. It genuinely selects better stocks: signals that eventually cleared it
+returned **+0.86%/60m (n=20)** against **+0.11% (n=66)** for those that never
+did. But clearing it takes TIME, and the queue means we buy *after* the move
+instead of into it.
+
+The bill arrives at the stop. Entering ~2% higher leaves the −2% stop sitting at
+the price the news originally fired at, where ordinary reversion takes us out.
+LAMR (2026-08-06) is the clean case: signalled at $161.09, filled at $164.30 —
+above the stock's high for the entire session — stopped out 28 seconds later on
+a drift back to $161. Not isolated: of the last five closed trades, **three
+never traded above their own entry price at any point** (`max_favorable_pct`:
+ITT −0.12%, CEG −0.36%, LAMR −1.91%).
+
+Simulated over every signal from 2026-06 → 08 with the live exit rules (−2%
+stop, +5% take-profit, 120-min hold, 0.46pp round-trip costs):
+
+| class | n | gross | **net/trade** | win rate | t |
+|---|---|---|---|---|---|
+| guidance_raise | 193 | +1.127% | **+0.667%** | 50% | 5.51 |
+| fda_approval | 106 | +0.314% | **−0.146%** | 32% | 1.44 |
+
+Live, for comparison, is **−1.65%/trade at a 21% win rate over 29 trades**. The
+mechanism is entirely in the stop-out rate: 48% live, 33% simulated at the
+signal price. We are buying a better horse at a worse price and losing on the
+deal.
+
+`SKIP_MOMENTUM_CATALYSTS` (default `guidance_raise`) skips the momentum FLOOR
+for the listed classes. Deliberately narrow, in three ways:
+
+- **Flat tape only.** The gate already distinguished "nobody has reacted yet"
+  from "sellers are in control despite the positive catalyst", and only the
+  first is what costs us. The backtest cannot tell them apart — it sampled
+  prices at 5/15/60/120 min, so a signal that was −4% at the moment of entry
+  looks identical to a flat one — so buying active selling was never the
+  measured strategy and stays rejected (still TRANSIENT, so it re-evaluates).
+- **Floor only.** The momentum *ceiling*, VWAP, RVOL, liquidity, spread, the
+  day-move ceiling and entry-quote freshness all still reject. `cfg.validate()`
+  now refuses `SKIP_MOMENTUM_CATALYSTS` without `REQUIRE_VWAP_CONFIRMATION`:
+  VWAP is the remaining market-agreement evidence once the floor is off, and
+  nothing else coupled these two independent knobs.
+- **Regular-hours signals only.** The pre-market gap-and-go path deliberately
+  does NOT pass `catalyst_type`, so its floor stays enforced — a gap candidate
+  is on the watchlist *because* the move already happened, which is the
+  opposite of the case that was measured.
+
+### 2. `TRADEABLE_CATALYSTS` pruned to `guidance_raise`
+
+v20 ranked classes by **raw forward return**, which asks "does the stock drift
+up?" — not "does a trade with our stop survive to collect the drift?".
+fda_approval's +1.42%/60m is real but too small and too volatile to clear a 2%
+stop plus costs: a 32% simulated win rate against the **33% break-even** that
+Trading 212's 0.15%-each-way FX conversion imposes.
+
+t=1.44 means *no measurable edge in either direction*, not "proven to lose", so
+this is a capital-allocation decision rather than a verdict: at ~0.5 trades/day
+throughput is the scarce resource, and splitting it with a zero-edge class
+halves the sample on the class measuring +0.667%. Live P&L cannot arbitrate —
+fda_approval has exactly **one** closed trade (−0.38%). The class is still
+scored and still accrues forward returns while switched off, so re-enabling it
+is a one-line config change backed by fresh evidence.
+
+### 3. `trades.signal_price` — measure the wait instead of arguing about it
+
+The cost of waiting was only estimable from `sentiment_scores` forward returns,
+which sample at 5/15/60/120 min and cannot see the path in between. That
+sampling is exactly why the simulation's 33% stop-out rate is optimistic against
+a live 48% — and that gap is the single number deciding whether change 1 was
+right. `buy_price − signal_price` on a real row settles it per trade.
+
+Carried through the re-eval queue (`_queue_reeval(..., signal_price=)`) so it
+records the price at the signal's FIRST evaluation, not at entry — passing
+`confirmation.current_price` at entry time would have reported a wait cost of
+exactly zero on every trade. Non-finite and ≤0 values store as NULL rather than
+0.0: the graduated pre-market hand-off builds a synthetic confirmation with
+`current_price=0.0`, and stored as 0.0 every downstream query divides by zero.
+Pure observability — no entry, exit or sizing decision reads it.
+
+### 3b. Entry provenance — `entry_reason` / `entry_momentum_pct` / `entry_delay_seconds`
+
+`signal_price` alone is not enough to judge change 1. It records what waiting
+**cost**, not **which path produced the trade** — and a trade that confirmed on
+its first look because momentum was already present looks identical, in price
+terms, to one that confirmed because the floor was skipped. Both show a wait cost
+of ~zero. Without a recorded path there is no control group and the change is
+unfalsifiable in hindsight.
+
+- `entry_reason` — `momentum_confirmed` | `momentum_skipped` | `premarket_gap`.
+  Set from a new `PriceConfirmation.momentum_skipped` flag that gate 7 raises, so
+  it is recorded from the gate that actually made the decision rather than
+  re-derived later. `premarket_gap` is separate on purpose: the overnight move
+  already happened, so pooling those rows into either momentum bucket would
+  corrupt the comparison.
+- `entry_momentum_pct` — the reading the decision was made on, so the outcome can
+  be **regressed against it** rather than only bucketed. The open question is
+  where between "flat" and "clearly moving" the edge lives, and a boolean can't
+  answer that.
+- `entry_delay_seconds` — 0 on a first-look entry, real seconds out of the
+  re-eval queue. Separates "2% wait cost over 30 seconds" (a fast mover) from
+  "2% over 14 minutes" (the queue grinding).
+
+`news_cycle()`'s premarket approved-entry loop was extracted to
+`_enter_premarket_approved()` so its `entry_path="premarket_gap"` label is
+testable at the call site — a caller that silently stops passing it produces
+plausible-looking rows in the wrong group, which is worse than a crash. The
+extraction also brought that loop's risk-gate abort and its per-candidate
+exception isolation (the 2026-06-11→07-06 drought shape) under test for the
+first time.
+
+### 4. Prompt caching has never worked — it was a silent no-op
+
+`cache_control` is a request HINT. **Claude Haiku 4.5 will not cache a prefix
+below 4,096 tokens, and says nothing when it declines**: the field is accepted,
+ignored, 200 OK, and `usage` reports zero cached tokens. Measured across the
+first 1,140 Claude calls, `tokens_cached` summed to **exactly 0** — while Qwen,
+whose OpenAI-compatible endpoint caches automatically with no minimum,
+accumulated 38,272. The cached prefix (tools + system) was ~3.5k tokens, about
+600 short, so every call since v21.14 paid full input price for the rubric
+(3.18M full-price tokens in the last 7 days alone).
+
+Fixed by giving the rubric content it should have had anyway: **worked examples
+drawn from real production misclassifications** — the BE post-earnings-rally
+explainer, the CRCL 3-ticker digest, acquirer-vs-target, offering dilution, and
+a `guidance_raise` boundary section (what is and is not a raise). This is the
+deeper fix for three downstream regexes: `_DIGEST_RE` and `_EXPLAINER_RE` patch
+two specific headline SHAPES, while the examples teach the principle behind
+them. With `guidance_raise` now the only tradeable class, both of its error
+directions cost money, so its definition is spelled out explicitly.
+
+Two guards, because an estimate is not a measurement:
+- `_note_cache_usage()` raises `claude_cache_ineffective` after 25 consecutive
+  calls with zero cached tokens. Deliberately **warning, not critical** — a cost
+  regression, not a trading outage; nothing stops being scored and no trade is
+  affected. Adding it to `_CRITICAL_EVENT_TYPES` would page a human for a
+  billing inefficiency and dilute the four event types that mean the system has
+  stopped working. That exclusion is a decision recorded in the code, not the
+  v21.15.1 oversight repeating.
+- `tokens_cached` now counts cache **creation** as well as reads. Anthropic
+  reports `input_tokens` as the non-cached remainder only, so counting reads
+  alone made the first call of every 5-min TTL window — the write — look
+  identical to no caching at all, both in this column and in the cost figures
+  `analysis/classifier_compare.py` derives from it.
+
+### Grafana
+
+Four panels: *Entry Path: did entering at the signal work?* (the verdict panel —
+buckets closed trades by the RECORDED `entry_reason`, comparing win rate, stop-out
+share and realised P&L across `momentum_skipped` vs `momentum_confirmed`),
+*Entry Path per trade* (full provenance per row), *Classifier Prompt Cache*, and
+*Momentum Gate: which classes are still waiting?*.
+
+### Tests
+
+`tests/test_v21_16.py` (38 tests), **mutation-tested — 13 mutations, 13 caught**:
+deleting the against-the-tape guard, making the skip ignore `catalyst_type`,
+reverting `tokens_cached` to reads-only, dropping `signal_price` from the queue
+or from `open_trade`, deleting either new prompt section, removing the
+once-only alert latch, and removing the VWAP/skip coupling check from
+`validate()` each fail at least one test. The provenance columns were mutation-tested separately and three gaps were found and closed: nothing asserted that the premarket CALL SITE passed its label, that `_enter_confirmed` fed the real momentum reading through, or — worst — that the re-eval path handed `first_seen_at` to the entry, which would have made every trade that DID wait record a delay of zero. ⚠️ Run mutation checks on a COPY of the repo: an in-place mutate/restore script corrupted `news/fetcher.py` and left a stale `__pycache__` that made three tests fail against source that was actually correct. `TestCatalystPrune` was rewritten to
+assert the *invariant* (no measured-negative class is tradeable by default)
+rather than restate the current list.
+
+The cache-threshold test derives its chars/token ratio from production
+(`min(tokens_in)=3641` for a 1-article batch against a known 10,511-char prefix
+→ 2.94–3.24 chars/token) and asserts against a pessimistic 3.5, so it cannot
+pass on a favourable tokenizer and fails if the prompt is trimmed ~9%.
+
+**⚠️ Operational note:** the momentum skip is the change with live risk. The
+simulation's 33% stop-out rate is optimistic by construction, and the edge
+survives only until the true rate reaches ~50% — live is currently 48%. Panels
+25/26 are the read-out; ~20 new trades are needed before they mean anything.
+Reverting is a one-line config change (`SKIP_MOMENTUM_CATALYSTS=`), no code
+deploy required.
+
+---
+
 ## v21.15.1 — 2026-08-18 (cap the batch; make the v21.15 tests actually test v21.15)
 
 Review pass on v21.15. The diagnosis held up; the fix and its tests did not.

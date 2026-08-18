@@ -329,6 +329,59 @@ def _enter_claude_cooldown(seconds: float, reason: str) -> None:
     _claude_cooldown = {"until": time.monotonic() + seconds, "reason": reason}
 
 
+# ── Prompt-cache verification (v21.16) ────────────────────────────────────────
+# cache_control is a REQUEST HINT, not a guarantee: below the model's minimum
+# cacheable prefix (4096 tokens on Haiku 4.5) the API accepts the field, ignores
+# it, returns 200 OK and reports zero cached tokens. There is no error to catch
+# and no field that says "your prompt was too short" — which is why this went
+# unnoticed for 1,140 calls while every one of them paid full input price.
+#
+# The prompt is now sized past the threshold, but "sized past" rests on a
+# character-count estimate of a tokenizer we do not run locally, and any future
+# edit to the rubric or the tool schema can quietly drop it back under. So the
+# claim is VERIFIED FROM LIVE USAGE instead of trusted: after this many
+# consecutive successful calls with zero cached tokens, say so loudly. One
+# alert, then silence until caching is seen working again.
+_CACHE_MISS_ALERT_AFTER = 25
+_consecutive_uncached_calls = 0
+_cache_alert_raised = False
+
+
+def _note_cache_usage(cached_tokens: int) -> None:
+    """Track whether prompt caching is actually engaging. Never raises."""
+    global _consecutive_uncached_calls, _cache_alert_raised
+    try:
+        if cached_tokens > 0:
+            if _cache_alert_raised:
+                logger.info(
+                    "Prompt caching is working again (%d cached tokens) — "
+                    "clearing the cache-miss alert", cached_tokens,
+                )
+            _consecutive_uncached_calls = 0
+            _cache_alert_raised = False
+            return
+        _consecutive_uncached_calls += 1
+        if _consecutive_uncached_calls < _CACHE_MISS_ALERT_AFTER or _cache_alert_raised:
+            return
+        _cache_alert_raised = True
+        logger.error(
+            "Prompt caching is NOT engaging: %d consecutive Claude calls "
+            "reported zero cached tokens. cache_control is being silently "
+            "ignored, which happens when the cached prefix (tool schema + "
+            "system prompt) falls below the model's %d-token minimum. Every "
+            "call is paying full input price for the rubric. Check whether "
+            "_SYSTEM_PROMPT or _CLASSIFY_TOOL was recently shortened.",
+            _consecutive_uncached_calls, 4096,
+        )
+        _record_claude_event(
+            "claude_cache_ineffective",
+            f"{_consecutive_uncached_calls} consecutive calls with zero cached "
+            f"tokens — cached prefix likely below the 4096-token minimum",
+        )
+    except Exception as exc:   # observability must never break classification
+        logger.debug("Could not track cache usage: %s", exc)
+
+
 def _record_claude_call(articles: list, latency_ms: int, msg, ok: bool,
                         scored_count: int = 0,
                         error_type: str | None = None,
@@ -354,8 +407,16 @@ def _record_claude_call(articles: list, latency_ms: int, msg, ok: bool,
         usage = getattr(msg, "usage", None)
         cached = None
         if usage is not None:
+            # v21.16: count cache CREATION as well as reads. Anthropic reports
+            # input_tokens as the non-cached remainder only, so the true input
+            # size is input + creation + read; counting reads alone made the
+            # first call of every 5-min TTL window — the write — indistinguishable
+            # from no caching at all, both here and in the cost figures that
+            # analysis/classifier_compare.py derives from these columns.
             read = getattr(usage, "cache_read_input_tokens", None) or 0
-            cached = read or None
+            created = getattr(usage, "cache_creation_input_tokens", None) or 0
+            cached = (read + created) or None
+            _note_cache_usage(read + created)
         record_classifier_call(
             "claude", "claude-haiku-4-5-20251001", len(articles), latency_ms,
             ok=ok, scored_count=scored_count, error_type=error_type,
@@ -598,6 +659,90 @@ Headline: "Acme Therapeutics Shares Halted On Circuit Breaker To The Upside"
 
 Headline: "What's Going On With Acme Therapeutics Stock On Tuesday?"
 → {"sentiment": "neutral", "confidence": 0.2, "catalyst_type": "recap_explainer", "already_moved": true, "catalyst_magnitude": 1}
+
+WORKED EXAMPLES FROM REAL ERRORS
+
+Each of the following was misclassified in production and cost money. The
+common thread: a TEMPLATED headline whose wording announces that the move has
+already happened, or that no single-stock news exists at all. Read the words
+that are actually there rather than the sentiment they imply.
+
+Headline: "Acme Energy Stock Charges Higher Tuesday: What's Driving The Post-Earnings Rally?"
+→ {"sentiment": "neutral", "confidence": 0.2, "catalyst_type": "recap_explainer", "already_moved": true, "catalyst_magnitude": 1}
+WHY: "Charges Higher" and "Rally" are past-tense descriptions of a move in
+progress; the article asks what is driving it, so it is not itself the driver.
+The earnings report that caused this is a separate, earlier wire item. This was
+scored guidance_raise / positive / 0.75 with already_moved=false, and the stock
+was already up 4% on the day at entry. already_moved is the single field that
+decides these cases — set it true whenever the headline itself reports the move.
+
+Headline: "Market-Moving News For July 10: Acme Corp, Beta Industries, Gamma Holdings"
+→ {"sentiment": "neutral", "confidence": 0.1, "catalyst_type": "recap_explainer", "already_moved": true, "catalyst_magnitude": 1}
+WHY: a digest tags several unrelated tickers on one article. There is no fact
+here about any single company. Scored as earnings_beat / 0.8 for all three
+tickers, this bought the top of a 13% spike. Apply this to EVERY ticker on such
+an article, however positive the contents sound.
+
+Headline: "Acme Corp Reports Preliminary Q3 Revenue Of $412M, Above Prior Guidance Of $380M–$395M"
+→ {"sentiment": "positive", "confidence": 0.85, "catalyst_type": "guidance_raise", "already_moved": false, "catalyst_magnitude": 3}
+WHY: a pre-announcement ahead of the scheduled report, and the comparison point
+is explicit ("Above Prior Guidance Of"), so the direction is knowable. This is
+guidance_raise, not earnings_beat — no completed report is being compared to a
+consensus estimate.
+
+Headline: "Acme Corp Reports Preliminary Q3 Revenue Of $412M"
+→ {"sentiment": "neutral", "confidence": 0.4, "catalyst_type": "guidance_raise", "already_moved": false, "catalyst_magnitude": 1}
+WHY: same routing, but the number is unanchored — with no prior guidance or
+estimate stated, $412M could be a raise or a cut. Correct type, neutral
+sentiment. Never infer the direction of a bare figure.
+
+Headline: "Beta Industries To Acquire Acme Corp For $28 Per Share In Cash" [tagged ticker: BETA, the acquirer]
+→ {"sentiment": "neutral", "confidence": 0.3, "catalyst_type": "ma_acquirer", "already_moved": false, "catalyst_magnitude": 1}
+WHY: the target re-prices to the offer instantly; the acquirer typically falls
+on deal risk and dilution. Always check which side the TAGGED ticker is on
+before calling M&A positive.
+
+Headline: "Acme Corp Announces $75M Registered Direct Offering Priced At-The-Market"
+→ {"sentiment": "negative", "confidence": 0.8, "catalyst_type": "offering_dilution", "already_moved": false, "catalyst_magnitude": 4}
+WHY: an offering is new, binding and material — but the direction is DOWN.
+Small caps sell equity into strength, and this reliably reverses the run-up
+that preceded it. Materiality is not the same as bullishness.
+
+GETTING guidance_raise RIGHT
+
+This class carries more weight than the others: it is the one whose measured
+forward returns still climb an hour after publication, which is the shape a
+minutes-latency entry can actually capture. Both error directions are costly —
+a missed raise is a missed trade, and a false raise is a real loss — so apply
+the definition literally.
+
+A guidance_raise requires a company statement about its OWN FUTURE results
+that is higher than a previously stated figure. All three parts are required:
+the company itself (not an analyst), a forward period (not a completed one),
+and an upward comparison against something stated.
+
+Counts as guidance_raise:
+- "Raises FY25 Revenue Outlook To $1.2B–$1.25B From $1.1B–$1.15B"
+- "Now Sees Q4 EPS Above Prior View"
+- "Lifts Full-Year Margin Target After Strong Demand"
+- A preliminary/pre-announced figure explicitly above prior guidance.
+
+Does NOT count as guidance_raise:
+- "Analyst Raises Price Target To $95" → analyst_action. A price target is an
+  outsider's opinion, not company guidance. This is routine flow.
+- "Reports Q3 EPS Of $1.42, Beating The $1.30 Estimate" → earnings_beat. A
+  completed period compared to consensus is a different class.
+- "Reaffirms FY25 Guidance" / "Maintains Outlook" → other, neutral. Confirming
+  an existing number is not raising it, however reassuring the tone.
+- "Guides Q4 Below Consensus" → sentiment=negative. Read the direction; do not
+  let the word "guidance" imply a raise.
+- "Management Optimistic About Second-Half Demand" → other, low confidence.
+  Sentiment in an interview is not a numeric revision.
+
+When a guidance raise is genuine, size catalyst_magnitude on how far the new
+range sits above the old one, not on the absolute dollar figure: a 2% lift to
+a mega-cap's outlook is magnitude 1–2, while a small cap raising a full-year
+revenue target by 20%+ is magnitude 4.
 
 Headline: "Acme Announces $40M Registered Direct Offering Priced At-The-Market"
 → {"sentiment": "negative", "confidence": 0.85, "catalyst_type": "offering_dilution", "already_moved": false, "catalyst_magnitude": 3}
@@ -957,6 +1102,23 @@ def _score_one_batch(articles: list[dict],
                         "text": _SYSTEM_PROMPT,
                         # Cached across cycles (5-min TTL > 1-min cadence) —
                         # ~90% input-cost cut on the rubric.
+                        #
+                        # ⚠️ v21.16: this had been a silent NO-OP since it was
+                        # added. Claude Haiku 4.5 has a MINIMUM CACHEABLE
+                        # PREFIX OF 4096 TOKENS; below it, cache_control is
+                        # accepted and ignored — no error, no warning, and
+                        # usage simply reports zero cached tokens. Measured
+                        # over the first 1,140 Claude calls: tokens_cached
+                        # summed to exactly 0, while Qwen (whose endpoint
+                        # caches automatically with no minimum) accumulated
+                        # 38,272. The cached prefix is tools + system, which
+                        # totalled ~3.5k tokens — about 600 short.
+                        # _SYSTEM_PROMPT is now sized past the threshold with
+                        # real worked examples, so DO NOT trim it below ~4.3k
+                        # tokens (~15k characters of prompt + tool schema)
+                        # without re-checking tokens_cached afterwards.
+                        # _warn_if_cache_never_hits() below verifies this from
+                        # live usage rather than trusting the estimate.
                         "cache_control": {"type": "ephemeral"},
                     }
                 ],

@@ -266,13 +266,62 @@ class Settings:
     # The kept classes are binary regulatory/guidance surprises whose drift
     # BUILDS over 15–60 min — a shape our 1–3 min entry latency captures.
     # Re-enable a class only with fresh forward-return evidence.
+    #
+    # ── v21.16 (2026-08-18): fda_approval REMOVED ────────────────────────────
+    # The v20 pruning above ranked classes by RAW forward return, which asks
+    # "does the stock drift up?" — not "does a trade with our stop survive to
+    # collect that drift?". Re-running the panel as an actual simulation
+    # (entry at the signal, −2% stop, +5% take-profit, 120-min hold, 0.46pp
+    # round-trip costs) over 2026-06→08 separates them:
+    #   guidance_raise n=193  gross +1.127%  NET +0.667%/trade  50% win  t=5.51
+    #   fda_approval   n=106  gross +0.314%  NET −0.146%/trade  32% win  t=1.44
+    # fda_approval's +1.42%/60m drift is real but too SMALL and too volatile to
+    # clear a 2% stop plus costs: at a 33% break-even win rate (see
+    # docs/algorithm.md §11 on the 0.31pp FX round trip) a 32% win rate is a
+    # coin that lands on zero. t=1.44 means "not distinguishable from no edge",
+    # NOT "proven to lose" — so this is a capital-allocation decision, not a
+    # verdict: our throughput is limited (0.5 trades/day), and splitting it
+    # with a class that measures zero halves the sample on the class that
+    # measures +0.667%. Live P&L cannot arbitrate — fda_approval has exactly
+    # ONE closed trade (−0.38%). Re-enable with fresh evidence; the class is
+    # still SCORED and still accumulates forward returns while switched off.
     tradeable_catalysts: list[str] = field(
         default_factory=lambda: [
             c.strip().lower() for c in os.getenv(
                 "TRADEABLE_CATALYSTS",
-                "fda_approval,guidance_raise",
+                "guidance_raise",
             ).split(",") if c.strip()
         ]
+    )
+    # ── v21.16: catalyst classes that enter WITHOUT waiting for momentum ──────
+    # The `low_momentum` gate asks "has the tape started moving yet?" and parks
+    # the signal in the 15-min re-eval queue until it has. It is a genuine
+    # filter — signals that eventually passed it returned +0.86%/60m vs +0.11%
+    # for those that never did (n=20 vs n=66) — but the WAIT is what makes it
+    # unprofitable: by the time momentum is visible we are buying ~2% higher,
+    # which puts the −2% stop back at the price the news originally fired at.
+    # Routine reversion to that price then stops us out. Measured on the last
+    # five closed trades, THREE never traded above their own entry price at any
+    # point (max_favorable_pct: ITT −0.12%, CEG −0.36%, LAMR −1.91%).
+    # Simulated stop-out rate: 48% waiting for momentum → 33% entering at the
+    # signal. We are buying a better horse at a worse price and losing on the
+    # deal, so for these classes we skip the wait and take the price the
+    # catalyst was published at.
+    #
+    # ⚠️ Scoped by catalyst on purpose. The edge is measured for guidance_raise
+    # only (t=5.51); fda_approval's buy-at-signal simulation is NEGATIVE
+    # (−0.146%), so if it is ever re-enabled above it must keep its momentum
+    # gate rather than silently inherit this bypass.
+    # ⚠️ Only the momentum FLOOR is skipped. Every other gate still applies —
+    # VWAP, RVOL, liquidity, spread, day-move ceiling, entry-quote freshness —
+    # and the momentum CEILING (high_momentum) still rejects post-halt spikes.
+    skip_momentum_catalysts: set[str] = field(
+        default_factory=lambda: {
+            c.strip().lower() for c in os.getenv(
+                "SKIP_MOMENTUM_CATALYSTS",
+                "guidance_raise",
+            ).split(",") if c.strip()
+        }
     )
 
     # ── Position sizing & portfolio risk ──────────────────────────────────────
@@ -554,6 +603,16 @@ class Settings:
              self.max_vwap_extension_pct < self.stop_loss_pct),
             ("RATCHET_TRIGGER_PCT", self.ratchet_trigger_pct > 0),
             ("RATCHET_LOCK_PCT", 0 <= self.ratchet_lock_pct < self.ratchet_trigger_pct),
+            # v21.16: skipping the momentum floor removes the "has the tape
+            # started moving?" evidence, which is acceptable ONLY because VWAP
+            # still runs the size-neutral accumulation test ("is the stock
+            # trading above its own session average?"). Turning both off would
+            # leave no market-agreement evidence at all behind an entry — the
+            # signal would be Claude's opinion and nothing else. These two
+            # settings are independent knobs, so nothing but this check stops
+            # a deploy from disabling them together.
+            ("SKIP_MOMENTUM_CATALYSTS requires REQUIRE_VWAP_CONFIRMATION",
+             not self.skip_momentum_catalysts or self.require_vwap_confirmation),
             ("EXTENDED_MIN_ADV_DOLLAR >= MIN_DAILY_DOLLAR_VOLUME",
              self.extended_min_adv_dollar >= self.min_daily_dollar_volume),
             ("EXTENDED_MIN_SESSION_DOLLAR_VOLUME", self.extended_min_session_dollar_volume >= 0),

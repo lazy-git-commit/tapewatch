@@ -224,6 +224,54 @@ def _record_entry_slippage(ticker: str, signal_price: float, fill_price: float,
         logger.debug("Could not record entry slippage for %s: %s", ticker, exc)
 
 
+def _usable_price(price: float | None) -> float | None:
+    """
+    Return `price` if it is a real, positive, finite quote — else None.
+
+    The graduated pre-market hand-off builds a synthetic PriceConfirmation with
+    current_price=0.0 (it never got a quote), and NaN survives every ordinary
+    comparison, so both must be filtered before a price is stored or divided by.
+    """
+    try:
+        if price is None:
+            return None
+        value = float(price)
+        return value if math.isfinite(value) and value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_wait_cost(ticker: str, signal_price: float | None,
+                      fill_price: float) -> None:
+    """
+    Log the gap between the price when the signal FIRST appeared and the price
+    we actually paid. Never raises.
+
+    This is the momentum gate's bill, itemised. The gate is a real filter, but
+    it is paid for in entry price: waiting for the tape to confirm has meant
+    buying ~2% higher, which leaves the −2% stop at the price the news fired
+    at. Persisted alongside this as trades.signal_price so the question is
+    answerable from our own rows rather than from forward-return sampling,
+    which cannot see the path between its 5/15/60/120-min checkpoints.
+    """
+    try:
+        fill = _usable_price(fill_price)
+        if signal_price is None or fill is None:
+            return
+        wait_pct = ((fill - signal_price) / signal_price) * 100
+        if abs(wait_pct) < 0.01:
+            return   # confirmed on the first look — nothing was waited for
+        logger.info(
+            "Wait cost [%s]: signal first seen at $%.4f, entered at $%.4f "
+            "(%+.2f%%) — the stop now sits %.2f%% below the fill, i.e. %.2f%% "
+            "from the price the catalyst was published at.",
+            ticker, signal_price, fill, wait_pct,
+            cfg.stop_loss_pct, cfg.stop_loss_pct - wait_pct,
+        )
+    except Exception as exc:   # observability must never break the entry path
+        logger.debug("Could not record wait cost for %s: %s", ticker, exc)
+
+
 def _reset_no_quote_blackout_if_new_day() -> None:
     """Clear the no-quote blackout when the ET trading day rolls over."""
     global _no_quote_blackout_day
@@ -317,14 +365,28 @@ def _drain_retry_queue() -> list[NewsItem]:
     return items
 
 
-def _queue_reeval(item: NewsItem, signal_id: int) -> None:
-    """Park a transiently-rejected signal for periodic re-confirmation."""
+def _queue_reeval(item: NewsItem, signal_id: int, signal_price: float | None = None) -> None:
+    """
+    Park a transiently-rejected signal for periodic re-confirmation.
+
+    `signal_price` (v21.16) is the price observed on the FIRST evaluation of
+    this signal — i.e. what the entry would have cost had we not waited. It is
+    carried through the queue so the eventual trade row can record it, making
+    "what did waiting for confirmation cost us?" a direct measurement instead
+    of an inference from 5/15/60/120-min forward-return samples.
+    """
     key = (item.article_id, item.ticker)
     if key in _reeval_queue:
         return  # already waiting — keep the original expiry
     _reeval_queue[key] = {
         "item": item,
         "signal_id": signal_id,
+        "signal_price": signal_price,
+        # When we first looked at this signal — the other half of the wait
+        # measurement. signal_price says what the delay cost; this says how long
+        # the delay was, so a 2% wait cost over 30s (a fast mover) is
+        # distinguishable from 2% over 14 minutes (the queue grinding).
+        "first_seen_at": datetime.now(timezone.utc),
         "expires_at": datetime.now(timezone.utc) + timedelta(minutes=_REEVAL_TTL_MINUTES),
     }
     logger.info(
@@ -370,7 +432,7 @@ def _process_reeval_queue() -> int:
             continue
 
         try:
-            conf = confirm_price_signal(item.ticker)
+            conf = confirm_price_signal(item.ticker, catalyst_type=item.catalyst_type)
         except Exception as exc:
             logger.error("Re-eval confirm raised for %s: %s", item.ticker, exc, exc_info=True)
             continue
@@ -387,7 +449,9 @@ def _process_reeval_queue() -> int:
                 "Re-eval CONFIRMED [%s] — participation arrived within the window: %s",
                 item.ticker, conf.reason,
             )
-            if _enter_confirmed(item, conf, entry["signal_id"]):
+            if _enter_confirmed(item, conf, entry["signal_id"],
+                                signal_price=entry.get("signal_price"),
+                                first_seen_at=entry.get("first_seen_at")):
                 opened_count += 1
             continue
 
@@ -453,7 +517,8 @@ def _risk_gates_pass() -> tuple[bool, str]:
 
 # ── Shared entry execution ────────────────────────────────────────────────────
 
-def _execute_entry(item: NewsItem, confirmation: PriceConfirmation, fetched_at: str) -> bool:
+def _execute_entry(item: NewsItem, confirmation: PriceConfirmation, fetched_at: str,
+                   entry_path: str | None = None) -> bool:
     """
     Execute one confirmed entry: save the signal, run the buy, place the
     resting take-profit, record the trade. Used by both the regular-hours
@@ -490,14 +555,60 @@ def _execute_entry(item: NewsItem, confirmation: PriceConfirmation, fetched_at: 
         # Transient tape states (participation not arrived yet) get re-checked
         # for the next _REEVAL_TTL_MINUTES rather than dying at first sight.
         if confirmation.reason_code in _TRANSIENT_REJECT_CODES:
-            _queue_reeval(item, signal_id)
+            _queue_reeval(item, signal_id, signal_price=confirmation.current_price)
         return False
 
-    return _enter_confirmed(item, confirmation, signal_id)
+    # first_seen_at is left None: this signal confirmed on its FIRST look, so
+    # its entry delay is zero by construction. Only the re-eval path, which
+    # knows when it parked the signal, passes a real timestamp.
+    return _enter_confirmed(item, confirmation, signal_id,
+                            signal_price=confirmation.current_price,
+                            entry_path=entry_path)
 
 
-def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id: int) -> bool:
-    """Buy + resting stop + trade record for an already-confirmed, saved signal."""
+def _entry_reason(confirmation: PriceConfirmation,
+                  entry_path: str | None = None) -> str:
+    """
+    Name the decision path that authorised this entry, for the trade row.
+
+    'momentum_skipped' vs 'momentum_confirmed' is the distinction that makes
+    v21.16 falsifiable: both paths can produce a fill on the signal's first
+    look with a wait cost of zero, so nothing in the prices tells them apart.
+    Without this, "did entering at the signal work?" has no control group.
+    """
+    if entry_path:
+        return entry_path
+    return ("momentum_skipped"
+            if getattr(confirmation, "momentum_skipped", False)
+            else "momentum_confirmed")
+
+
+def _entry_delay_seconds(first_seen_at) -> int | None:
+    """Seconds from the signal's first evaluation to now. None if unknown."""
+    if first_seen_at is None:
+        return 0        # confirmed on its first look — it never waited
+    try:
+        delta = (datetime.now(timezone.utc) - first_seen_at).total_seconds()
+        return max(0, int(delta))
+    except (TypeError, ValueError):
+        return None
+
+
+def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id: int,
+                     signal_price: float | None = None,
+                     first_seen_at=None,
+                     entry_path: str | None = None) -> bool:
+    """
+    Buy + resting stop + trade record for an already-confirmed, saved signal.
+
+    `signal_price` (v21.16) is the price at the FIRST evaluation of this
+    signal, which for a re-queued signal is minutes older than the price we
+    are about to buy at. Persisted on the trade row so the cost of waiting is
+    measurable per trade rather than argued from a backtest.
+
+    `first_seen_at` / `entry_path` (v21.16) record HOW the entry happened —
+    how long it waited, and which gate path let it through. See _entry_reason.
+    """
     # v21: extended-session entries route through T212's extendedHours market
     # orders, at cfg.extended_size_factor size, and get NO resting stop —
     # T212 stop orders execute in regular hours only, so a stop placed now
@@ -505,6 +616,16 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
     # both sides at its 5s cadence instead and flattens before the overnight
     # handoff.
     extended = confirmation.session in EXTENDED_SESSIONS
+    entry_reason = _entry_reason(confirmation, entry_path)
+    if entry_reason == "momentum_skipped":
+        logger.info(
+            "Entry path [%s]: MOMENTUM FLOOR SKIPPED — entering at %+.2f%% "
+            "(floor is +%.2f%%) because catalyst=%s is in "
+            "SKIP_MOMENTUM_CATALYSTS. Recorded on the trade row as "
+            "entry_reason='momentum_skipped'.",
+            item.ticker, confirmation.recent_move_pct,
+            cfg.min_price_move_pct, item.catalyst_type,
+        )
     logger.info(
         "Signal approved [%s] @ $%.4f (session=%s) — %s",
         item.ticker, confirmation.current_price, confirmation.session,
@@ -559,6 +680,12 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
         item.ticker, confirmation.current_price, result.price,
         time.monotonic() - buy_started_at,
     )
+    # And what did WAITING cost us — the price when the signal first appeared
+    # vs the price we actually paid? For a signal confirmed on its first look
+    # these are the same number and the log is a no-op; for one that sat in the
+    # re-eval queue it is the entire cost of the momentum gate.
+    clean_signal_price = _usable_price(signal_price)
+    _record_wait_cost(item.ticker, clean_signal_price, result.price)
 
     # ── Record trade ──────────────────────────────────────────────────────────
     # A buy that is not represented in the DB is an unmanaged live position.
@@ -575,6 +702,10 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
             buy_fx_rate=result.fx_rate,
             buy_fees_gbp=result.fees_gbp,
             session=confirmation.session,
+            signal_price=clean_signal_price,
+            entry_reason=entry_reason,
+            entry_momentum_pct=confirmation.recent_move_pct,
+            entry_delay_seconds=_entry_delay_seconds(first_seen_at),
         )
     except Exception as exc:
         logger.error(
@@ -694,6 +825,57 @@ def _candidate_to_news_item(cand: dict) -> NewsItem:
     )
 
 
+def _enter_premarket_approved(approved: list, fetched_at: str) -> bool:
+    """
+    Enter every approved gap-and-go candidate. Returns False when a portfolio
+    risk gate tripped mid-loop and the rest of the news cycle must be abandoned.
+
+    Extracted from news_cycle() in v21.16 so the `entry_path="premarket_gap"`
+    label is testable at its call site. It is not decoration: the gap path is a
+    different strategy from an intraday news entry — the move already happened
+    overnight, which is what put the candidate on the watchlist — so pooling it
+    into either momentum bucket would corrupt the v21.16 comparison. A call site
+    that silently stops passing it produces plausible-looking rows in the wrong
+    group, which is worse than a crash.
+
+    Each candidate is handled in its own try/except so a bug triggered by one
+    candidate's data (e.g. an unexpected field shape) can't silently drop every
+    candidate queued behind it with no DB trace of what happened to them. This
+    is the same shape of bug that caused a 2026-06-11→07-06 zero-trade drought:
+    a single unhandled TypeError inside this loop used to abort the whole batch
+    with one generic log line and no per-candidate status update, leaving the
+    rest stuck "pending" indefinitely.
+    """
+    for cand, conf in approved:
+        try:
+            if was_recently_traded(cand["ticker"]):
+                update_premarket_candidate(cand["id"], "rejected", "24h ticker cooldown")
+                continue
+            item = _candidate_to_news_item(cand)
+            opened = _execute_entry(item, conf, fetched_at,
+                                    entry_path="premarket_gap")
+            update_premarket_candidate(
+                cand["id"], "traded" if opened else "rejected",
+                None if opened else "buy failed or signal save failed",
+            )
+        except Exception as exc:
+            logger.error(
+                "Pre-market candidate %s (id=%s) failed: %s",
+                cand.get("ticker"), cand.get("id"), exc, exc_info=True,
+            )
+            try:
+                update_premarket_candidate(cand["id"], "rejected", f"unhandled error: {exc}")
+            except Exception:
+                pass
+            continue
+        # Re-check gates after each entry so a fill can't blow the caps.
+        gates_ok, gate_reason = _risk_gates_pass()
+        if not gates_ok:
+            logger.warning("Risk gate tripped mid-cycle: %s", gate_reason)
+            return False
+    return True
+
+
 def news_cycle() -> None:
     """
     The main pipeline — runs every minute on a fixed IntervalTrigger.
@@ -775,39 +957,8 @@ def news_cycle() -> None:
         logger.error("Pre-market candidate evaluation failed: %s", exc, exc_info=True)
         approved, graduated = [], []
 
-    # Each candidate is handled in its own try/except so a bug triggered by one
-    # candidate's data (e.g. an unexpected field shape) can't silently drop
-    # every candidate queued behind it with no DB trace of what happened to
-    # them. This is the same shape of bug that caused a 2026-06-11→07-06
-    # zero-trade drought: a single unhandled TypeError inside this loop used
-    # to abort the whole batch with one generic log line and no per-candidate
-    # status update, leaving the rest stuck "pending" indefinitely.
-    for cand, conf in approved:
-        try:
-            if was_recently_traded(cand["ticker"]):
-                update_premarket_candidate(cand["id"], "rejected", "24h ticker cooldown")
-                continue
-            item = _candidate_to_news_item(cand)
-            opened = _execute_entry(item, conf, fetched_at)
-            update_premarket_candidate(
-                cand["id"], "traded" if opened else "rejected",
-                None if opened else "buy failed or signal save failed",
-            )
-        except Exception as exc:
-            logger.error(
-                "Pre-market candidate %s (id=%s) failed: %s",
-                cand.get("ticker"), cand.get("id"), exc, exc_info=True,
-            )
-            try:
-                update_premarket_candidate(cand["id"], "rejected", f"unhandled error: {exc}")
-            except Exception:
-                pass
-            continue
-        # Re-check gates after each entry so a fill can't blow the caps.
-        gates_ok, gate_reason = _risk_gates_pass()
-        if not gates_ok:
-            logger.warning("Risk gate tripped mid-cycle: %s", gate_reason)
-            return
+    if not _enter_premarket_approved(approved, fetched_at):
+        return
 
     # Candidates whose 30-min gap-and-go window closed still PENDING (never
     # confirmed, never terminally rejected) are hand off to the same
@@ -913,7 +1064,9 @@ def news_cycle() -> None:
         # Price confirmation — runs before the DB write so a transient data
         # failure doesn't permanently mark the pair as seen.
         try:
-            confirmation = confirm_price_signal(item.ticker)
+            confirmation = confirm_price_signal(
+                item.ticker, catalyst_type=item.catalyst_type,
+            )
         except Exception as exc:
             logger.error(
                 "confirm_price_signal raised for %s: %s", item.ticker, exc, exc_info=True,

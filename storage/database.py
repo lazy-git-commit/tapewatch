@@ -194,6 +194,68 @@ def init_db() -> None:
                 ALTER TABLE trades
                 ADD COLUMN IF NOT EXISTS max_adverse_pct REAL
             """)
+            # signal_price (v21.16): the price observed at the FIRST evaluation
+            # of the signal that produced this trade — what the entry would
+            # have cost if we had not waited for momentum confirmation.
+            #
+            # WHY a column rather than a report query: the cost of waiting is
+            # currently only estimable from `sentiment_scores` forward returns,
+            # which sample the price at 5/15/60/120 min and therefore cannot
+            # see the path in between. That sampling is what makes the
+            # buy-at-signal simulation optimistic about its stop-out rate (it
+            # measured 33% where live is 48%) — the one number that decides
+            # whether entering at the signal is profitable. buy_price -
+            # signal_price on a real row settles it directly, per trade, with
+            # no vendor retention window and no interpolation.
+            #
+            # NULL for every pre-v21.16 row and for any entry whose first look
+            # produced no usable quote (the graduated pre-market hand-off
+            # carries a synthetic current_price of 0.0). Pure observability:
+            # no entry, exit or sizing decision reads this column.
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS signal_price REAL
+            """)
+            # ── Entry provenance (v21.16) ────────────────────────────────────
+            # HOW was this entry authorised? signal_price records what waiting
+            # COST, but not which decision path produced the trade — and those
+            # are different questions. A trade that confirmed on its first look
+            # because momentum was already present and one that confirmed
+            # because the momentum floor was skipped for its catalyst both show
+            # a wait cost of ~zero, so price alone cannot separate the v21.16
+            # treatment group from the control. Without these columns the
+            # change is unfalsifiable in hindsight.
+            #
+            #   entry_reason         — 'momentum_confirmed' (floor passed on its
+            #                          own merits), 'momentum_skipped' (v21.16
+            #                          bypass: the floor would have rejected),
+            #                          'premarket_gap' (gap-and-go path).
+            #   entry_momentum_pct   — the actual momentum reading the decision
+            #                          was made on, so the outcome can be
+            #                          regressed against it rather than only
+            #                          bucketed. A 'momentum_skipped' row has
+            #                          this < MIN_PRICE_MOVE_PCT by definition.
+            #   entry_delay_seconds  — seconds from the signal's first
+            #                          evaluation to the fill. 0 means it never
+            #                          waited; a large value is the re-eval
+            #                          queue. Makes "did it wait, and how
+            #                          long?" a number rather than an inference
+            #                          from signal_price == buy_price.
+            #
+            # NULL on every pre-v21.16 row. Pure observability: no entry, exit
+            # or sizing decision reads any of them.
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS entry_reason TEXT
+            """)
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS entry_momentum_pct REAL
+            """)
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS entry_delay_seconds INTEGER
+            """)
             # One-time backfill (v21.2): every pre-v21.1 row was a regular-hours
             # entry (extended-hours trading didn't exist before 2026-07-17), so
             # stamp them instead of re-deriving session from buy_time in every
@@ -470,19 +532,38 @@ def open_trade(
     buy_fx_rate: float | None = None,
     buy_fees_gbp: float | None = None,
     session: str | None = None,
+    signal_price: float | None = None,
+    entry_reason: str | None = None,
+    entry_momentum_pct: float | None = None,
+    entry_delay_seconds: int | None = None,
 ) -> int:
-    """Record an opening buy. Returns the trade id."""
+    """
+    Record an opening buy. Returns the trade id.
+
+    `signal_price` (v21.16) is the price at the signal's first evaluation; see
+    the column comment in init_db(). None when unknown — never substitute
+    buy_price, which would silently report a wait cost of zero.
+
+    `entry_reason` / `entry_momentum_pct` / `entry_delay_seconds` (v21.16)
+    record HOW the entry was authorised, so the two entry paths stay
+    distinguishable in the trade history long after the logs have rotated.
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO trades
                    (mode, ticker, signal_id, quantity, buy_price, buy_time, status,
-                    buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp, session)
-                   VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s)
+                    buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp, session,
+                    signal_price, entry_reason, entry_momentum_pct,
+                    entry_delay_seconds)
+                   VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s)
                    RETURNING id""",
                 (cfg.trading_mode, ticker, signal_id, quantity, buy_price,
                  _now_london(),
-                 buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp, session),
+                 buy_order_id, buy_net_gbp, buy_fx_rate, buy_fees_gbp, session,
+                 signal_price, entry_reason, entry_momentum_pct,
+                 entry_delay_seconds),
             )
             row_id = cur.fetchone()["id"]
             # buy_price is in USD (T212 quotes US equities in USD); GBP cash
@@ -1041,6 +1122,14 @@ _CRITICAL_EVENT_TYPES = {
     # `WHERE severity = 'critical'`, so a session-long scoring blackout raised
     # no alert at all.
     "claude_truncated_batch",
+    # NOT critical, and deliberately so (v21.16): `claude_cache_ineffective`
+    # means every call is paying full input price for a rubric that should be
+    # cached — a cost regression, not a trading outage. Nothing stops being
+    # scored and no trade is affected. Adding it here would page a human out of
+    # hours for a billing inefficiency and dilute the signal of the four event
+    # types above, each of which means the system has stopped working. It is
+    # surfaced as a Grafana panel ("Prompt cache hit rate") instead. This
+    # exclusion is a decision, not the v21.15.1 oversight repeating itself.
 }
 
 

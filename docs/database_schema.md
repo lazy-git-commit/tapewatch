@@ -117,6 +117,54 @@ v21.11 folds the realised exit price into the band on every close path
 (`_record_exit_excursion`), so from that point MAE is bounded by the actual
 outcome. Any row where `max_adverse_pct > profit_loss_pct` predates the fix.
 
+### `signal_price` (v21.16) — what the entry would have cost without the wait
+
+| Column | Type | Description |
+|---|---|---|
+| `signal_price` | REAL | Price observed at the **first** evaluation of the signal that produced this trade. NULL for every pre-v21.16 row, and for any entry whose first look produced no usable quote. |
+
+`buy_price − signal_price` is the cost of waiting for momentum confirmation.
+Before this column that cost was only estimable from `sentiment_scores` forward
+returns, which sample at 5/15/60/120 min and therefore cannot see the path in
+between — and that sampling gap is precisely why the buy-at-signal simulation
+reports a 33% stop-out rate against a live 48%. One real row settles per trade
+what four samples can only approximate.
+
+Recorded at the signal's first evaluation and carried through the re-eval queue,
+**not** read from `confirmation.current_price` at entry time — the latter would
+report a wait cost of exactly zero on every trade. Values that are non-finite or
+≤ 0 store as NULL rather than 0.0: the graduated pre-market hand-off constructs
+a synthetic `PriceConfirmation` with `current_price=0.0`, and a stored 0.0 makes
+every downstream wait-cost query divide by zero.
+
+Pure observability — no entry, exit or sizing decision reads it.
+
+### Entry provenance (v21.16) — HOW was this trade made?
+
+| Column | Type | Description |
+|---|---|---|
+| `entry_reason` | TEXT | The decision path that authorised the entry: `momentum_confirmed` (the momentum floor passed on its own merits), `momentum_skipped` (the floor **would have rejected** and `SKIP_MOMENTUM_CATALYSTS` let it through), `premarket_gap` (the gap-and-go path). NULL pre-v21.16. |
+| `entry_momentum_pct` | REAL | The actual momentum reading the decision was made on. A `momentum_skipped` row is below `MIN_PRICE_MOVE_PCT` by definition. |
+| `entry_delay_seconds` | INTEGER | Seconds from the signal's first evaluation to the fill. `0` = confirmed on first look; a large value is the re-eval queue. |
+
+`signal_price` records what waiting **cost**; these record **which path produced
+the trade**, and those are different questions. A trade that confirmed on its
+first look because momentum was already present and one that confirmed because
+the floor was skipped both show a wait cost of ~zero — so price alone cannot
+separate the v21.16 treatment group from the control. Without these columns the
+change is unfalsifiable after the fact.
+
+`entry_momentum_pct` exists so the outcome can be **regressed against the
+reading** rather than only bucketed by it — the open question is where between
+"flat" and "clearly moving" the edge actually lives, and a boolean cannot answer
+that. `premarket_gap` is labelled separately on purpose: the overnight move
+already happened, which is what put the candidate on the watchlist, so pooling
+those rows into either momentum bucket would corrupt the comparison.
+
+Read them on Grafana panels *"Entry Path: did entering at the signal work?"*
+(25) and *"Entry Path per trade"* (26). Pure observability throughout — no
+entry, exit or sizing decision reads any of them.
+
 ---
 
 ## `portfolio_snapshots`
@@ -353,7 +401,7 @@ automatically from `event_type`.
 | Column | Type | Description |
 |---|---|---|
 | `id` | SERIAL PK | Auto-incrementing primary key. |
-| `event_type` | TEXT | Machine-readable event key. Critical: `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`, `zero_trade_session`, `claude_truncated_batch` (v21.15 — our `max_tokens` cut the answer off; same operational state as a billing error and cannot self-heal without a code change). Warning: `claude_outage`, `claude_empty_batch` (v21.12), `twelvedata_prepost_unavailable` (v21.6), `finnhub_outage` (v21.10), `stale_quote_feed` (v21.10 — a provider serving a run of frozen quotes; fired for real on its first live day, 2026-07-31, four minutes before the NVT entry), `exit_stuck` (v19.2). ⚠️ Severity comes from `_CRITICAL_EVENT_TYPES` in `storage/database.py`, and the documented Grafana alert queries `severity = 'critical'` — an event type omitted from that set is recorded but **never alerts**. |
+| `event_type` | TEXT | Machine-readable event key. Critical: `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`, `zero_trade_session`, `claude_truncated_batch` (v21.15 — our `max_tokens` cut the answer off; same operational state as a billing error and cannot self-heal without a code change). Warning: `claude_outage`, `claude_empty_batch` (v21.12), `twelvedata_prepost_unavailable` (v21.6), `finnhub_outage` (v21.10), `stale_quote_feed` (v21.10 — a provider serving a run of frozen quotes; fired for real on its first live day, 2026-07-31, four minutes before the NVT entry), `exit_stuck` (v19.2), `entry_slippage_high` (v21.13), `claude_cache_ineffective` (v21.16 — 25 consecutive Claude calls with zero cached tokens, i.e. `cache_control` is being silently ignored because the cached prefix fell below the model's 4096-token minimum. **Warning by design**: it is a cost regression, not a trading outage — nothing stops being scored and no trade is affected — so it must not page a human or dilute the critical set. Read it on the *Classifier Prompt Cache* panel). ⚠️ Severity comes from `_CRITICAL_EVENT_TYPES` in `storage/database.py`, and the documented Grafana alert queries `severity = 'critical'` — an event type omitted from that set is recorded but **never alerts**. |
 | `severity` | TEXT | `"critical"` or `"warning"`. |
 | `detail` | TEXT | Human-readable context (e.g. credits used at exhaustion, drought session count). |
 | `created_at` | TIMESTAMPTZ | When the event was first recorded. |

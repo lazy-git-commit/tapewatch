@@ -1034,6 +1034,122 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 25,
+      "title": "Entry Path: did entering at the signal work?",
+      "description": "THE v21.16 verdict panel. entry_reason is RECORDED on each trade, not inferred: 'momentum_skipped' = the momentum floor would have rejected this and v21.16 let it through (the treatment group); 'momentum_confirmed' = the floor passed on its own merits (the control); 'premarket_gap' = the gap-and-go path, a different strategy that must not be pooled with either. wait_cost_pct = fill price vs the price when the signal first appeared. The change is working if momentum_skipped shows a lower stopped_out share and a higher avg_realised_pct than momentum_confirmed. Pre-v21.16 trades have NULL entry_reason and are excluded, so this needs ~20 new trades before it means anything.",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 74,
+        "w": 24,
+        "h": 7
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT COALESCE(t.entry_reason, 'pre-v21.16 (unrecorded)') AS entry_reason, COUNT(*) AS n, ROUND(AVG(t.entry_momentum_pct)::numeric, 2) AS avg_entry_momentum_pct, ROUND(AVG(t.entry_delay_seconds)::numeric, 0) AS avg_wait_secs, ROUND(AVG((t.buy_price - t.signal_price) / t.signal_price * 100)::numeric, 2) AS avg_wait_cost_pct, ROUND(AVG(t.profit_loss_pct)::numeric, 2) AS avg_realised_pct, ROUND((100.0 * SUM(CASE WHEN t.profit_loss_pct > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0))::numeric, 0) AS win_pct, ROUND((100.0 * SUM(CASE WHEN t.exit_reason = 'stop_loss' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0))::numeric, 0) AS stopped_out_pct FROM trades t WHERE t.status = 'closed' AND t.mode = '$mode' GROUP BY 1 ORDER BY n DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "title": "Entry Path per trade (how was this trade made?)",
+      "description": "Full provenance for each entry, newest first. entry_reason is the decision path, entry_momentum_pct is the actual momentum reading the decision was made on (a 'momentum_skipped' row is below MIN_PRICE_MOVE_PCT by definition), wait_secs is how long the signal sat in the re-eval queue, and wait_cost_pct is what that wait added to the entry price. Read alongside mfe_pct: a row with a large wait_cost_pct AND a negative mfe_pct never traded above what we paid, which is the failure v21.16 targets (ITT -0.12%, CEG -0.36%, LAMR -1.91%).",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 81,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT t.ticker, to_char(t.buy_time::timestamptz, 'MM-DD HH24:MI') AS bought, s.catalyst_type, t.entry_reason, ROUND(t.entry_momentum_pct::numeric, 2) AS entry_momentum_pct, t.entry_delay_seconds AS wait_secs, ROUND(t.signal_price::numeric, 2) AS signal_price, ROUND(t.buy_price::numeric, 2) AS fill_price, ROUND(((t.buy_price - t.signal_price) / t.signal_price * 100)::numeric, 2) AS wait_cost_pct, ROUND(t.profit_loss_pct::numeric, 2) AS realised_pct, ROUND(t.max_favorable_pct::numeric, 2) AS mfe_pct, t.exit_reason FROM trades t LEFT JOIN news_signals s ON s.id = t.signal_id WHERE t.mode = '$mode' ORDER BY t.buy_time DESC LIMIT 50",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "title": "Classifier Prompt Cache (is cache_control actually engaging?)",
+      "description": "cache_control is a request HINT: below Claude Haiku 4.5's 4096-token minimum cacheable prefix it is accepted, ignored, and reported as success. It was a silent no-op for the first 1,140 Claude calls - cached_tokens summed to exactly 0 while Qwen, whose endpoint caches automatically, accumulated 38,272. cache_hit_pct should sit high for both providers during market hours; a collapse to 0 for claude means the prompt or tool schema was trimmed back under the threshold. The service also emits a claude_cache_ineffective system_event after 25 consecutive uncached calls (warning, not critical - it is a cost regression, not an outage).",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 89,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT provider, COUNT(*) AS calls, SUM(CASE WHEN COALESCE(tokens_cached, 0) > 0 THEN 1 ELSE 0 END) AS calls_with_cache, ROUND((100.0 * SUM(CASE WHEN COALESCE(tokens_cached, 0) > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0))::numeric, 1) AS cache_hit_pct, SUM(COALESCE(tokens_cached, 0)) AS cached_tokens, SUM(COALESCE(tokens_in, 0)) AS full_price_tokens FROM classifier_calls WHERE ok AND called_at::timestamptz >= NOW() - INTERVAL '7 days' GROUP BY provider ORDER BY provider",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "title": "Momentum Gate: which classes are still waiting?",
+      "description": "v21.16 skips the low_momentum FLOOR for the classes in SKIP_MOMENTUM_CATALYSTS. For those classes rejected_low_momentum should fall close to zero - what remains is the 'tape moving against the signal' branch, which is deliberately still enforced. A class NOT in the skip list should be unchanged. If guidance_raise still shows heavy low_momentum rejection, the catalyst is not reaching confirm_price_signal().",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 89,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "trader-postgres"
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {}
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT catalyst_type, COUNT(*) AS signals, SUM(CASE WHEN rejection_code = 'low_momentum' THEN 1 ELSE 0 END) AS rejected_low_momentum, SUM(CASE WHEN rejection_code = 'below_vwap' THEN 1 ELSE 0 END) AS rejected_below_vwap, SUM(CASE WHEN rejection_code IS NULL THEN 1 ELSE 0 END) AS not_rejected FROM news_signals WHERE created_at::timestamptz >= NOW() - INTERVAL '14 days' AND catalyst_type IS NOT NULL GROUP BY catalyst_type ORDER BY signals DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "schemaVersion": 38
