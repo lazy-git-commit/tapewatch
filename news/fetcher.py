@@ -278,6 +278,21 @@ _EMPTY_BATCH_COOLDOWN_SECONDS = 120
 _TOKENS_PER_ARTICLE = 150
 _MIN_OUTPUT_TOKENS = 1024
 
+# Hard cap on articles per Claude call (v21.15.1). Raising the per-article
+# allowance above rescaled the truncation cliff; it did not remove it, because
+# nothing bounded `len(articles)` — `to_score` in fetch_all_news is the entire
+# unscored backlog, and a truncated cycle GROWS it (_mark_scored fires only on
+# success). Chunking makes max_tokens a bounded constant (25*150+256 = 4006,
+# vs a measured need of ~25*72 = 1800), so no achievable backlog can truncate,
+# and a single bad chunk costs one chunk's articles instead of the whole cycle.
+#
+# backtest/backtest.py has chunked at 20 "to stay within Claude token limits"
+# since long before any of this; the live path simply never adopted it. Every
+# property of the outage — deterministic recurrence, self-reinforcement,
+# clustering at session boundaries — was a consequence of unbounded n, not of
+# the constant 60.
+_MAX_ARTICLES_PER_BATCH = 25
+
 # Consecutive news cycles whose batch came back empty on every attempt. Reset by
 # ANY successful scoring pass (see _batch_score_sentiment) — a single good cycle
 # means the classifier is answering again.
@@ -386,12 +401,21 @@ def _record_claude_failure(articles: list, error_type: str,
         logger.debug("Could not record classifier_call failure for claude: %s", exc)
 
 
-def _record_claude_event(event_type: str, detail: str) -> None:
+def _record_claude_event(event_type: str, detail: str,
+                         live: bool = True) -> None:
     """Best-effort system_event for a Claude failure (alerting/observability).
 
     Import-local and swallowing — an event-log failure must never affect the
     news path. See storage.database.record_system_event.
+
+    `live=False` (backtest replay) writes nothing. record_system_event stamps
+    event_day from TODAY and de-dupes atomically on (event_type, event_day), so
+    a replayed event would consume the day's only alert slot and silently
+    suppress the genuine production one — the same "a replayed row permanently
+    blocks the real one" hazard already guarded for qwen_scores.
     """
+    if not live:
+        return
     try:
         from storage.database import record_system_event
         record_system_event(event_type, detail)
@@ -745,10 +769,44 @@ def _fetch(lookback_minutes: int) -> list[dict]:
         return []
 
 
+def _output_budget(n_articles: int) -> int:
+    """
+    max_tokens for a batch of n_articles.
+
+    Single definition, imported by news/shadow_classifier.py and asserted by the
+    tests, so the live call, the shadow call and the test expectation can never
+    disagree. v21.14.1 shipped a duplicated formula and the copies drifted;
+    sharing only the two constants (v21.15) left the arithmetic duplicated in
+    six places, where a changed overhead term would still have diverged
+    silently.
+    """
+    return max(_MIN_OUTPUT_TOKENS, n_articles * _TOKENS_PER_ARTICLE + 256)
+
+
 def _batch_score_sentiment(articles: list[dict],
                            live: bool = True) -> dict[str, dict]:
     """
-    Score sentiment for multiple articles in a single Claude call.
+    Score sentiment for a list of articles, chunked into bounded Claude calls.
+
+    Splits into batches of at most _MAX_ARTICLES_PER_BATCH and merges the
+    results, so the output budget per call is bounded regardless of how large
+    the unscored backlog has grown. A chunk that fails contributes nothing and
+    leaves its own articles unscored (and therefore still eligible next cycle);
+    it does not discard the chunks around it.
+    """
+    if not articles:
+        return {}
+    scores: dict[str, dict] = {}
+    for i in range(0, len(articles), _MAX_ARTICLES_PER_BATCH):
+        chunk = articles[i:i + _MAX_ARTICLES_PER_BATCH]
+        scores.update(_score_one_batch(chunk, live=live))
+    return scores
+
+
+def _score_one_batch(articles: list[dict],
+                     live: bool = True) -> dict[str, dict]:
+    """
+    Score sentiment for one bounded batch of articles in a single Claude call.
 
     articles: list of dicts with keys 'id', 'headline', 'teaser', 'ticker', and
               optionally 'prior_context' (see _prior_ticker_context).
@@ -821,7 +879,6 @@ def _batch_score_sentiment(articles: list[dict],
         _record_claude_failure(articles, "cooldown_suppressed", live=live)
         return {}
 
-    # Tool-use JSON output runs ~55 tokens per article empirically; 60 gives
     # ── Output budget (v21.15 — this was THE "empty batch" bug) ──────────────
     #
     # The old budget was `max(400, n * 60 + 64)`, from a claimed "~55 tokens per
@@ -858,7 +915,7 @@ def _batch_score_sentiment(articles: list[dict],
     # are billed, and forced tool use with a strict schema means the model
     # cannot ramble to fill it. So the budget is now generous on purpose:
     # under-budgeting costs whole trading sessions, over-budgeting costs zero.
-    max_tokens = max(_MIN_OUTPUT_TOKENS, len(articles) * _TOKENS_PER_ARTICLE + 256)
+    max_tokens = _output_budget(len(articles))
     try:
         # Retries when Claude returns a well-formed but EMPTY classifications
         # list for a non-empty batch. This is not a parsing failure — the 200 OK
@@ -930,6 +987,7 @@ def _batch_score_sentiment(articles: list[dict],
                     "claude_truncated_batch",
                     f"response hit max_tokens={max_tokens} on a "
                     f"{len(articles)}-article batch — output budget too small",
+                    live=live,
                 )
                 return {}
 
@@ -984,6 +1042,7 @@ def _batch_score_sentiment(articles: list[dict],
                     f"empty classification lists on all {_EMPTY_BATCH_ATTEMPTS} "
                     f"attempts for a {len(articles)}-article batch — news "
                     f"scoring is blind while this persists",
+                    live=live,
                 )
                 # Repeated across cycles this is not a blip; stop paying for it.
                 if _consecutive_empty_batches >= _EMPTY_BATCH_COOLDOWN_TRIGGER:
@@ -1070,7 +1129,8 @@ def _batch_score_sentiment(articles: list[dict],
                 err_type, exc, _CLAUDE_BILLING_COOLDOWN_SECONDS // 60,
             )
         _enter_claude_cooldown(_CLAUDE_BILLING_COOLDOWN_SECONDS, f"403 {err_type}")
-        _record_claude_event("claude_billing_error", f"403 {err_type}: {exc}")
+        _record_claude_event("claude_billing_error", f"403 {err_type}: {exc}",
+                             live=live)
         _record_claude_failure(articles, f"403_{err_type}", exc, live=live)
         return {}
     except anthropic.AuthenticationError as exc:
@@ -1080,7 +1140,7 @@ def _batch_score_sentiment(articles: list[dict],
             exc, _CLAUDE_BILLING_COOLDOWN_SECONDS // 60,
         )
         _enter_claude_cooldown(_CLAUDE_BILLING_COOLDOWN_SECONDS, "401 auth")
-        _record_claude_event("claude_auth_error", f"401: {exc}")
+        _record_claude_event("claude_auth_error", f"401: {exc}", live=live)
         _record_claude_failure(articles, "401_auth", exc, live=live)
         return {}
 
@@ -1097,7 +1157,8 @@ def _batch_score_sentiment(articles: list[dict],
         # Record it too: a SUSTAINED 429 stops all scoring (→ zero trades) and
         # must be visible to the degradation alert, not just the zero-trade
         # tripwire 3 sessions later.
-        _record_claude_event("claude_outage", f"429 rate limit: {exc}")
+        _record_claude_event("claude_outage", f"429 rate limit: {exc}",
+                             live=live)
         _record_claude_failure(articles, "429_rate_limit", exc, live=live)
         return {}
     except (anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
@@ -1110,7 +1171,8 @@ def _batch_score_sentiment(articles: list[dict],
         _enter_claude_cooldown(
             _CLAUDE_OUTAGE_COOLDOWN_SECONDS, f"API status {status}"
         )
-        _record_claude_event("claude_outage", f"status {status}: {exc}")
+        _record_claude_event("claude_outage", f"status {status}: {exc}",
+                             live=live)
         _record_claude_failure(articles, f"api_status_{status}", exc, live=live)
         return {}
     except Exception as exc:

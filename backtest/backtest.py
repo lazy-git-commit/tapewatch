@@ -331,9 +331,19 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
         headline = html.unescape(a.get("title", ""))
 
         if use_sentiment:
-            sentiment, confidence = scores.get(article_id, ("neutral", 0.0))
-            if sentiment != "positive":
+            # _batch_score_sentiment returns {id: {sentiment, confidence,
+            # catalyst_type, already_moved, catalyst_magnitude}} — a 5-key dict,
+            # NOT a 2-tuple. Unpacking it into two names raises ValueError.
+            # That never fired because the old max_tokens budget truncated even
+            # this path's 20-article chunks (20*60+64 = 1264 vs ~1400 needed),
+            # so `scores` was always empty and the default was always used —
+            # i.e. this replay has been silently scoring nothing. v21.15 fixed
+            # the budget, which is what made the latent crash reachable.
+            score = scores.get(article_id)
+            if score is None or score.get("sentiment") != "positive":
                 continue
+            sentiment = score["sentiment"]
+            confidence = float(score.get("confidence") or 0.0)
         else:
             sentiment, confidence = "positive", 1.0
 

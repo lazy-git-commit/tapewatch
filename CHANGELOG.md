@@ -7,6 +7,101 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.15.1 — 2026-08-18 (cap the batch; make the v21.15 tests actually test v21.15)
+
+Review pass on v21.15. The diagnosis held up; the fix and its tests did not.
+
+**1. Raising the budget rescaled the cliff — capping the batch removes it.**
+`max(1024, n*150 + 256)` is still a function of `n`, and nothing bounded `n`:
+`to_score` is the entire unscored backlog, and a truncated cycle *grows* it
+(`_mark_scored` fires only on success). So the death spiral was intact, just at
+a higher trigger threshold. `_batch_score_sentiment` now chunks to
+**`_MAX_ARTICLES_PER_BATCH` (25)** and merges — exactly what
+`backtest/backtest.py` has done for years — making `max_tokens` a bounded
+constant (4,006 against a measured need of ~1,800) and limiting any single
+failure to one chunk instead of the whole cycle. Every property of the outage
+(deterministic recurrence, self-reinforcement, session-boundary clustering) was
+a consequence of unbounded `n`, not of the constant 60.
+
+**2. The v21.15 tests were vacuous — proved by mutation.** Reverting
+`max_tokens` to the exact original bug left **all 45 tests green**: both tests
+with "budget" in the name asserted against the *shadow* (Qwen) client, and
+nothing anywhere inspected the live Claude call. Deleting the truncation branch
+left **6 of 7** green: both truncation tests used `content=[]`, which falls into
+the pre-existing `no_tool_use` branch and produces byte-identical behaviour,
+rather than the real truncated shape — a `tool_use` block whose `input` never
+finished serialising. Rewritten: the budget is asserted on the live call across
+three batch sizes, the truncation tests use the real shape and are paired
+against a non-truncated control, the cooldown test runs
+`_EMPTY_BATCH_COOLDOWN_TRIGGER + 1` cycles (one cycle could never reach the
+trigger, so the old assertion could not fail), `tokens_out` recording is pinned
+(it is the entire evidence chain), and two tautologies are gone. Both mutations
+are now caught.
+
+**3. `python -m backtest.backtest` was broken, and v21.15 would have crashed
+it.** `sentiment, confidence = scores.get(article_id, ("neutral", 0.0))`
+unpacks a **five-key dict** into two names → `ValueError`. It never fired
+because this path's 20-article chunks were *also* truncating under the old
+budget (20×60+64 = 1,264 vs ~1,400 needed), so `scores` was always empty and the
+default tuple was always used — i.e. **the legacy replay has been silently
+scoring nothing**. Fixing the budget made the latent crash reachable.
+
+**4. `claude_truncated_batch` raised no alert.** It was not in
+`_CRITICAL_EVENT_TYPES`, so it landed at `warning` while the documented Grafana
+alert queries `severity = 'critical'`. A session-long scoring blackout would
+have produced one routine-looking row. Now critical — it is the same
+operational state as a billing error (no scores → no signals → no trades) and,
+unlike an empty batch, cannot self-heal: the remedy is a code change.
+
+**5. Our config bug was being charged to the provider.** `truncated` written as
+`ok=False` degraded Claude's `success_rate` and `worst_failure_streak` — the
+figure `classifier_compare` tells the reader to weigh above all others — in the
+report used to decide whether to *replace* Claude. That is precisely the
+accounting error v21.14.1 removed on the Qwen side, mirrored. `truncated`,
+`bad_shape`, `client_unavailable` and `dropped_backlog` are now excluded from
+liveness and reported separately as `OUR-FAULT calls`.
+
+**6. `_record_claude_event` was not `live`-guarded** while
+`_record_claude_call` two lines above it was. `record_system_event` stamps
+`event_day` from *today* and de-dupes on `(event_type, event_day)` with `ON
+CONFLICT DO NOTHING`, so one backtest replay could consume the day's only alert
+slot and silently suppress the genuine production event. All six event call
+sites now pass `live`.
+
+**7. Shadow truncation detection was broken three ways.** `finish_reason` was
+read *after* the `no_tool_call` early return, so a Qwen completion truncated
+before it emitted a tool call was filed as the provider refusing to use the
+tool; the success path never consulted it at all, so a truncated-but-parseable
+completion was recorded as `ok=True` with partial data (Claude in the identical
+situation records a failure and saves nothing — a liveness *and* coverage bias
+in the challenger's favour on exactly the largest batches); and there was no
+shape guard, so a `classifications` value arriving as a JSON *string* would
+report `scored_count` = the string's character length, while a non-dict payload
+raised `AttributeError` into a DEBUG swallow and wrote **no row at all**.
+
+**8. The budget formula was duplicated six times.** v21.15 shared the two
+constants but copied the arithmetic, so a changed overhead term would still
+have diverged silently — with both parity tests green, since they compared the
+shadow against a third copy. One shared `_output_budget()` now.
+
+**Also:** the cache-hit column computed `cached / in` uniformly, but
+`tokens_in` means the uncached remainder for Anthropic and the *total* prompt
+for OpenAI-compatible providers — producing hit rates above 100% for Claude.
+And the orphaned `# …~55 tokens per article empirically; 60 gives` comment, left
+dangling directly above the block disproving it, is deleted. `docs/algorithm.md`
+(which still described the root cause as "unconfirmed") and
+`docs/api_reference.md` (which still published the killed formula as a code
+sample) are updated.
+
+**Standing finding, not fixed here:** prompt caching has **never worked**.
+1,072 Claude calls, zero cached tokens ever recorded. Claude Haiku 4.5's minimum
+cacheable prefix is 4,096 tokens; the system prompt plus tool schema measures
+~3,000-3,200, and below the minimum `cache_control` silently no-ops. The
+"~90% input-cost reduction" claim in the code and docs is false. Tracked
+separately.
+
+---
+
 ## v21.15 — 2026-08-14 (the "empty batch" outages were our own truncation)
 
 **The single most consequential bug found so far.** Three releases "fixed" it

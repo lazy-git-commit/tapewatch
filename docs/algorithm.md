@@ -116,7 +116,12 @@ batched call** per cycle:
   every 60s, and the prompt cache TTL is 5 min, so the rubric is a cache hit on
   every call after the first.
 - **Forced tool use** (`tool_choice`) — output is schema-validated JSON; no
-  string parsing, no truncation recovery.
+  string parsing. It does **not** guarantee a complete answer: see the
+  truncation note below, which is the actual cause of the "empty batch" outages.
+- **Bounded batch size (v21.15.1)** — `_batch_score_sentiment` chunks into calls
+  of at most `_MAX_ARTICLES_PER_BATCH` (25). This is what makes the output
+  budget a constant instead of a function of news volume, and it is the reason
+  truncation cannot recur; see the root-cause note below.
 - **Retries on an empty result (v21.7, 2026-07-28; widened v21.12, 2026-08-04):**
   a 200 OK, forced-tool-use response can still legitimately carry an empty
   `classifications` list for a non-empty batch — observed 8 consecutive cycles
@@ -164,10 +169,45 @@ batched call** per cycle:
   data-loss risk, not routine. `record_system_event` de-dupes per day, so this is
   one alert per outage rather than one per cycle. A missing `tool_use` block is a
   *parsing* failure, not an empty batch, and still returns immediately without
-  burning the retry budget. Root cause of the empty response itself remains
-  unconfirmed — plausibly a backlog/complexity edge in the first larger batch
-  after an idle gap. **This is the strongest argument for a second classifier
-  provider as a fallback** (see CHANGELOG v21.13): Claude is the only external
+  burning the retry budget.
+
+  > ⚠️ **v21.15 — ROOT CAUSE FOUND, AND IT WAS OURS. Everything above this line
+  > describes symptom management for a bug that was never Claude's.** The three
+  > releases above (v21.7 retry, v21.12 three retries, v21.13 cooldown) all
+  > treated a failure that was our own `max_tokens` truncation. The budget was
+  > `max(400, n*60 + 64)`, from a comment claiming "~55 tokens/article"; the
+  > measured cost in `classifier_calls` is **68-72 tokens/article** — above the
+  > allowance — so any batch of roughly 7+ articles was cut off deterministically.
+  > A truncated forced-tool-use response returns 200 OK with a `tool_use` block
+  > whose `input` never finished serialising, so `.get("classifications", [])`
+  > yields `[]`: identical to a genuine empty answer unless `stop_reason` is read.
+  >
+  > Proof (2026-08-12..14): 26 calls with `tokens_out` **exactly** equal to the
+  > cap, all 26 with `scored_count=0`, and exactly 26 `empty_batch` errors. 1:1.
+  >
+  > It explains every property the "genuinely empty array" theory could not:
+  > retries never helped (deterministic — same batch, same cut-off); it
+  > self-reinforced (`_mark_scored` fires only on success, so the next batch is
+  > BIGGER); it always self-healed unaided (articles aged out, shrinking the
+  > batch); and it clustered at premarket/session boundaries (largest backlogs).
+  > The v21.13 cooldown "worked" by accident — standing down let the backlog
+  > drain.
+  >
+  > **Fix:** `stop_reason == "max_tokens"` is now detected and recorded as
+  > `truncated` + a `claude_truncated_batch` event, returning immediately
+  > WITHOUT consuming a retry or tripping the cooldown (a config bug must not
+  > stand the classifier down). `_TOKENS_PER_ARTICLE`=150 / `_MIN_OUTPUT_TOKENS`
+  > =1024 raise the allowance, and **v21.15.1 `_MAX_ARTICLES_PER_BATCH`=25 caps
+  > the batch**, which is the fix that actually closes the class: raising the
+  > multiplier alone rescaled the cliff, capping removes it, because `max_tokens`
+  > stops depending on how big the backlog grew. `_output_budget()` is a single
+  > shared function so the live call, the shadow call and the tests cannot drift.
+  > **If short/empty batches ever recur, check `tokens_out` against the cap in
+  > `classifier_calls` FIRST — do not add retries.**
+
+  The empty-batch machinery above is retained for a genuinely empty answer, which
+  remains possible in principle. **A second classifier provider as a fallback is
+  still worth having** (see CHANGELOG v21.13): Claude is the only external
   dependency with no alternative path, and it has now gone dark twice in three
   sessions.
 - The rubric is a **decision tree**: (1) is this NEW information, or a
@@ -1179,7 +1219,8 @@ most partnership news produces no intraday price action at all.
 | Both feeds down with open position | TP/SL skipped that cycle; time stop still fires (needs no price) |
 | Quote frozen / stale (source up, data dead) | **v19.2:** quote `t` older than 20 min → treated as no coverage (falls to next source / fail-closed). A frozen print is not a price (GLASF: entry, P&L, and every exit limit priced off a $12.50 quote that never moved). **v21.10:** 10 consecutive stale readings from one source → `stale_quote_feed` `system_events` row + ERROR, because a *streak* is a provider cache, not a quiet ticker. **v21.11:** while that streak is live, no-quote misses stop counting toward the session blacklist, and a quote merely LAGGING (not frozen) is rejected for entries at 90s via `stale_price`. **v21.12:** the streak must ALSO span `_STALE_QUOTE_MIN_DISTINCT_SYMBOLS` (3) distinct symbols — one dead ticker polled in a loop is not a provider outage (MZDAY, 221 polls on 2026-08-04, tripped both providers while BE quoted fine two minutes later) |
 | Frozen-feed false alarm protecting a dead ticker | **v21.12:** the distinct-symbol requirement above closes a self-reinforcing loop. `quote_feed_degraded()` deliberately suppresses the no-quote strikes that would blacklist an un-quotable ticker (the v21.11 fix). When a single dead ticker was itself what tripped the "provider frozen" alarm, it protected itself from ever being blacklisted and kept polling to re-trip the alarm — all day. The 2026-07-31 real outage served the previous day's close for *every* symbol asked (SONY included), so it clears a distinct-symbol bar trivially; the original protection is intact. `_note_quote_fresh()` clears the symbol set with the streak so a feed alternating fresh/stale cannot accumulate its way over the bar |
-| Claude returns an empty batch repeatedly | **v21.12:** `_EMPTY_BATCH_ATTEMPTS` (3) attempts with a 2s backoff, then a `claude_empty_batch` `system_events` row. The v21.7 single retry was insufficient — 25 consecutive cycles on 2026-08-04 had both the call and its retry return empty, and articles aged out of the freshness window **unscored** with no trace on any monitoring surface. See §3.2 |
+| Claude returns an empty batch repeatedly | **v21.13:** `_EMPTY_BATCH_ATTEMPTS` (**2** — one retry) with a 2s backoff, a `claude_empty_batch` `system_events` row when exhausted, and a 120s stand-down after `_EMPTY_BATCH_COOLDOWN_TRIGGER` (2) consecutive all-empty cycles. ⚠️ **Every historical instance of this was actually OUR truncation, not an empty answer — see the v21.15 note in §3.2 before touching these constants.** |
+| Claude response truncated at `max_tokens` | **v21.15:** `stop_reason == "max_tokens"` → recorded as `truncated` + a **critical** `claude_truncated_batch` `system_events` row, returning immediately without consuming a retry or tripping the empty-batch cooldown (our config bug must not stand the classifier down). **v21.15.1:** `_MAX_ARTICLES_PER_BATCH` (25) caps the batch so `max_tokens` is a bounded constant and this cannot recur from backlog growth. Critical, not warning: it produces the identical operational state to a billing error (no scores → no signals → no trades) and cannot self-heal — the remedy is a code change. See §3.2 |
 | Quote lagging but inside the coverage window | **v21.11:** entries only, RTH only — `stale_price` (transient). Distinct from the row above: a 3-minute-old quote is honest about its age and passes every coverage test, yet makes momentum/RVOL/VWAP agree on a market that has moved on (NVT 2026-07-31, stopped out 42s after the fill) |
 | Broker rate-limits the cash endpoint | **v21.11:** `/equity/account/cash` is served from a 15s process cache behind a lock, with one retry on 429/5xx. The lock is the actual fix — it serializes the callers that used to collide. See "Scheduler collisions" below |
 | Malformed payloads (wrong types, NaN, nulls, mis-scaled values) | **v19.3: normalized at every seam** — Finnhub quotes require a positive finite `c`; Twelvedata quote fields coerce individually (bad secondary field ≠ dead quote); bar arrays must be lists and non-dict bars are skipped; Claude records validated individually with out-of-range values REJECTED not clamped; article-feed nulls/scalars/bare-string tickers skipped per element. Contract enforced by `tests/test_adversarial.py`: garbage may never crash a cycle nor produce an approval |
@@ -1234,9 +1275,15 @@ degraded-but-up system is visible. One row per `(event_type, event_day)`,
 de-duped atomically by a UNIQUE index + `ON CONFLICT DO NOTHING` (safe under the
 8-worker pre-market pool). Critical types:
 `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`,
-`zero_trade_session`; warning: `claude_outage`, `benzinga_outage` (v19.1 —
-these can self-heal), `exit_stuck` (v19.2 — a position's limit exits failed
-repeatedly and the monitor escalated to a market order). Grafana alert query (fires on any critical event today):
+`zero_trade_session`, `claude_truncated_batch` (v21.15 — our output budget cut
+the answer off; no scores, and it cannot self-heal without a code change);
+warning: `claude_outage`, `benzinga_outage` (v19.1 — these can self-heal),
+`exit_stuck` (v19.2 — a position's limit exits failed repeatedly and the monitor
+escalated to a market order), `claude_empty_batch` (v21.12),
+`twelvedata_prepost_unavailable` (v21.6), `finnhub_outage` / `stale_quote_feed`
+(v21.10). **The alert query below fires on `severity = 'critical'` only — a new
+event type that is not in `_CRITICAL_EVENT_TYPES` raises no alert at all.**
+Grafana alert query (fires on any critical event today):
 
 ```sql
 SELECT event_type, detail, created_at FROM system_events

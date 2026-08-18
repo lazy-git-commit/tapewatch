@@ -565,27 +565,141 @@ class TestOutputBudgetAndTruncation:
         return [{"id": str(i), "headline": f"h{i}", "teaser": "t",
                  "ticker": f"T{i}_US_EQ"} for i in range(n)]
 
+    def _truncated_msg(self, out_tokens=4006):
+        """
+        The REAL production truncation shape.
+
+        A cut-off forced-tool-use response is NOT an empty content list — it is
+        a tool_use block whose `input` never finished serialising, so
+        `.get("classifications", [])` yields []. That distinction is the whole
+        bug: with `content=[]` the code falls into the pre-existing
+        `no_tool_use` branch and every assertion below passes whether or not
+        the truncation check exists at all. The v21.15 tests used `content=[]`
+        and were provably vacuous — deleting the branch left 6 of 7 green.
+        """
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": []}
+        msg = MagicMock()
+        msg.stop_reason = "max_tokens"
+        msg.content = [block]
+        msg.usage = MagicMock(input_tokens=100, output_tokens=out_tokens,
+                              cache_read_input_tokens=0)
+        return msg
+
+    def test_the_live_call_sends_the_computed_budget(self):
+        """
+        THE regression test for v21.15. Nothing previously asserted the
+        max_tokens actually sent to Claude — both "budget" tests inspected the
+        Qwen shadow client instead, so reverting the live formula to the exact
+        bug left all 45 tests green.
+        """
+        import news.fetcher as f
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": []}
+        msg = MagicMock()
+        msg.stop_reason = "tool_use"
+        msg.content = [block]
+        msg.usage = None
+        for n in (1, 8, 25):
+            with patch.object(f, "_claude_available", return_value=True), \
+                 patch.object(f, "_claude") as claude, \
+                 patch.object(f, "_record_claude_event"), \
+                 patch.object(f, "_record_claude_call"):
+                claude.messages.create.return_value = msg
+                f._batch_score_sentiment(self._articles(n))
+            sent = claude.messages.create.call_args.kwargs["max_tokens"]
+            assert sent == f._output_budget(n), (
+                f"batch of {n} sent max_tokens={sent}, expected "
+                f"{f._output_budget(n)}"
+            )
+            # The bug itself, pinned by value: the old formula must not return.
+            assert sent > n * 72, "no headroom over the worst measured rate"
+
     def test_budget_exceeds_measured_cost_per_article(self):
         """
         The regression that caused the outages: a per-article allowance BELOW
         what a classification actually costs. Measured 68-72; anything at or
         under that truncates once fixed overhead stops covering the gap.
+
+        Load-bearing: this is the only assertion pinning the CONSTANT rather
+        than the formula, so `test_the_live_call_sends_the_computed_budget`
+        cannot catch a revert of _TOKENS_PER_ARTICLE on its own.
         """
         import news.fetcher as f
         assert f._TOKENS_PER_ARTICLE >= 100, (
             "measured cost is 68-72 tokens/article — a budget near that has no "
             "headroom and truncates large batches"
         )
-        # A 25-article batch is the size that actually broke in production.
-        budget = max(f._MIN_OUTPUT_TOKENS, 25 * f._TOKENS_PER_ARTICLE + 256)
-        assert budget > 25 * 72, "no headroom over the worst measured rate"
 
-    def test_large_batch_gets_a_bigger_budget_than_the_old_formula(self):
+    def test_batch_size_is_capped_so_truncation_cannot_recur(self):
+        """
+        The altitude fix. Raising the per-article allowance rescaled the cliff;
+        capping the batch removes it, because max_tokens stops being a function
+        of news volume. Without this, a truncated cycle GROWS the backlog
+        (_mark_scored fires only on success) and truncates harder next minute.
+        """
         import news.fetcher as f
-        for n in (8, 16, 21, 25):
-            old = max(400, n * 60 + 64)          # the formula that truncated
-            new = max(f._MIN_OUTPUT_TOKENS, n * f._TOKENS_PER_ARTICLE + 256)
-            assert new > old, f"batch {n}: {new} is not more than {old}"
+        # A non-empty classifications list, so no chunk enters the empty-batch
+        # retry and the call count is exactly the chunk count.
+        block = MagicMock()
+        block.type = "tool_use"
+        block.input = {"classifications": [
+            {"id": "0", "sentiment": "neutral", "confidence": 0.5,
+             "catalyst_type": "other", "already_moved": False,
+             "catalyst_magnitude": 1},
+        ]}
+        msg = MagicMock()
+        msg.stop_reason = "tool_use"
+        msg.content = [block]
+        msg.usage = None
+        with patch.object(f, "_claude_available", return_value=True), \
+             patch.object(f, "_claude") as claude, \
+             patch.object(f, "_record_claude_event"), \
+             patch.object(f, "_record_claude_call"):
+            claude.messages.create.return_value = msg
+            f._batch_score_sentiment(self._articles(120))
+        sizes = [c.kwargs["max_tokens"]
+                 for c in claude.messages.create.call_args_list]
+        expected_chunks = -(-120 // f._MAX_ARTICLES_PER_BATCH)   # ceil div
+        assert len(sizes) == expected_chunks, (
+            f"120 articles must split into {expected_chunks} bounded calls, "
+            f"got {len(sizes)}"
+        )
+        ceiling = f._output_budget(f._MAX_ARTICLES_PER_BATCH)
+        assert max(sizes) == ceiling, (
+            f"max_tokens must be bounded by {ceiling}, saw {max(sizes)}"
+        )
+
+    def test_every_article_survives_chunking(self):
+        """Chunking must not drop or duplicate articles."""
+        import news.fetcher as f
+
+        def _reply(**kwargs):
+            # Echo back one classification per article in THIS chunk.
+            ids = [ln.split(":")[0].removeprefix("ID ").strip()
+                   for ln in kwargs["messages"][0]["content"].splitlines()
+                   if ln.startswith("ID ")]
+            block = MagicMock()
+            block.type = "tool_use"
+            block.input = {"classifications": [
+                {"id": i, "sentiment": "positive", "confidence": 0.8,
+                 "catalyst_type": "guidance_raise", "already_moved": False,
+                 "catalyst_magnitude": 3} for i in ids
+            ]}
+            msg = MagicMock()
+            msg.stop_reason = "tool_use"
+            msg.content = [block]
+            msg.usage = None
+            return msg
+
+        with patch.object(f, "_claude_available", return_value=True), \
+             patch.object(f, "_claude") as claude, \
+             patch.object(f, "_record_claude_call"):
+            claude.messages.create.side_effect = _reply
+            out = f._batch_score_sentiment(self._articles(60))
+        assert set(out) == {str(i) for i in range(60)}
 
     def test_truncation_is_recorded_as_truncated_not_empty_batch(self):
         """
@@ -593,59 +707,89 @@ class TestOutputBudgetAndTruncation:
         releases chasing retries and cooldowns instead of the budget.
         """
         import news.fetcher as f
-        msg = MagicMock()
-        msg.stop_reason = "max_tokens"
-        msg.content = []
-        msg.usage = MagicMock(input_tokens=100, output_tokens=1564,
-                              cache_read_input_tokens=0)
         with patch.object(f, "_claude_available", return_value=True), \
              patch.object(f, "_claude") as claude, \
              patch.object(f, "_record_claude_event") as evt, \
              patch.object(f, "_record_claude_call") as rec:
-            claude.messages.create.return_value = msg
+            claude.messages.create.return_value = self._truncated_msg()
             assert f._batch_score_sentiment(self._articles(25)) == {}
 
+        # Exactly ONE record, and it is not `empty_batch`. Asserting only
+        # call_args (the LAST call) would still pass if an empty_batch row were
+        # written first and a truncated row appended after it.
+        assert rec.call_count == 1, "a truncation must not also record empty_batch"
         assert rec.call_args.kwargs["error_type"] == "truncated"
         assert rec.call_args.kwargs["ok"] is False
+        assert evt.call_count == 1
         assert evt.call_args.args[0] == "claude_truncated_batch"
 
     def test_truncation_does_not_burn_the_retry_budget(self):
         """
         Retrying a truncation is pointless — same batch, same size, same
         deterministic cut-off. It must fail fast, exactly once.
+
+        Discriminating: the identical response WITHOUT stop_reason="max_tokens"
+        is a genuine empty batch and does get retried, so the two counts differ.
         """
         import news.fetcher as f
-        msg = MagicMock()
-        msg.stop_reason = "max_tokens"
-        msg.content = []
-        msg.usage = None
         with patch.object(f, "_claude_available", return_value=True), \
              patch.object(f, "_claude") as claude, \
              patch.object(f, "_record_claude_event"), \
              patch.object(f, "_record_claude_call"):
-            claude.messages.create.return_value = msg
+            claude.messages.create.return_value = self._truncated_msg()
             f._batch_score_sentiment(self._articles(20))
         assert claude.messages.create.call_count == 1
+
+        msg = self._truncated_msg()
+        msg.stop_reason = "tool_use"          # same shape, NOT truncated
+        with patch.object(f, "_claude_available", return_value=True), \
+             patch.object(f, "_claude") as claude, \
+             patch.object(f, "_record_claude_event"), \
+             patch.object(f, "_record_claude_call"), \
+             patch.object(f, "_EMPTY_BATCH_BACKOFF_SECONDS", 0):
+            claude.messages.create.return_value = msg
+            f._batch_score_sentiment(self._articles(20))
+        assert claude.messages.create.call_count == f._EMPTY_BATCH_ATTEMPTS, (
+            "a genuine empty batch must still be retried — otherwise this test "
+            "proves nothing about the truncation branch"
+        )
 
     def test_truncation_does_not_trip_the_empty_batch_cooldown(self):
         """
         A budget bug must not stand the classifier down for 120s — that would
         turn our own misconfiguration into a self-inflicted outage.
+
+        Runs _EMPTY_BATCH_COOLDOWN_TRIGGER + 1 cycles: a single cycle can never
+        reach the trigger (which is 2), so the old one-cycle version could not
+        have failed even if truncation did increment the streak.
         """
         import news.fetcher as f
-        msg = MagicMock()
-        msg.stop_reason = "max_tokens"
-        msg.content = []
-        msg.usage = None
         with patch.object(f, "_claude_available", return_value=True), \
              patch.object(f, "_claude") as claude, \
              patch.object(f, "_record_claude_event"), \
              patch.object(f, "_record_claude_call"), \
              patch.object(f, "_enter_claude_cooldown") as cooldown:
-            claude.messages.create.return_value = msg
-            f._batch_score_sentiment(self._articles(20))
+            claude.messages.create.return_value = self._truncated_msg()
+            for _ in range(f._EMPTY_BATCH_COOLDOWN_TRIGGER + 1):
+                f._batch_score_sentiment(self._articles(20))
         cooldown.assert_not_called()
         assert f._consecutive_empty_batches == 0
+
+    def test_truncation_records_tokens_out_for_forensics(self):
+        """
+        tokens_out == the cap is the ENTIRE evidence chain that proved v21.15
+        (26 cap-hits, 26 scored_count=0, 26 empty_batch errors — 1:1). If a
+        truncated call stops writing that column, a recurrence is undiagnosable.
+        """
+        import news.fetcher as f
+        with patch.object(f, "_claude_available", return_value=True), \
+             patch.object(f, "_claude") as claude, \
+             patch.object(f, "_record_claude_event"), \
+             patch("storage.database.record_classifier_call") as rec:
+            claude.messages.create.return_value = self._truncated_msg(
+                out_tokens=4006)
+            f._batch_score_sentiment(self._articles(25))
+        assert rec.call_args.kwargs["tokens_out"] == 4006
 
     def test_a_complete_response_is_unaffected(self):
         """stop_reason of a normal completion must not be mistaken for truncation."""
@@ -670,10 +814,12 @@ class TestOutputBudgetAndTruncation:
 
     def test_shadow_shares_the_live_budget(self):
         """
-        The shadow must not carry its own copy of the number. A shadow scored
-        under a different budget is not a like-for-like comparison, and the
-        v21.14.1 hard-coded duplicate is what truncated 10 Qwen batches and
-        filed them as the provider's fault.
+        The shadow must not carry its own copy of the number — nor its own copy
+        of the FORMULA. v21.14.1 hard-coded Claude's old expression and
+        truncated 10 Qwen batches, filed as the provider's fault; v21.15 shared
+        the constants but still duplicated the arithmetic, so a changed
+        overhead term would have re-diverged with both parity tests green.
+        Both sides now call the same function.
         """
         import news.shadow_classifier as sc
         import news.fetcher as f
@@ -686,5 +832,19 @@ class TestOutputBudgetAndTruncation:
              patch("storage.database.record_classifier_call"):
             sc._run(self._articles(25), "msg")
         sent = client.chat.completions.create.call_args.kwargs["max_tokens"]
-        assert sent == max(f._MIN_OUTPUT_TOKENS,
-                           25 * f._TOKENS_PER_ARTICLE + 256)
+        assert sent == f._output_budget(25)
+
+    def test_replay_does_not_consume_the_days_alert_slot(self):
+        """
+        record_system_event de-dupes on (event_type, event_day) with ON CONFLICT
+        DO NOTHING, so a replayed event written today permanently suppresses the
+        genuine production one. _record_claude_call was live-guarded; its
+        sibling two lines below was not.
+        """
+        import news.fetcher as f
+        with patch.object(f, "_claude_available", return_value=True), \
+             patch.object(f, "_claude") as claude, \
+             patch("storage.database.record_system_event") as evt:
+            claude.messages.create.return_value = self._truncated_msg()
+            f._batch_score_sentiment(self._articles(25), live=False)
+        evt.assert_not_called()

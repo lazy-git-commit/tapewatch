@@ -165,9 +165,8 @@ def _run(articles: list[dict], user_message: str) -> None:
     """Body of one shadow scoring job. Runs on the background thread."""
     # Imported here rather than at module scope to avoid a circular import
     # (fetcher imports this module).
-    from news.fetcher import (CATALYST_TYPES, _CLASSIFY_TOOL,
-                             _MIN_OUTPUT_TOKENS, _SYSTEM_PROMPT,
-                             _TOKENS_PER_ARTICLE)
+    from news.fetcher import (CATALYST_TYPES, _CLASSIFY_TOOL, _SYSTEM_PROMPT,
+                              _output_budget)
     from storage.database import record_classifier_call, save_qwen_scores
 
     client = _get_client()
@@ -188,19 +187,22 @@ def _run(articles: list[dict], user_message: str) -> None:
         resp = client.chat.completions.create(
             model=cfg.qwen_model,
             temperature=0,
-            # Same budget as the live Claude call, IMPORTED rather than
-            # duplicated so the two can never drift — a shadow scored under a
+            # Same budget as the live Claude call, computed by the SHARED
+            # helper rather than a copied formula — a shadow scored under a
             # different budget is not a like-for-like comparison.
             #
-            # v21.15: the v21.14.1 version hard-coded Claude's old
-            # `n * 60 + 64`, which was BELOW the 68-72 tokens/article both
-            # models actually need. Ten Qwen batches truncated in three days,
-            # every one with tokens_out exactly equal to the cap, all recorded
-            # as Qwen's own `truncated` failure — our sizing blamed on the
-            # provider. Batch size tracks news volume, so it landed on the
-            # busiest cycles and biased the paired sample toward small batches.
-            max_tokens=max(_MIN_OUTPUT_TOKENS,
-                           len(articles) * _TOKENS_PER_ARTICLE + 256),
+            # v21.14.1 hard-coded Claude's old `n * 60 + 64`, which was BELOW
+            # the 68-72 tokens/article both models actually need. Ten Qwen
+            # batches truncated in three days, every one with tokens_out
+            # exactly equal to the cap, all recorded as Qwen's own `truncated`
+            # failure — our sizing blamed on the provider. v21.15 shared the
+            # two constants but still duplicated the arithmetic, so a changed
+            # overhead term would have re-diverged silently; v21.15.1 shares
+            # the function. The caller chunks to _MAX_ARTICLES_PER_BATCH, so
+            # this stays bounded well under any provider's per-request output
+            # ceiling (an over-cap request 400s and would be recorded as the
+            # provider failing, which is the same misattribution again).
+            max_tokens=_output_budget(len(articles)),
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -222,38 +224,67 @@ def _run(articles: list[dict], user_message: str) -> None:
     latency_ms = int((time.monotonic() - started) * 1000)
     usage = _extract_usage(resp)
 
+    # finish_reason is read BEFORE any early return. It is the single signal
+    # that separates "our output budget cut the answer off" from "the provider
+    # answered badly", and every exit below has to be able to tell those apart
+    # — filing our sizing as the provider's unreliability is the exact
+    # misdiagnosis that cost v21.7, v21.12 and v21.13 on the Claude side.
+    finish = getattr(resp.choices[0], "finish_reason", None) if resp.choices else None
+    truncated = finish == "length"
+
     calls = (resp.choices[0].message.tool_calls or []) if resp.choices else []
     if not calls:
-        # The same failure shape we are hedging against on the Claude side —
-        # worth recording precisely so we can compare how often each provider
-        # does it.
+        # Truncation before the tool call is even emitted: forced tool_choice on
+        # an OpenAI-compatible endpoint is best-effort, not enforced the way
+        # Anthropic's is, so a model that writes a preamble first can run out of
+        # budget with tool_calls still empty. That is our cap, not the provider
+        # refusing to use the tool.
         record_classifier_call(
             PROVIDER, cfg.qwen_model, len(articles), latency_ms, ok=False,
-            error_type="no_tool_call", **usage,
+            error_type="truncated" if truncated else "no_tool_call",
+            error_detail=f"finish_reason={finish}", **usage,
         )
         return
-    # A completion truncated by the output cap lands here as invalid JSON.
-    # Distinguish it so a sizing problem on our side is never filed as the
-    # provider being unreliable.
-    finish = getattr(resp.choices[0], "finish_reason", None) if resp.choices else None
     try:
         payload = json.loads(calls[0].function.arguments)
     except (json.JSONDecodeError, TypeError) as exc:
         record_classifier_call(
             PROVIDER, cfg.qwen_model, len(articles), latency_ms, ok=False,
-            error_type="truncated" if finish == "length" else "bad_json",
+            error_type="truncated" if truncated else "bad_json",
             error_detail=f"finish_reason={finish}: {exc}", **usage,
         )
         return
 
+    # Shape guard, mirroring the live path's `bad_shape` check. Two real
+    # failures are possible here and neither may be allowed to escape:
+    #   * `payload` is not a dict at all (arguments were "[]" or a scalar), so
+    #     .get() raises AttributeError. _job() swallows that at DEBUG, so NO
+    #     classifier_calls row is written and the failure is deleted from
+    #     Qwen's own denominator — the defect v21.14.1 fixed for dropped
+    #     batches, reappearing by a different route.
+    #   * `classifications` is a JSON *string* rather than a list (a common
+    #     weak-model behaviour for nested array params). Iterating it yields
+    #     characters, every record is discarded, yet ok=True and
+    #     scored_count=len(string) would report ~1,500 articles scored for a
+    #     25-article batch and feed that straight into the comparison's
+    #     articles_scored total.
+    if not isinstance(payload, dict) or \
+            not isinstance(payload.get("classifications"), list):
+        record_classifier_call(
+            PROVIDER, cfg.qwen_model, len(articles), latency_ms, ok=False,
+            error_type="truncated" if truncated else "bad_shape",
+            error_detail=f"finish_reason={finish}, "
+                         f"payload={type(payload).__name__}", **usage,
+        )
+        return
     # ok/scored_count are computed on the RAW list, exactly as the Claude path
     # does (news/fetcher.py records before its own per-record validation loop).
-    # Computing them post-validation instead made the two providers'
-    # liveness columns incomparable: a batch of well-formed answers that all
-    # missed the taxonomy would have been filed under the same `empty_batch`
-    # error_type as a genuine outage, while Claude emitting the identical
-    # answers records ok=true.
-    parsed = payload.get("classifications") or []
+    # Computing them post-validation instead made the two providers' liveness
+    # columns incomparable: a batch of well-formed answers that all missed the
+    # taxonomy would have been filed under the same `empty_batch` error_type as
+    # a genuine outage, while Claude emitting the identical answers records
+    # ok=true.
+    parsed = payload["classifications"]
 
     rows = []
     for rec in parsed:
@@ -301,11 +332,21 @@ def _run(articles: list[dict], user_message: str) -> None:
             "catalyst_magnitude": mag,
         })
 
+    # A completion can hit the cap and STILL leave parseable arguments — the
+    # gateway closes the JSON after record N of M. Claude's path discards the
+    # whole batch as `truncated` in that situation; recording it here as a
+    # success with partial data would hand Qwen a liveness and coverage
+    # advantage on exactly the largest batches, where the comparison is most
+    # load-bearing. Rows already saved are harmless (UNIQUE + ON CONFLICT DO
+    # NOTHING), but the CALL is recorded for what it was.
     saved = save_qwen_scores(rows, cfg.qwen_model)
     record_classifier_call(
         PROVIDER, cfg.qwen_model, len(articles), latency_ms,
-        ok=bool(parsed), scored_count=len(parsed),
-        error_type=None if parsed else "empty_batch", **usage,
+        ok=bool(parsed) and not truncated, scored_count=len(parsed),
+        error_type=("truncated" if truncated
+                    else None if parsed else "empty_batch"),
+        error_detail=f"finish_reason={finish}" if truncated else None,
+        **usage,
     )
     logger.info("Shadow [qwen]: %d returned, %d valid of %d articles in %dms "
                 "(%d new rows)",

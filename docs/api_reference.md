@@ -95,25 +95,45 @@ Three v14 design choices (see `news/fetcher.py` for the full implementation):
 
 1. **`temperature=0`** — this is a classifier; sampling noise on borderline calls is pure harm.
 2. **Cached system prompt** — the static rubric lives in the `system` parameter with `cache_control: {"type": "ephemeral"}`. The news cycle runs every 60s and the prompt cache TTL is 5 minutes, so the rubric is a cache hit on every call after the first (~90% input-cost reduction on the rubric tokens). Only the per-cycle articles go in the user message, keeping the cache prefix stable.
-3. **Forced tool use** — `tool_choice={"type": "tool", "name": "classify_articles"}` guarantees schema-validated structured output. No JSON string parsing, no markdown-fence stripping, no truncation recovery.
+3. **Forced tool use** — `tool_choice={"type": "tool", "name": "classify_articles"}` guarantees schema-validated structured output. No JSON string parsing, no markdown-fence stripping. ⚠️ It does **not** guarantee a *complete* output: a response cut off at `max_tokens` still returns 200 OK with a `tool_use` block whose `input` never finished serialising, so `.get("classifications", [])` yields `[]` — indistinguishable from a genuine empty answer unless `stop_reason` is read. That was the v21.15 bug (see §"Output budget" below).
 
 **Code:**
 ```python
 client = anthropic.Anthropic()
 msg = client.messages.create(
     model="claude-haiku-4-5-20251001",
-    max_tokens=max(400, len(articles) * 60 + 64),  # ~55 tokens/article empirically
+    # Bounded by construction: the caller chunks to _MAX_ARTICLES_PER_BATCH (25)
+    # so this can never scale with the size of the unscored backlog.
+    max_tokens=_output_budget(len(articles)),   # max(1024, n*150 + 256)
     temperature=0,
     system=[{"type": "text", "text": RUBRIC, "cache_control": {"type": "ephemeral"}}],
     messages=[{"role": "user", "content": articles_text}],
     tools=[CLASSIFY_TOOL],
     tool_choice={"type": "tool", "name": "classify_articles"},
 )
-# Result arrives as a tool_use content block:
+# ALWAYS read stop_reason before trusting the content — a truncated response
+# parses cleanly into an empty list.
+if msg.stop_reason == "max_tokens":
+    raise RuntimeError("output budget too small — our bug, not Claude's")
 for block in msg.content:
     if block.type == "tool_use":
         classifications = block.input["classifications"]
 ```
+
+**Output budget (v21.15 / v21.15.1).** The original `max(400, n*60 + 64)` came
+from a comment claiming "~55 tokens/article". The measured cost in
+`classifier_calls` is **68-72 tokens/article** — above the allowance — so every
+batch of roughly 7+ articles was cut off deterministically. Proof (2026-08-12..14):
+26 calls had `tokens_out` exactly equal to the cap, all 26 recorded
+`scored_count=0`, and there were exactly 26 `empty_batch` errors. 1:1.
+
+Two changes, and the second is the one that matters: `_TOKENS_PER_ARTICLE=150` /
+`_MIN_OUTPUT_TOKENS=1024` raised the allowance, and `_MAX_ARTICLES_PER_BATCH=25`
+**caps the batch**, which turns `max_tokens` from a function of news volume into
+a bounded constant (4,006 vs a measured need of ~1,800). Raising the multiplier
+alone only moved the cliff; capping removes it. `_output_budget()` is a single
+shared function — `news/shadow_classifier.py` and the tests all call it, because
+two earlier releases duplicated the arithmetic and the copies drifted.
 
 **Rubric structure (system prompt):** a decision tree — (1) is this NEW information or a recap/halt article describing a move that already happened? (2) is the tagged ticker the actual subject (acquirer vs target)? (3) is the catalyst binding and material (LOI/MOU → neutral, offerings/dilution → negative)? (4) is the company small enough to move? — followed by a 14-class catalyst taxonomy and few-shot examples. Full text in `news/fetcher.py::_SYSTEM_PROMPT`.
 

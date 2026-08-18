@@ -40,6 +40,7 @@ import json
 import logging
 import statistics
 import sys
+from collections import Counter
 
 from config.settings import cfg
 from storage.database import get_conn
@@ -53,6 +54,19 @@ _HORIZONS = ("5m", "60m", "120m", "eod")
 # to draw a conclusion rather than inviting one from a handful of rows.
 _MIN_CALLS_FOR_VERDICT = 200
 _MIN_PAIRS_FOR_VERDICT = 300
+
+# error_types caused by OUR request, not by the provider. Excluded from the
+# liveness numbers (success rate, failure streak, latency) and reported
+# separately, so a sizing bug on our side can never be read as the provider
+# being unreliable — the question this tool exists to answer is whether the
+# CHALLENGER can be trusted, and a truncated call says nothing about that.
+#   truncated          — our max_tokens cut the answer off mid-serialisation
+#   bad_shape          — a completion we could not use; still ours to bound
+#   client_unavailable — our config (missing key, bad base URL, no `openai`)
+#   dropped_backlog    — our bounded queue shed the batch, no call was made
+_OUR_FAULT = frozenset({
+    "truncated", "bad_shape", "client_unavailable", "dropped_backlog",
+})
 
 
 def _rows(sql: str, params=()) -> list[dict]:
@@ -121,9 +135,23 @@ def latency_and_liveness(days: int) -> dict:
     )
     out = {}
     for provider in ("claude", "qwen"):
-        mine = [c for c in calls if c["provider"] == provider]
-        if not mine:
+        allrows = [c for c in calls if c["provider"] == provider]
+        if not allrows:
             out[provider] = {"calls": 0}
+            continue
+        # Liveness answers "can this provider be relied on?", so it must be
+        # computed over the provider's OWN failures. Rows in _OUR_FAULT are
+        # caused by our request parameters, not by the provider — counting them
+        # charges our config bugs to the candidate's reliability record and
+        # inflates worst_failure_streak, the figure this tool tells the reader
+        # to weigh above everything else. That is precisely the accounting
+        # error v21.14.1 removed on the Qwen side; leaving it on the Claude
+        # side would just point the same bias the other way. They stay visible
+        # in `our_fault` so a sizing bug is never hidden, only re-attributed.
+        ours = [c for c in allrows if c["error_type"] in _OUR_FAULT]
+        mine = [c for c in allrows if c["error_type"] not in _OUR_FAULT]
+        if not mine:
+            out[provider] = {"calls": 0, "our_fault": len(ours)}
             continue
         lat = [c["latency_ms"] for c in mine if c["latency_ms"] is not None]
         ok = [c for c in mine if c["ok"]]
@@ -143,6 +171,13 @@ def latency_and_liveness(days: int) -> dict:
             "model": mine[-1]["model"],
             "success_rate": len(ok) / len(mine),
             "worst_failure_streak": worst_streak,
+            # Not a provider failure — see _OUR_FAULT. Surfaced so it is
+            # re-attributed rather than hidden.
+            "our_fault": len(ours),
+            "our_fault_errors": dict(sorted(
+                Counter(c["error_type"] for c in ours).items(),
+                key=lambda kv: -kv[1],
+            )),
             "errors": dict(sorted(errors.items(), key=lambda kv: -kv[1])),
             "latency_ms": {
                 "p50": _pct(lat, 0.50), "p95": _pct(lat, 0.95),
@@ -306,6 +341,12 @@ def main() -> int:
         if errs:
             print(f"    {prov} failures: " +
                   ", ".join(f"{k}×{v}" for k, v in errs.items()))
+    for prov in ("claude", "qwen"):
+        ours = (ll.get(prov) or {}).get("our_fault_errors") or {}
+        if ours:
+            print(f"    {prov} OUR-FAULT calls (excluded from ok% / streak "
+                  f"above — our request, not the provider): " +
+                  ", ".join(f"{k}×{v}" for k, v in ours.items()))
 
     print("\nCOST (tokens over the window)")
     for prov in ("claude", "qwen"):
@@ -313,8 +354,15 @@ def main() -> int:
         if not d.get("calls"):
             continue
         t = d["tokens"]
-        hit = f"{t['cached'] / t['in']:.0%}" if t["in"] else "—"
-        print(f"  {prov:9} in={t['in']:>10,}  out={t['out']:>9,}  "
+        # tokens_in means different things per provider, so the denominator
+        # must too. Anthropic's usage.input_tokens is the UNCACHED remainder
+        # (cache reads are reported separately), while OpenAI's prompt_tokens
+        # is the TOTAL prompt with cached_tokens as a subset of it. Dividing
+        # cached/in uniformly produced hit rates above 100% for Claude — the
+        # ~2.3k-token rubric over a few hundred uncached tokens reads as 575%.
+        total_in = t["in"] + t["cached"] if prov == "claude" else t["in"]
+        hit = f"{t['cached'] / total_in:.0%}" if total_in else "—"
+        print(f"  {prov:9} prompt={total_in:>10,}  out={t['out']:>9,}  "
               f"cached={t['cached']:>10,} ({hit} hit)")
 
     print("\nPREDICTION")

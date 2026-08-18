@@ -353,7 +353,7 @@ automatically from `event_type`.
 | Column | Type | Description |
 |---|---|---|
 | `id` | SERIAL PK | Auto-incrementing primary key. |
-| `event_type` | TEXT | Machine-readable event key. Critical: `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`, `zero_trade_session`. Warning: `claude_outage`, `twelvedata_prepost_unavailable` (v21.6), `finnhub_outage` (v21.10), `stale_quote_feed` (v21.10 — a provider serving a run of frozen quotes; fired for real on its first live day, 2026-07-31, four minutes before the NVT entry). |
+| `event_type` | TEXT | Machine-readable event key. Critical: `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`, `zero_trade_session`, `claude_truncated_batch` (v21.15 — our `max_tokens` cut the answer off; same operational state as a billing error and cannot self-heal without a code change). Warning: `claude_outage`, `claude_empty_batch` (v21.12), `twelvedata_prepost_unavailable` (v21.6), `finnhub_outage` (v21.10), `stale_quote_feed` (v21.10 — a provider serving a run of frozen quotes; fired for real on its first live day, 2026-07-31, four minutes before the NVT entry), `exit_stuck` (v19.2). ⚠️ Severity comes from `_CRITICAL_EVENT_TYPES` in `storage/database.py`, and the documented Grafana alert queries `severity = 'critical'` — an event type omitted from that set is recorded but **never alerts**. |
 | `severity` | TEXT | `"critical"` or `"warning"`. |
 | `detail` | TEXT | Human-readable context (e.g. credits used at exhaustion, drought session count). |
 | `created_at` | TIMESTAMPTZ | When the event was first recorded. |

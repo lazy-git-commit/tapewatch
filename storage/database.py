@@ -1034,6 +1034,13 @@ _CRITICAL_EVENT_TYPES = {
     "claude_billing_error",
     "claude_auth_error",
     "zero_trade_session",
+    # Truncation produces the identical operational state to a billing error —
+    # no scores, therefore no signals, therefore no trades — and unlike an empty
+    # batch it CANNOT self-heal: the remedy is a code change and a redeploy.
+    # It was landing at 'warning' while the documented Grafana alert queries
+    # `WHERE severity = 'critical'`, so a session-long scoring blackout raised
+    # no alert at all.
+    "claude_truncated_batch",
 }
 
 
