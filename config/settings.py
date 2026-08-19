@@ -324,6 +324,56 @@ class Settings:
         }
     )
 
+    # ── Portfolio circuit breakers (v21.17) ──────────────────────────────────
+    # MAX_DAILY_LOSS_PCT resets at midnight, so it cannot see a slow bleed: a
+    # strategy losing 1.9% every day never trips it. These two controls cover
+    # the shapes the daily limit is blind to.
+    #
+    # 1. Peak-to-trough equity decline. The standard risk metric for a
+    #    systematic strategy, and the one that answers "is this still working?"
+    #    rather than "was today bad?". Entries stop; open positions are still
+    #    managed and exited normally.
+    max_drawdown_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_DRAWDOWN_PCT", "10.0"))
+    )
+    drawdown_lookback_days: int = field(
+        default_factory=lambda: int(os.getenv("DRAWDOWN_LOOKBACK_DAYS", "30"))
+    )
+    # 2. Consecutive losers. A run of stop-outs usually means the regime is
+    #    wrong today, not that the next signal is bad — Freqtrade ships this as
+    #    `StoplossGuard`. 0 disables. The cooldown is deliberately short: this
+    #    is a pause to let the tape change, not a stand-down.
+    loss_streak_halt: int = field(
+        default_factory=lambda: int(os.getenv("LOSS_STREAK_HALT", "4"))
+    )
+    loss_streak_cooldown_minutes: int = field(
+        default_factory=lambda: int(os.getenv("LOSS_STREAK_COOLDOWN_MINUTES", "90"))
+    )
+
+    # ── Entry execution (v21.17) ──────────────────────────────────────────────
+    # Buy with a LIMIT at decision-price × (1 + slack) instead of at market.
+    # A market buy accepts whatever the book offers: LAMR (2026-08-06) was
+    # sized on $161.09 and filled at $164.30 — 1.99% higher, above the stock's
+    # high for the whole session — which parked the −2% stop back at the price
+    # the news had fired at, and a drift to that ordinary level stopped us out
+    # 28 seconds later. ~£6 of that day's £17.96 loss was this one fill.
+    #
+    # An unfilled limit is NOT a rejection: the signal returns to the re-eval
+    # queue, so we lose a fill we didn't want rather than the idea. Extended
+    # sessions keep market orders (T212 rejects extendedHours on limits).
+    entry_limit_enabled: bool = field(
+        default_factory=lambda: os.getenv("ENTRY_LIMIT_ENABLED", "true").lower() == "true"
+    )
+    # How far above the decision price we will still pay. Deliberately well
+    # under the stop width: an entry further above our chosen price than the
+    # stop is wide starts the trade inside its own stop-loss distance, which is
+    # exactly the LAMR failure. Ordinary bid-ask spread on a liquid name is
+    # 0.01–0.26% (measured across our fills), so 0.4% clears normal spread
+    # while refusing a genuine chase.
+    entry_limit_slack_pct: float = field(
+        default_factory=lambda: float(os.getenv("ENTRY_LIMIT_SLACK_PCT", "0.4"))
+    )
+
     # ── Position sizing & portfolio risk ──────────────────────────────────────
     # Hard cap: max % of total portfolio value in a single position.
     max_position_size_pct: float = field(
@@ -613,6 +663,13 @@ class Settings:
             # a deploy from disabling them together.
             ("SKIP_MOMENTUM_CATALYSTS requires REQUIRE_VWAP_CONFIRMATION",
              not self.skip_momentum_catalysts or self.require_vwap_confirmation),
+            ("ENTRY_LIMIT_SLACK_PCT", self.entry_limit_slack_pct > 0),
+            # v21.17: an entry allowed further above our decision price than the
+            # stop is wide begins the trade already inside its own stop-loss
+            # distance — the LAMR failure the limit exists to prevent. Same
+            # reasoning as MAX_VWAP_EXTENSION_PCT < STOP_LOSS_PCT above.
+            ("ENTRY_LIMIT_SLACK_PCT < STOP_LOSS_PCT (else the fill starts inside its own stop)",
+             self.entry_limit_slack_pct < self.stop_loss_pct),
             ("EXTENDED_MIN_ADV_DOLLAR >= MIN_DAILY_DOLLAR_VOLUME",
              self.extended_min_adv_dollar >= self.min_daily_dollar_volume),
             ("EXTENDED_MIN_SESSION_DOLLAR_VOLUME", self.extended_min_session_dollar_volume >= 0),

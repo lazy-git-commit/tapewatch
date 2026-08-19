@@ -7,6 +7,127 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.17 — 2026-08-19 (the edge does not survive path-aware measurement)
+
+**This release retracts the central claim of v21.16.** It ships cost reduction,
+downside protection and the measurement tools that produced the retraction —
+and deliberately withholds every change that would have increased exposure.
+
+### 1. What the triple-barrier study found
+
+`analysis/triple_barrier.py` labels each historical signal by which barrier a
+real trade would have touched FIRST — take-profit, stop-loss, or the time stop —
+instead of sampling the price at fixed horizons. Run over **1,235 signals across
+22 days** at the live parameters (TP +5% / SL −2% / 120 min / 0.46pp costs):
+
+| catalyst | n | net/trade | win | t | stopped |
+|---|---|---|---|---|---|
+| other | 135 | +0.135% | 46% | +0.61 | 33% |
+| earnings_beat | 420 | −0.259% | 33% | −2.19 | 37% |
+| contract_win | 214 | −0.270% | 34% | −1.67 | 36% |
+| **guidance_raise** | 123 | **−0.388%** | 32% | −1.68 | **48%** |
+| product_launch | 98 | −0.504% | 35% | −2.02 | 47% |
+| fda_approval | 31 | −0.696% | 26% | −1.83 | 45% |
+| **OVERALL** | **1,235** | **−0.264%** | 35% | **−3.82** | 38% |
+
+v21.16 justified its entry change with **+0.667%/trade** for `guidance_raise`,
+from a simulation that sampled 5/15/60/120-minute returns and *inferred* a 33%
+stop-out rate. The path-aware measurement says **−0.388%** and a **48%** stop-out
+rate — which matches the live record (48% stopped, −1.65%/trade) almost exactly.
+The sampling was the error: four checkpoints cannot see the dip in between, and
+the dip is what fills a stop.
+
+**A 48-point exit-parameter sweep found no profitable configuration.** Stops from
+1.5% to 5%, targets 2% to 8%, holds 60 to 390 minutes: every one of the 48 combos
+is negative, and the best (TP +5 / SL −4 / 60 min, −0.165%) has t = −0.59. The
+exits are not the constraint.
+
+**No quality filter selects a profitable subset.** Confidence is flat across all
+classes; within `guidance_raise` it runs the *wrong* way (conf ≥ 0.8 → −0.567%,
+t = −2.09, the only significant result in the study and it is negative). Magnitude
+is flat. The handful of subsets that print positive (`other` +0.237%,
+`product_launch` +0.088%) all have |t| < 1.
+
+**The deflated Sharpe ratio settles it.** Across ~384 variants examined, the
+expected best Sharpe from a strategy with *no edge at all* is **+2.972**. The best
+subset observed scores **+0.091**. Every DSR in the study is **0.000**.
+
+### 2. What shipped
+
+Only changes that are correct whether or not an edge exists:
+
+- **Entry limit orders** (`ENTRY_LIMIT_ENABLED`, `ENTRY_LIMIT_SLACK_PCT=0.4`).
+  Buy at decision-price × (1 + slack) instead of at market. LAMR (2026-08-06)
+  was sized on $161.09 and filled at $164.30 — above the stock's high for the
+  whole session — parking the −2% stop at the price the news fired at. An
+  unfilled limit is **not** a rejection: the signal returns to the re-eval queue
+  (`entry_limit_unfilled`), so we lose a fill we didn't want rather than the
+  idea. Extended sessions stay on market orders (T212 rejects `extendedHours`
+  on limits). `cfg.validate()` refuses a slack ≥ the stop width — an entry
+  further above our chosen price than the stop is wide starts the trade inside
+  its own stop distance, which is the LAMR shape exactly.
+- **Drawdown circuit breaker** (`MAX_DRAWDOWN_PCT=10`, 30-day lookback).
+  `MAX_DAILY_LOSS_PCT` resets at midnight, so a strategy losing 1.9% a day
+  forever never trips anything. Fails **open** on a data error — the 2026-07-31
+  lesson, where an unavailable portfolio value silently halted 44 news cycles.
+  Only the daily kill switch fails closed.
+- **Losing-streak cooldown** (`LOSS_STREAK_HALT=4`, 90 min). A run of stop-outs
+  is information about the tape, not about the next signal. Freqtrade ships the
+  same idea as `StoplossGuard`; we had nothing between a bad tape and ten
+  consecutive losses except `MAX_TRADES_PER_DAY`.
+- **`analysis/triple_barrier.py`** — the labeller above, with a CLI.
+- **`analysis/validation.py`** — deflated Sharpe ratio and anchored
+  walk-forward with an embargo. Numpy/stdlib only: a live trading service must
+  not grow scipy/sklearn so an offline study can run.
+
+### 3. What was deliberately NOT shipped
+
+Each of these was on the 2026-08-18 roadmap and each is withheld on the evidence
+above. Recorded here so they are not re-proposed as oversights:
+
+- **Ranked scoring / raising breadth.** This was the #1 recommendation and it is
+  now the most harmful available change: breadth multiplies whatever edge exists,
+  and the measured edge is negative. Taking 8 trades a day instead of 2 would
+  quadruple the loss rate. Revisit only if a positive, DSR-surviving edge is found.
+- **Re-enabling `product_launch`** — the 120-minute forward return that motivated
+  it (+0.64%) becomes **−0.504%/trade** once the path is walked.
+- **Widening the day-move gates** (`dead_cat`, `extended_move`). The pre-market
+  study suggested the rejected candidates outperform, but that was forward-return
+  evidence of exactly the kind this release just discredited, and the sweep found
+  no configuration in which those candidates are profitable.
+- **A catalyst-magnitude ceiling** — magnitude is flat under path-aware labelling.
+- **Meta-labelling.** Training a model to predict when a zero-edge signal is
+  right is fitting noise, and would be scored by the same search that the DSR
+  just failed. The labelled dataset it needs now exists, so this is ready the
+  moment there is an edge to meta-label.
+- **Trailing stops** — the sweep shows the exit rules are not the binding
+  constraint.
+- **Push alerts** — descoped at the user's request.
+
+### 4. Tests
+
+`tests/test_v21_17.py` (30 tests), **mutation-tested — 12 mutations, 12 caught**:
+removing the limit endpoint, reporting an unfilled limit as a hard failure,
+treating it as terminal at the caller, disabling the drawdown breaker, making it
+fail closed, counting winners in the loss streak, scoring a same-bar barrier as
+the target, letting the entry bar trigger its own exit, dropping costs, ignoring
+the trial count in the DSR, scoring walk-forward parameters in-sample, and
+ignoring the embargo.
+
+Two real bugs were found by these tests before shipping: `walk_forward` selected
+no parameters when every candidate tied at zero variance (silently skipping the
+split), and the DSR variance term goes negative for absurdly high per-trade
+Sharpes — now reported as an unstable moment estimate rather than a pass.
+
+**⚠️ Standing conclusion:** on 22 days and 1,235 signals there is no measurable
+tradeable edge in any catalyst class, at any exit configuration, under any
+quality filter. The sample is small and single-regime, so this is "no measurable
+edge", not "proven worthless" — but it is the opposite of the finding v21.16 was
+shipped on, and no exposure-increasing change should be made until a positive
+result survives the deflated Sharpe ratio.
+
+---
+
 ## v21.16 — 2026-08-18 (enter at the signal; drop the class that doesn't pay; the prompt cache was never on)
 
 Three changes from one review. The entry gates were never the binding

@@ -719,6 +719,41 @@ per-stock. The baseline is the newest bar at least `MOMENTUM_LOOKBACK_MINUTES`
 old, with a 10-minute staleness guard on the freshest bar (the VECO incident:
 a bar from 09:56 served at 11:42 produced a false +1.20% momentum reading).
 
+### ⚠️ v21.17 — the edge does not survive path-aware measurement
+
+**Read this before acting on any performance number in this document.**
+
+Every forward-return figure here (`fwd_return_5m/15m/60m/120m/eod`) is a SNAPSHOT
+of where the price was at a fixed horizon. A trade is a PATH, and a stop is
+filled by the dip between snapshots. On 2026-08-19 the same signals were
+re-labelled by which barrier a real trade would touch first
+(`analysis/triple_barrier.py`, 1,235 signals / 22 days):
+
+| catalyst | n | net/trade | win | t | stopped |
+|---|---|---|---|---|---|
+| guidance_raise | 123 | **−0.388%** | 32% | −1.68 | **48%** |
+| product_launch | 98 | −0.504% | 35% | −2.02 | 47% |
+| fda_approval | 31 | −0.696% | 26% | −1.83 | 45% |
+| OVERALL | 1,235 | **−0.264%** | 35% | −3.82 | 38% |
+
+The 48% stop-out rate matches the live record exactly; the 33% rate that §4's
+sampling implied never existed. A 48-combination exit sweep (stops 1.5–5%,
+targets 2–8%, holds 60–390 min) found **no profitable configuration**, and no
+confidence or magnitude cut selects a profitable subset. Across ~384 variants
+examined the deflated Sharpe ratio is **0.000** — the expected best Sharpe from a
+strategy with no edge at all is +2.972, and the best subset observed scores
++0.091.
+
+Consequences that are now standing rules:
+
+* No exposure-increasing change ships without a path-aware result that survives
+  `analysis.validation.deflated_sharpe_ratio` at the honest trial count.
+* Raising breadth is the most harmful available change while the measured edge
+  is negative — breadth multiplies the edge's sign.
+* A class pruned or restored on `fwd_return_*` alone is not evidence-backed.
+
+---
+
 ### The momentum gate's bill — why `SKIP_MOMENTUM_CATALYSTS` exists (v21.16)
 
 The `low_momentum` floor is a genuine filter. Measured on its own decisions,

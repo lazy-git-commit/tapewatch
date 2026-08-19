@@ -1104,7 +1104,7 @@ class TestBuyPrecisionRetry:
         )
         return T212HTTPError(400, body)
 
-    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._fetch_fill", return_value={"fillPrice": 1.51})
     @patch("trading.executor._post")
     @patch("trading.executor._get")
     def test_precision_retry_succeeds(self, mock_get, mock_post, mock_fill):
@@ -1137,7 +1137,7 @@ class TestBuyPrecisionRetry:
         assert mock_post.call_count == 1
 
     @patch("trading.executor.time.sleep")
-    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._fetch_fill", return_value={"fillPrice": 1.51})
     @patch("trading.executor._post")
     @patch("trading.executor._get")
     def test_transient_5xx_on_order_placement_retries_once(self, mock_get, mock_post, _fill, _sleep):
@@ -1177,7 +1177,7 @@ class TestBuyPrecisionRetry:
 class TestSellExecution:
     """Tests for trading/executor.py::sell execution policy"""
 
-    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._fetch_fill", return_value={"fillPrice": 1.51})
     @patch("trading.executor._post", return_value={"id": "eod-1"})
     def test_eod_flatten_uses_market_order(self, mock_post, _mock_fill):
         from trading.executor import sell
@@ -1186,7 +1186,7 @@ class TestSellExecution:
         assert mock_post.call_args[0][0] == "/equity/orders/market"
 
     @patch("trading.executor.time.sleep")
-    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._fetch_fill", return_value={"fillPrice": 1.51})
     @patch("trading.executor.get_order_status", return_value="FILLED")
     @patch("trading.executor._post", return_value={"id": "sl-1"})
     def test_stop_loss_uses_limit_order(self, mock_post, _mock_status, _mock_fill, _mock_sleep):
@@ -1195,7 +1195,7 @@ class TestSellExecution:
         assert result.success is True
         assert mock_post.call_args[0][0] == "/equity/orders/limit"
 
-    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._fetch_fill", return_value={"fillPrice": 1.51})
     @patch("trading.executor._post", return_value={"id": "em-1"})
     def test_emergency_flatten_uses_market_order(self, mock_post, _mock_fill):
         # An unrecorded buy must exit at market — a limit that fails to fill
@@ -2720,7 +2720,7 @@ class TestPrecisionRetryRobustness:
         return T212HTTPError(400, body)
 
     @patch("trading.executor.get_gbp_usd_rate", return_value=1.25)
-    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._fetch_fill", return_value={"fillPrice": 1.51})
     @patch("trading.executor._post")
     @patch("trading.executor._get")
     def test_verbose_detail_wording_parsed(self, mock_get, mock_post, _fill, _fx):
@@ -2736,7 +2736,7 @@ class TestPrecisionRetryRobustness:
         assert qty == round(qty, 1)
 
     @patch("trading.executor.get_gbp_usd_rate", return_value=1.25)
-    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._fetch_fill", return_value={"fillPrice": 1.51})
     @patch("trading.executor._post")
     @patch("trading.executor._get")
     def test_unparseable_detail_falls_back_to_whole_shares(self, mock_get, mock_post, _fill, _fx):
@@ -2752,7 +2752,7 @@ class TestPrecisionRetryRobustness:
         assert qty == int(qty)  # whole shares
 
     @patch("trading.executor.get_gbp_usd_rate", return_value=1.25)
-    @patch("trading.executor._fetch_fill", return_value=None)
+    @patch("trading.executor._fetch_fill", return_value={"fillPrice": 1.51})
     @patch("trading.executor._post")
     @patch("trading.executor._get")
     def test_quantity_floored_not_rounded(self, mock_get, mock_post, _fill, _fx):

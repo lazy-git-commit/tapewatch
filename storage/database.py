@@ -763,6 +763,76 @@ def trading_days_since_last_trade() -> int | None:
     return int(len(closed))
 
 
+def get_loss_streak() -> tuple[int, str | None]:
+    """
+    Consecutive LOSING closed trades counting back from the most recent one,
+    plus the sell_time of that most recent trade.
+
+    Backs the losing-streak cooldown (v21.17). The daily kill switch measures
+    the SIZE of the damage; this measures its SHAPE. Four stop-outs in a row
+    usually means the regime is wrong today — a market where our catalyst edge
+    is being overwhelmed by something else — not that the fifth signal is bad.
+    Freqtrade ships the same idea as `StoplossGuard`; we had no equivalent, so
+    the only thing standing between a bad tape and ten consecutive losses was
+    MAX_TRADES_PER_DAY.
+
+    Returns (0, None) when the most recent trade was a winner.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT profit_loss_pct, sell_time FROM trades
+                   WHERE mode = %s AND status = 'closed' AND sell_time IS NOT NULL
+                   ORDER BY sell_time DESC LIMIT 20""",
+                (cfg.trading_mode,),
+            )
+            rows = cur.fetchall()
+    streak, last_sell = 0, None
+    for row in rows:
+        pnl = row["profit_loss_pct"]
+        # NULL P&L is unknown, not a loss — stop counting rather than guess.
+        if pnl is None or float(pnl) >= 0:
+            break
+        if last_sell is None:
+            last_sell = row["sell_time"]
+        streak += 1
+    return streak, last_sell
+
+
+def get_drawdown_from_peak(lookback_days: int = 30) -> tuple[float, float, float] | None:
+    """
+    Return (current_value, peak_value, drawdown_pct) from portfolio_snapshots,
+    or None when there aren't enough snapshots to judge.
+
+    `drawdown_pct` is negative when below the peak.
+
+    Backs the drawdown circuit breaker (v21.17). MAX_DAILY_LOSS_PCT resets at
+    midnight, so a strategy losing 1.9% a day indefinitely never trips
+    anything — it just bleeds. Peak-to-trough equity decline is the standard
+    risk metric precisely because it is the one a daily limit cannot see.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT total_value, snapshot_at FROM portfolio_snapshots
+                   WHERE snapshot_at::timestamptz >= NOW() - make_interval(days => %s)
+                   ORDER BY snapshot_at""",
+                (int(lookback_days),),
+            )
+            rows = cur.fetchall()
+    values = [float(r["total_value"]) for r in rows
+              if r["total_value"] is not None and float(r["total_value"]) > 0]
+    # Two snapshots cannot describe a peak-to-trough path; refuse to answer
+    # rather than report a meaningless drawdown from a single reading.
+    if len(values) < 3:
+        return None
+    current = values[-1]
+    peak = max(values)
+    if peak <= 0:
+        return None
+    return current, peak, (current - peak) / peak * 100.0
+
+
 def get_today_realized_pnl() -> float:
     """
     Sum of realized P&L (GBP) for trades CLOSED today. Backs the daily kill

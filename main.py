@@ -54,6 +54,7 @@ from storage.database import (
     touch_heartbeat, count_open_trades, count_trades_today, get_today_realized_pnl,
     update_premarket_candidate, save_snapshot,
     trading_days_since_last_trade, record_system_event,
+    get_loss_streak, get_drawdown_from_peak,
 )
 from news.fetcher import fetch_all_news, NewsItem
 from market.price_check import (
@@ -512,6 +513,49 @@ def _risk_gates_pass() -> tuple[bool, str]:
     except Exception as exc:
         logger.warning("count_trades_today failed (%s) — gate skipped this cycle", exc)
 
+    # ── Drawdown circuit breaker (v21.17) ────────────────────────────────────
+    # The daily kill switch resets at midnight and therefore cannot see a slow
+    # bleed. This measures the peak-to-trough decline the strategy is actually
+    # in. Fail-OPEN on error, unlike the kill switch: a missing snapshot series
+    # is an observability gap, not evidence of loss, and standing the system
+    # down on it would repeat the 2026-07-31 failure where an unavailable
+    # portfolio value silently halted 44 news cycles.
+    if cfg.max_drawdown_pct > 0:
+        try:
+            dd = get_drawdown_from_peak(cfg.drawdown_lookback_days)
+            if dd is not None:
+                current, peak, dd_pct = dd
+                if dd_pct <= -abs(cfg.max_drawdown_pct):
+                    return False, (
+                        f"DRAWDOWN BREAKER: equity £{current:,.2f} is {dd_pct:.2f}% "
+                        f"below its {cfg.drawdown_lookback_days}-day peak of "
+                        f"£{peak:,.2f}, past the −{cfg.max_drawdown_pct}% limit — "
+                        f"no new entries (open positions are still managed)"
+                    )
+        except Exception as exc:
+            logger.warning("drawdown check failed (%s) — gate skipped this cycle", exc)
+
+    # ── Losing-streak cooldown (v21.17) ──────────────────────────────────────
+    # A run of consecutive stop-outs is information about the TAPE, not about
+    # the next signal. Pause briefly rather than spend the rest of the daily
+    # trade budget discovering the same thing four more times.
+    if cfg.loss_streak_halt > 0:
+        try:
+            streak, last_sell = get_loss_streak()
+            if streak >= cfg.loss_streak_halt and last_sell:
+                last_dt = datetime.fromisoformat(str(last_sell))
+                if last_dt.tzinfo is None:
+                    last_dt = pytz.timezone("Europe/London").localize(last_dt)
+                mins = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                if mins < cfg.loss_streak_cooldown_minutes:
+                    return False, (
+                        f"LOSS-STREAK COOLDOWN: {streak} consecutive losing trades, "
+                        f"last closed {mins:.0f} min ago — pausing entries for "
+                        f"{cfg.loss_streak_cooldown_minutes - mins:.0f} more min"
+                    )
+        except Exception as exc:
+            logger.warning("loss-streak check failed (%s) — gate skipped this cycle", exc)
+
     return True, ""
 
 
@@ -668,6 +712,27 @@ def _enter_confirmed(item: NewsItem, confirmation: PriceConfirmation, signal_id:
         break
 
     if not result.success:
+        # v21.17: an entry LIMIT that never filled is not a failure — it is the
+        # feature working. The market did not come back to a price we were
+        # willing to pay, so we own nothing and have lost nothing. Park the
+        # signal for re-confirmation instead of recording a terminal rejection;
+        # abandoning it here would throw away the upside the limit protects.
+        if getattr(result, "unfilled", False):
+            logger.info(
+                "Entry limit not filled [%s] — market never reached our price. "
+                "Signal parked for re-evaluation rather than dropped: %s",
+                item.ticker, result.error,
+            )
+            try:
+                set_rejection_reason(
+                    signal_id, f"entry limit unfilled: {result.error}",
+                    "entry_limit_unfilled",
+                )
+            except Exception as exc:
+                logger.warning("set_rejection_reason failed after unfilled limit: %s", exc)
+            _queue_reeval(item, signal_id, signal_price=signal_price)
+            return False
+
         logger.error("Buy order failed [%s]: %s", item.ticker, result.error)
         try:
             set_rejection_reason(signal_id, f"buy order failed: {result.error}", "buy_failed")

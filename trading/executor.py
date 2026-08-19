@@ -316,6 +316,13 @@ class OrderResult:
     net_gbp: float | None = None
     fx_rate: float | None = None
     fees_gbp: float | None = None
+    # v21.17: the entry LIMIT rested and never filled inside its window, so it
+    # was cancelled. Distinct from every other failure because nothing is
+    # wrong — the market simply never came back to our price. Callers must
+    # re-queue the signal rather than record a terminal rejection: refusing a
+    # bad price is the feature, and abandoning the idea would throw away the
+    # benefit. Always False on a market order.
+    unfilled: bool = False
 
 
 def _fetch_fill(order_id: str) -> dict | None:
@@ -757,6 +764,29 @@ def buy(
     if extended:
         payload["extendedHours"] = True
 
+    # ── Entry price ceiling (v21.17) ─────────────────────────────────────────
+    # A market buy accepts whatever the book offers. LAMR (2026-08-06) was
+    # sized on a $161.09 decision and filled at $164.30 — 1.99% higher, above
+    # the stock's high for the entire session — which left the −2% stop sitting
+    # at the price the news had originally fired at. A drift back to that
+    # perfectly ordinary level stopped us out 28 seconds after entry.
+    #
+    # A LIMIT at decision-price × (1 + slack) makes the worst case explicit: we
+    # either get a price we chose, or we get nothing and the signal goes back
+    # in the queue. `cfg.validate()` keeps the slack below the stop width, so a
+    # filled entry can never start out further from value than the stop is wide.
+    #
+    # Extended sessions stay on market orders: T212 rejects the extendedHours
+    # flag on the limit endpoint (see `_extended_limit_supported` in sell()),
+    # and out there we want the fill more than we want the price.
+    use_limit = bool(cfg.entry_limit_enabled) and not extended
+    limit_price = None
+    if use_limit:
+        limit_price = round(price * (1 + cfg.entry_limit_slack_pct / 100.0), 2)
+        payload["limitPrice"] = limit_price
+        payload["timeValidity"] = "DAY"
+    endpoint = "/equity/orders/limit" if use_limit else "/equity/orders/market"
+
     # One retry on a transient failure (429 rate limit / 5xx / network error)
     # placing the actual order — this is the live order call, not a pre-check,
     # so losing it outright to a rate-limit blip is strictly worse than the
@@ -767,7 +797,7 @@ def buy(
     post_exc: Exception | None = None
     for attempt in range(2):
         try:
-            order = _post("/equity/orders/market", payload)
+            order = _post(endpoint, payload)
             post_exc = None
             break
         except Exception as exc:
@@ -829,7 +859,7 @@ def buy(
                     ticker, allowed, quantity,
                 )
                 payload["quantity"] = quantity
-                order = _post("/equity/orders/market", payload)
+                order = _post(endpoint, payload)
             except Exception as retry_exc:
                 logger.error("BUY failed for %s after precision retry: %s", ticker, retry_exc)
                 return OrderResult(
@@ -847,27 +877,46 @@ def buy(
         order_id = str(order.get("id", ""))
         fill = _fetch_fill(order_id)
 
-        # ── Extended-hours fill verification (v21) ───────────────────────────
-        # In RTH a market order's fill is a certainty and a missing fill dict
-        # is just slow bookkeeping. Extended-hours market orders can instead
-        # sit QUEUED (instrument not 24/5-eligible → T212 parks the order for
-        # the next RTH open; or no crossable liquidity). A queued buy filling
-        # blind at tomorrow's open is exactly the "gap-and-crap at auction
-        # price" trap this system refuses by design — cancel it and fail the
-        # entry rather than own an unconfirmed fill.
-        if extended and fill is None:
+        # ── Unconfirmed-fill verification (v21 extended, v21.17 limit) ───────
+        # In RTH a MARKET order's fill is a certainty and a missing fill dict is
+        # just slow bookkeeping. Two order shapes break that assumption and both
+        # are handled identically, because the danger is the same: an order that
+        # is alive at the broker but unconfirmed here is a position we own and
+        # are not managing.
+        #
+        #   extended  — can sit QUEUED (instrument not 24/5-eligible → T212
+        #               parks it for the next RTH open, or no crossable
+        #               liquidity). Filling blind at tomorrow's auction is the
+        #               "gap-and-crap" trap this system refuses by design.
+        #   limit     — rests until the market comes to our price, which it may
+        #               never do. Leaving it resting would fill us hours later,
+        #               long after the catalyst and the risk gates that
+        #               approved it have both gone stale.
+        #
+        # Either way: cancel, then verify the cancel against the fill race.
+        if (extended or use_limit) and fill is None:
+            kind = "extended-hours" if extended else "limit"
             status = get_order_status(order_id)
             if status not in ("FILLED", "GONE"):
                 if cancel_order(order_id):
                     logger.warning(
-                        "BUY [%s] extended-hours order %s unfilled (status=%s) — "
-                        "cancelled; instrument may not be 24/5-eligible",
-                        ticker, order_id, status,
+                        "BUY [%s] %s order %s unfilled (status=%s) — cancelled%s",
+                        ticker, kind, order_id, status,
+                        f"; market never reached ${limit_price}" if use_limit
+                        else "; instrument may not be 24/5-eligible",
                     )
                     return OrderResult(
                         success=False, ticker=ticker, quantity=quantity,
                         price=price, order_id=order_id,
-                        error=f"extended-hours buy unfilled (status={status}) — cancelled",
+                        # Only a LIMIT miss is retriable. An extended-hours
+                        # queue means the instrument can't trade now at any
+                        # price; a limit miss means it can't trade at OUR
+                        # price, which the next cycle may fix.
+                        unfilled=use_limit and not extended,
+                        error=(
+                            f"{kind} buy unfilled (status={status}) — cancelled"
+                            + (f"; limit ${limit_price} not reached" if use_limit else "")
+                        ),
                     )
                 # Cancel failed — re-check for the cancel/fill race before
                 # deciding anything.
@@ -877,7 +926,7 @@ def buy(
                         success=False, ticker=ticker, quantity=quantity,
                         price=price, order_id=order_id,
                         error=(
-                            f"extended-hours buy in unresolved state ({status}) — "
+                            f"{kind} buy in unresolved state ({status}) — "
                             "cancel failed; manual broker check required"
                         ),
                     )
