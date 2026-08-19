@@ -4,7 +4,16 @@ main.py
 Entry point for the momentum trader.
 
 Scheduled jobs:
-  1. news_cycle       — every minute. In an entry session (regular hours, and
+  1. news_cycle       — every cfg.news_cycle_seconds (v21.18; 10s in
+                        production, 60s default). The interval IS our
+                        publication→fetch latency: news arrives at random
+                        moments, so the average wait is HALF the interval.
+                        Only the FETCH runs at this cadence — the re-eval
+                        queue, retry queue, pre-market scan and gap-and-go
+                        evaluation stay on ~60s spacing via _slow_path_due(),
+                        because re-running them costs Twelvedata credits
+                        against a fail-closed 55/min bucket.
+                        In an entry session (regular hours, and
                         after-hours 16:00–20:00 ET under v21's extended
                         regime): fetch Benzinga → Claude sentiment → price
                         confirmation → risk gates → buy (+ resting stop-loss
@@ -348,6 +357,48 @@ def _note_price_data_ok(ticker: str) -> None:
     permanently blacklist a ticker that has perfectly good coverage.
     """
     _no_quote_ticker_strikes.pop(ticker, None)
+
+
+# ── Slow-path throttle (v21.18) ───────────────────────────────────────────────
+# Dropping NEWS_CYCLE_SECONDS to 10 makes us see news ~25s sooner. It must not
+# also make us do everything else six times as often, because most of the cycle
+# is not news discovery and re-running it costs real money and real quota:
+#
+#   * the re-eval queue re-confirms EVERY parked signal, and each confirmation
+#     spends a Twelvedata credit. Twelvedata's Grow plan allows 55 calls/min
+#     (`_PER_MINUTE_LIMIT`), and the token bucket FAILS CLOSED — once it is
+#     empty, `confirm_price_signal` returns None and nothing can be confirmed
+#     at all. Five parked signals at a 10s cadence is 30 credits/min; a dozen
+#     would starve the bucket and silently stop us trading. That is a strictly
+#     worse outcome than the 25s of latency this change buys.
+#   * the retry queue re-attempts tickers that had NO price data, so faster
+#     retries mean more calls against exactly the symbols least likely to
+#     answer.
+#   * the pre-market scan and the gap-and-go evaluation are anchored to
+#     30-minute windows and carry their own wall-clock budgets; 10-second
+#     granularity buys them nothing.
+#
+# None of those benefit from sub-minute granularity — only NEWS DISCOVERY does.
+# So the fetch runs at the fast cadence and every periodic sub-step keeps its
+# original ~60s spacing, whatever NEWS_CYCLE_SECONDS is set to.
+_SLOW_PATH_MIN_INTERVAL_SECONDS = 60.0
+_slow_path_last_run: dict[str, float] = {}
+
+
+def _slow_path_due(name: str,
+                   min_interval: float = _SLOW_PATH_MIN_INTERVAL_SECONDS) -> bool:
+    """
+    True when a periodic sub-step is due again, and records the run.
+
+    Uses time.monotonic() rather than wall-clock so an NTP correction or a DST
+    shift can't make a step appear overdue by hours (or never due again).
+    """
+    now = time.monotonic()
+    last = _slow_path_last_run.get(name)
+    if last is not None and (now - last) < min_interval:
+        return False
+    _slow_path_last_run[name] = now
+    return True
 
 
 def _drain_retry_queue() -> list[NewsItem]:
@@ -943,7 +994,11 @@ def _enter_premarket_approved(approved: list, fetched_at: str) -> bool:
 
 def news_cycle() -> None:
     """
-    The main pipeline — runs every minute on a fixed IntervalTrigger.
+    The main pipeline — runs every cfg.news_cycle_seconds (v21.18).
+
+    Only news DISCOVERY benefits from a fast cadence. Every periodic sub-step
+    is throttled to ~60s by _slow_path_due(), so lowering the interval buys
+    latency without multiplying quota consumption.
 
     Market open:   pre-market candidates (if any, inside their window) →
                    retry queue → fresh Benzinga signals. Each goes through
@@ -980,7 +1035,8 @@ def news_cycle() -> None:
     # it over before any ticker is tested against it (v21.6).
     _reset_no_quote_blackout_if_new_day()
 
-    if session == "premarket" and in_premarket_window():
+    if (session == "premarket" and in_premarket_window()
+            and _slow_path_due("premarket_scan")):
         logger.info("Pre-market window — scanning for overnight catalysts")
         try:
             premarket_scan()
@@ -1014,7 +1070,9 @@ def news_cycle() -> None:
     # 09:30 open. In extended sessions there is nothing here to evaluate.
     try:
         approved, graduated = (
-            evaluate_premarket_candidates() if session == REGULAR else ([], [])
+            evaluate_premarket_candidates()
+            if session == REGULAR and _slow_path_due("premarket_eval")
+            else ([], [])
         )
     except Exception as exc:
         # Nothing to iterate if the evaluation call itself blew up — this one
@@ -1061,7 +1119,10 @@ def news_cycle() -> None:
             continue
 
     # ── 2. Re-eval queue (transient tape rejections awaiting participation) ──
-    reeval_opened = _process_reeval_queue()
+    # Throttled to the slow path: each parked signal costs a Twelvedata credit
+    # per re-confirmation, and the 15-minute window does not need 10-second
+    # granularity. See _slow_path_due().
+    reeval_opened = _process_reeval_queue() if _slow_path_due("reeval") else 0
     if reeval_opened:
         gates_ok, gate_reason = _risk_gates_pass()
         if not gates_ok:
@@ -1070,7 +1131,7 @@ def news_cycle() -> None:
 
     # ── 3. Retry queue (already-scored signals that hit a data outage) ───────
     # ── 4. Fresh signals from Benzinga ────────────────────────────────────────
-    retry_items = _drain_retry_queue()
+    retry_items = _drain_retry_queue() if _slow_path_due("retry") else []
     try:
         # Lookback 5 min > the 3-min freshness window: articles the Benzinga
         # feed indexes late (or that land while a cycle overruns) still get
@@ -1255,6 +1316,90 @@ def portfolio_snapshot() -> None:
         logger.error("portfolio_snapshot failed: %s", exc)
 
 
+def setup_scheduler() -> BackgroundScheduler:
+    """
+    Build the scheduler with every job registered, and return it unstarted.
+
+    Extracted from main() in v21.18 so the news cycle's cadence and its
+    overlap protection are testable. At the old fixed 1-minute interval
+    max_instances/coalesce were academic; at 10 seconds they are load-bearing
+    (3 of 325 measured RTH cycles exceeded 10s), and a guarantee nothing
+    asserts is a guarantee that quietly disappears.
+    """
+    scheduler = BackgroundScheduler(timezone=pytz.utc)
+
+    # v21.18: cadence is configurable so the poll interval — which IS our
+    # publication→fetch latency, ~half the interval on average — can be tuned
+    # without a code change.
+    #
+    # max_instances=1 and coalesce=True are set EXPLICITLY rather than left to
+    # APScheduler's defaults, because at a 10s interval they stop being
+    # theoretical. Measured RTH cycles run p50 1s / p90 4s, but 3 of 325 today
+    # exceeded 10s. Two concurrent news cycles would race the re-eval queue and
+    # the retry queue (plain dicts, not thread-safe) and could double-enter a
+    # signal; skipping the overlapping run is the only safe resolution.
+    # coalesce collapses a backlog into one run instead of firing a burst.
+    scheduler.add_job(
+        news_cycle,
+        trigger=IntervalTrigger(seconds=cfg.news_cycle_seconds),
+        id="news_cycle",
+        name="News → Price Check → Buy",
+        misfire_grace_time=max(15, cfg.news_cycle_seconds // 2),
+        max_instances=1,
+        coalesce=True,
+    )
+
+    scheduler.add_job(
+        monitor_positions,
+        trigger=IntervalTrigger(seconds=cfg.monitor_interval_seconds),
+        id="monitor",
+        name="Position monitor",
+        misfire_grace_time=15,
+    )
+
+    # Nightly eval loop: forward returns for every Claude classification.
+    # 22:30 UTC is after the US close year-round (21:00 BST / 20:00 GMT close).
+    scheduler.add_job(
+        _nightly_forward_returns,
+        trigger=CronTrigger(hour=22, minute=30, day_of_week="mon-fri"),
+        id="forward_returns",
+        name="Eval loop: forward returns",
+        misfire_grace_time=3600,
+    )
+
+    # Daily symbol-map refresh (also picks up new listings).
+    scheduler.add_job(
+        build_symbol_map,
+        trigger=CronTrigger(hour=8, minute=0, day_of_week="mon-fri"),
+        id="symbol_map_rebuild",
+        name="T212 symbol map rebuild",
+        misfire_grace_time=3600,
+    )
+
+    # Zero-trade drought tripwire. 21:30 UTC is after the US close year-round, so
+    # "today" is already settled when it runs. Weekdays only — a Saturday alert
+    # would just re-report Friday's idle count.
+    scheduler.add_job(
+        check_zero_trade_drought,
+        trigger=CronTrigger(hour=21, minute=30, day_of_week="mon-fri"),
+        id="zero_trade_drought",
+        name="Zero-trade drought alert",
+        misfire_grace_time=3600,
+    )
+
+    # Portfolio value snapshots for the Grafana time-series panel.
+    # Every 5 min; the job itself returns immediately when the market is closed.
+    scheduler.add_job(
+        portfolio_snapshot,
+        trigger=IntervalTrigger(minutes=5),
+        id="portfolio_snapshot",
+        name="Portfolio value snapshot",
+        misfire_grace_time=60,
+    )
+
+    return scheduler
+
+
 def main() -> None:
     version = _read_version()
     logger.info("=" * 60)
@@ -1276,63 +1421,7 @@ def main() -> None:
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
     global _scheduler
-    _scheduler = BackgroundScheduler(timezone=pytz.utc)
-
-    _scheduler.add_job(
-        news_cycle,
-        trigger=IntervalTrigger(minutes=1),
-        id="news_cycle",
-        name="News → Price Check → Buy",
-        misfire_grace_time=30,
-    )
-
-    _scheduler.add_job(
-        monitor_positions,
-        trigger=IntervalTrigger(seconds=cfg.monitor_interval_seconds),
-        id="monitor",
-        name="Position monitor",
-        misfire_grace_time=15,
-    )
-
-    # Nightly eval loop: forward returns for every Claude classification.
-    # 22:30 UTC is after the US close year-round (21:00 BST / 20:00 GMT close).
-    _scheduler.add_job(
-        _nightly_forward_returns,
-        trigger=CronTrigger(hour=22, minute=30, day_of_week="mon-fri"),
-        id="forward_returns",
-        name="Eval loop: forward returns",
-        misfire_grace_time=3600,
-    )
-
-    # Daily symbol-map refresh (also picks up new listings).
-    _scheduler.add_job(
-        build_symbol_map,
-        trigger=CronTrigger(hour=8, minute=0, day_of_week="mon-fri"),
-        id="symbol_map_rebuild",
-        name="T212 symbol map rebuild",
-        misfire_grace_time=3600,
-    )
-
-    # Zero-trade drought tripwire. 21:30 UTC is after the US close year-round, so
-    # "today" is already settled when it runs. Weekdays only — a Saturday alert
-    # would just re-report Friday's idle count.
-    _scheduler.add_job(
-        check_zero_trade_drought,
-        trigger=CronTrigger(hour=21, minute=30, day_of_week="mon-fri"),
-        id="zero_trade_drought",
-        name="Zero-trade drought alert",
-        misfire_grace_time=3600,
-    )
-
-    # Portfolio value snapshots for the Grafana time-series panel.
-    # Every 5 min; the job itself returns immediately when the market is closed.
-    _scheduler.add_job(
-        portfolio_snapshot,
-        trigger=IntervalTrigger(minutes=5),
-        id="portfolio_snapshot",
-        name="Portfolio value snapshot",
-        misfire_grace_time=60,
-    )
+    _scheduler = setup_scheduler()
 
     # Surface an in-progress drought immediately on startup, not only at 21:30.
     check_zero_trade_drought()
@@ -1343,8 +1432,11 @@ def main() -> None:
 
     _scheduler.start()
     logger.info(
-        "Scheduler running. News cycle every 1 min, monitor every %ds. Press Ctrl+C to stop.",
-        cfg.monitor_interval_seconds,
+        "Scheduler running. News cycle every %ds (expected publication→fetch "
+        "latency ~%.0fs), slow path every %ds, monitor every %ds. "
+        "Press Ctrl+C to stop.",
+        cfg.news_cycle_seconds, cfg.news_cycle_seconds / 2,
+        int(_SLOW_PATH_MIN_INTERVAL_SECONDS), cfg.monitor_interval_seconds,
     )
     logger.info("Jobs scheduled: %s", [j.id for j in _scheduler.get_jobs()])
 

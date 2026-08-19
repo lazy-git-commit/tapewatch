@@ -324,6 +324,29 @@ class Settings:
         }
     )
 
+    # ── News poll cadence (v21.18) ───────────────────────────────────────────
+    # How often the news cycle asks Benzinga "anything new?".
+    #
+    # We are not told when news appears — we ask. So an article published just
+    # after a poll waits the full interval before we see it, and one published
+    # just before is seen immediately. Averaged over random arrival times, the
+    # expected wait is HALF the interval. Measured in production at the old
+    # 60s setting: publication→fetch was 30.2s mean, p50 27.8s, p95 59.3s, with
+    # the delays spread evenly across 0–60s and a hard cut-off at 60 — the exact
+    # signature of the poll interval, not of vendor lag (a slow vendor would
+    # shift the whole distribution right and leave the fast end empty).
+    #
+    # ⚠️ Expected value is SMALL and known. Re-labelling all 1,236 signals with
+    # artificial entry delays (v21.17 method) showed the outcome is flat in
+    # latency: instant entry vs a 60-MINUTE delay differs by 0.031pp/trade, and
+    # 0 vs 3 min by 0.021pp, against a −0.264pp deficit. This is bought because
+    # it is nearly free, not because it fixes anything.
+    #
+    # Only the FETCH runs at this cadence — see _slow_path_due() in main.py.
+    news_cycle_seconds: int = field(
+        default_factory=lambda: int(os.getenv("NEWS_CYCLE_SECONDS", "60"))
+    )
+
     # ── Portfolio circuit breakers (v21.17) ──────────────────────────────────
     # MAX_DAILY_LOSS_PCT resets at midnight, so it cannot see a slow bleed: a
     # strategy losing 1.9% every day never trips it. These two controls cover
@@ -663,6 +686,12 @@ class Settings:
             # a deploy from disabling them together.
             ("SKIP_MOMENTUM_CATALYSTS requires REQUIRE_VWAP_CONFIRMATION",
              not self.skip_momentum_catalysts or self.require_vwap_confirmation),
+            # Floor of 5s: measured RTH cycles run p50 1s / p90 4s / max 12s,
+            # and APScheduler skips a run whose predecessor is still going
+            # (max_instances=1). Below ~5s we would spend the day skipping.
+            # Ceiling of 300s: past that the 3-minute freshness filter starts
+            # discarding articles before we ever look at them.
+            ("NEWS_CYCLE_SECONDS (5–300)", 5 <= self.news_cycle_seconds <= 300),
             ("ENTRY_LIMIT_SLACK_PCT", self.entry_limit_slack_pct > 0),
             # v21.17: an entry allowed further above our decision price than the
             # stop is wide begins the trade already inside its own stop-loss

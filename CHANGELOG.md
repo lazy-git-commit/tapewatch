@@ -7,6 +7,87 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.18 — 2026-08-19 (configurable poll cadence; 60s → 10s)
+
+### Why our latency was 30 seconds, and why it was self-inflicted
+
+We are not told when news appears — we ask. At the fixed 60-second interval, an
+article published just after a poll waited the full minute; one published just
+before was seen at once. Averaged over random arrival times the expected wait is
+**half the interval**, and that is exactly what production showed:
+
+| publication → fetch | value |
+|---|---|
+| mean | 30.2s |
+| p50 | 27.8s |
+| p95 | 59.3s |
+| 0–30s bucket | 45 articles |
+| 30–60s bucket | 31 articles |
+| over 60s | 2 articles |
+
+Delays spread evenly across 0–60s with a hard cut-off at 60 is the **signature of
+the poll interval, not of vendor lag** — a slow vendor would shift the whole
+distribution right and leave the fast end empty. It doesn't. Benzinga is fast;
+the waiting was ours.
+
+`NEWS_CYCLE_SECONDS` (default 60, production 10) makes the cadence a deploy-time
+setting. Expected publication→fetch latency drops from ~30s to ~5s.
+
+**⚠️ Expected value is small and known.** Re-labelling all 1,236 signals with
+artificial entry delays (the v21.17 method) showed the outcome is flat in
+latency: instant entry vs a **60-minute** delay differs by 0.031pp/trade, and 0
+vs 3 minutes by 0.021pp, against a −0.264pp deficit. `guidance_raise` is
+marginally *better* at a 60-minute delay. This is bought because it is nearly
+free, not because it fixes anything — the deficit is a cost problem (0.196%
+gross against 0.46pp of costs), not a speed problem.
+
+### What makes 10s safe rather than expensive
+
+Only news DISCOVERY benefits from a fast cadence. Running the whole cycle six
+times as often would have been actively harmful:
+
+- The **re-eval queue** re-confirms every parked signal, and each confirmation
+  spends a Twelvedata credit. The Grow plan allows 55 calls/min and the token
+  bucket **fails closed** — once empty, `confirm_price_signal()` returns None and
+  nothing can be confirmed at all. Five parked signals at 10s is 30 credits/min;
+  a dozen would starve the bucket and silently stop us trading, which is
+  strictly worse than the 25s of latency this buys.
+- The **retry queue** re-attempts tickers that returned no price data, so faster
+  retries mean more calls against the symbols least likely to answer.
+- The **pre-market scan** and **gap-and-go evaluation** are anchored to 30-minute
+  windows with their own wall-clock budgets; 10-second granularity buys nothing.
+
+`_slow_path_due()` keeps all four on ~60s spacing regardless of the poll
+interval, using `time.monotonic()` so an NTP correction or DST shift can't make a
+step look overdue by hours. Only `fetch_all_news()` runs at the fast cadence.
+
+`max_instances=1` and `coalesce=True` are now set **explicitly** on the news job.
+At 60s they were academic; at 10s they are load-bearing — measured RTH cycles run
+p50 1s / p90 4s, but **3 of 325 exceeded 10s**, and two concurrent cycles would
+race the re-eval and retry queues (plain dicts, not thread-safe) and could
+double-enter a signal. `cfg.validate()` bounds the interval to 5–300s: below ~5s
+we would spend the day skipping runs, above 300s the 3-minute freshness filter
+discards articles before we look at them.
+
+`main()`'s scheduler block was extracted to `setup_scheduler()` so the cadence and
+the overlap guarantees are testable — a guarantee nothing asserts is one that
+quietly disappears.
+
+**Watch after deploy:** this is a 6× increase in Benzinga API calls (~6/min,
+~2,300/trading day). Massive's docs publish no rate limit. The failure mode is
+safe and fast to detect — the existing `_BENZINGA_OUTAGE_THRESHOLD` fires after 10
+consecutive failed fetches, which at 10s is 100 seconds rather than 10 minutes.
+
+### Tests
+
+`tests/test_v21_18.py` (19 tests), **mutation-tested — 11 mutations, 11 caught**:
+hardcoding the interval back to a minute, removing `max_instances`/`coalesce`,
+un-throttling each of the four slow-path steps, making the throttle never
+throttle, switching it to wall-clock time, dropping the bounds check, and
+throttling the fetch itself (which would defeat the entire change).
+
+---
+
 ## v21.17 — 2026-08-19 (the edge does not survive path-aware measurement)
 
 **This release retracts the central claim of v21.16.** It ships cost reduction,

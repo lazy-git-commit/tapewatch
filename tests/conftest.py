@@ -100,4 +100,13 @@ def _reset_process_level_state():
     sc._client = None
     sc._unavailable_logged = False
 
+    # Slow-path throttle (v21.18). news_cycle() runs the re-eval queue, retry
+    # queue and both pre-market steps at most once per 60s regardless of the
+    # poll interval. That timer is process-lifetime state, so the FIRST test to
+    # drive news_cycle() consumes the slot and every later test silently gets
+    # the throttled path — which is how a pre-market batch test started
+    # asserting against an evaluation that never ran.
+    import main as _main
+    _main._slow_path_last_run.clear()
+
     yield
