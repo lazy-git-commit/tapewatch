@@ -7,6 +7,83 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v21.19 — 2026-08-26 (one event, one trade; and a retry that survives a throttle)
+
+Two defects fired together and killed every signal of the day.
+
+### What happened
+
+Bath & Body Works published **three** guidance articles before the open. The
+pre-market scanner stores one candidate per ARTICLE and nothing collapsed them
+by ticker, so all three approved and all three fired a buy for `LB_US_EQ` within
+seconds. Each hit a `quantity-precision-mismatch` and immediately retried —
+**six order requests in a couple of seconds**. T212 rate-limited us, and because
+the precision retry (unlike the initial placement) had no retry of its own,
+every one died instantly:
+
+```
+BUY failed for LB_US_EQ after precision retry: HTTP 429 TooManyRequests
+```
+
+Those were the **first 429s in nine days** (zero on 17–25 Aug, seven on the
+26th). Had the orders succeeded we would instead have opened **three positions
+in one stock** — the 24-hour ticker cooldown only engages once a trade is
+RECORDED, which these were racing.
+
+### 1. Ticker-level dedupe in the pre-market pre-pass
+
+`_dedupe_by_ticker()` collapses candidates naming the same ticker, keeping the
+highest confidence (then magnitude, then newest). LB's three ranked 0.75 / 0.85
+/ 0.90, so the most complete article wins. Losers are retired as `rejected`
+with a "duplicate ticker — superseded by #N" reason rather than left pending.
+
+Deliberately placed in the **sequential, no-I/O pre-pass**, before the parallel
+confirm phase — so a duplicate never spends a quote credit either. Across all
+history 594 candidates covered only **550 unique ticker-days**; 44 duplicate
+price checks were being paid for.
+
+### 2. Both order POSTs now share one retry implementation
+
+`_post_order_with_retry()` replaces two divergent code paths. The initial
+placement always retried once on a retryable failure (429/5xx/network); the
+precision retry was a bare call. That asymmetry is the whole bug — and the
+precision retry is the attempt MOST likely to meet a throttle, since it follows
+the placement within milliseconds.
+
+Non-retryable errors (401/403/404/400) still return on the first attempt:
+burning a second order request on an error that cannot fix itself is precisely
+how an account reaches a rate limit.
+
+### Note on the drought
+
+Only one of the four idle days is explained by this bug. Fri 22 and Tue 25 had
+**zero** signals reach a price check, and Mon 24's single signal was rejected on
+momentum. That is the expected behaviour of a system restricted to
+`guidance_raise` at ~0.5 trades/day, not a fault. LB's own tape was −2.24%
+against the signal on later cycles, so the bug probably did not cost a
+profitable trade — but on a busier day it would cost more.
+
+### Tests
+
+`tests/test_v21_19.py` (13 tests), **mutation-tested — 7 mutations, 7 caught**:
+removing the dedupe, keeping the first article instead of the best, leaving
+duplicates pending, ignoring confidence in the ranking, reverting the precision
+retry to a bare call, disabling the shared retry, and making it retry
+non-retryable errors.
+
+Two mutation-testing notes worth keeping: the first run reported 2 misses, and
+**both were flaws in the test process rather than the code**. One mutation
+targeted the wrong function (the anchor string appears in `_fetch_cash` first,
+so it never touched the helper), and one test was genuinely vacuous — the real
+LB rows shared a magnitude AND ordered confidence with id, so "newest wins"
+would have passed. Fixed with a case where confidence and recency disagree.
+
+`test_precision_retry_still_fails` in `test_core.py` was updated: it encoded the
+pre-fix behaviour (instant failure on a transient error) and now asserts the
+retry, with a companion test pinning that permanent errors are NOT retried.
+
+---
+
 ## v21.18 — 2026-08-19 (configurable poll cadence; 60s → 10s)
 
 ### Why our latency was 30 seconds, and why it was self-inflicted

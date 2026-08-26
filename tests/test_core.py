@@ -1167,8 +1167,32 @@ class TestBuyPrecisionRetry:
     def test_precision_retry_still_fails(self, mock_get, mock_post):
         from trading.executor import buy
         mock_get.return_value = self._mock_cash()
-        # Both attempts fail
-        mock_post.side_effect = [self._precision_error(2), Exception("HTTP 500")]
+        # v21.19: the precision retry now gets the SAME one-shot retry the
+        # initial placement always had, so a TRANSIENT failure there is retried
+        # rather than being instantly terminal. That asymmetry is what killed
+        # three LB_US_EQ signals on 2026-08-26 when a rate limit landed on the
+        # precision retry. A bare Exception counts as a network error, hence
+        # three POSTs: placement, precision retry, retry-of-the-retry.
+        mock_post.side_effect = [
+            self._precision_error(2), Exception("HTTP 500"), Exception("HTTP 500"),
+        ]
+        result = buy("BCDA_US_EQ", price=1.51)
+        assert result.success is False
+        assert mock_post.call_count == 3
+
+    @patch("trading.executor._post")
+    @patch("trading.executor._get")
+    def test_precision_retry_does_not_retry_a_permanent_error(
+        self, mock_get, mock_post
+    ):
+        # The counterpart: 401/403/404 will fail identically on retry, so
+        # spending a second order request on them is exactly how an account
+        # reaches a rate limit. One placement, one precision retry, stop.
+        from trading.executor import buy, T212HTTPError
+        mock_get.return_value = self._mock_cash()
+        mock_post.side_effect = [
+            self._precision_error(2), T212HTTPError(403, "forbidden"),
+        ]
         result = buy("BCDA_US_EQ", price=1.51)
         assert result.success is False
         assert mock_post.call_count == 2

@@ -738,6 +738,44 @@ def place_stop_loss(ticker: str, quantity: float, stop_price: float) -> str | No
         return None
 
 
+def _post_order_with_retry(endpoint: str, payload: dict, ticker: str,
+                           label: str = "BUY") -> tuple[dict | None, Exception | None]:
+    """
+    POST an order, retrying ONCE on a retryable failure. Returns (order, exc).
+
+    Shared by the initial placement and the quantity-precision retry. It was
+    not shared before, and the asymmetry cost us real signals: the first POST
+    retried a 429 while the precision retry was a bare call, so a rate limit
+    arriving on the second attempt was instantly terminal.
+
+    2026-08-26: three articles about one Bath & Body Works guidance raise
+    produced three candidates for LB_US_EQ, which fired six order requests
+    within seconds (three placements, each followed by an immediate precision
+    retry). T212 rate-limited us and all three signals died with
+    "BUY failed after precision retry: HTTP 429" — the first 429s in nine days.
+    The duplicate candidates are fixed separately in premarket/scanner.py; this
+    makes the retry path survive a throttle either way.
+
+    A non-retryable T212HTTPError (401/403/404/400, including
+    quantity-precision-mismatch) returns immediately on the first attempt so
+    the caller can handle it — only transient failures are retried.
+    """
+    for attempt in range(2):
+        try:
+            return _post(endpoint, payload), None
+        except Exception as exc:
+            retryable = not isinstance(exc, T212HTTPError) or exc.retryable
+            if attempt == 0 and retryable:
+                logger.warning(
+                    "%s %s: order placement failed (%s) — retrying once",
+                    label, ticker, exc,
+                )
+                time.sleep(2)
+                continue
+            return None, exc
+    return None, None
+
+
 def buy(
     ticker: str,
     price: float,
@@ -793,24 +831,7 @@ def buy(
     # already-fixed cash-lookup case (v21.7/CHANGELOG). A non-retryable
     # T212HTTPError (401/403/404/400, including quantity-precision-mismatch)
     # falls straight through to the existing handling below on the first try.
-    order = None
-    post_exc: Exception | None = None
-    for attempt in range(2):
-        try:
-            order = _post(endpoint, payload)
-            post_exc = None
-            break
-        except Exception as exc:
-            post_exc = exc
-            retryable = not isinstance(exc, T212HTTPError) or exc.retryable
-            if attempt == 0 and retryable:
-                logger.warning(
-                    "BUY %s: order placement failed (%s) — retrying once",
-                    ticker, exc,
-                )
-                time.sleep(2)
-            else:
-                break
+    order, post_exc = _post_order_with_retry(endpoint, payload, ticker)
 
     if post_exc is not None:
         exc = post_exc
@@ -859,7 +880,14 @@ def buy(
                     ticker, allowed, quantity,
                 )
                 payload["quantity"] = quantity
-                order = _post(endpoint, payload)
+                # Same retry as the initial placement: the precision retry
+                # follows it within milliseconds, so it is the attempt MOST
+                # likely to meet a rate limit, not the least.
+                order, retry_exc = _post_order_with_retry(
+                    endpoint, payload, ticker, label="BUY precision-retry",
+                )
+                if retry_exc is not None:
+                    raise retry_exc
             except Exception as retry_exc:
                 logger.error("BUY failed for %s after precision retry: %s", ticker, retry_exc)
                 return OrderResult(

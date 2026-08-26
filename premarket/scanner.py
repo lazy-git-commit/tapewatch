@@ -226,6 +226,57 @@ def _minutes_since_open() -> float:
     return (now - open_).total_seconds() / 60
 
 
+def _candidate_rank(cand: dict) -> tuple:
+    """Sort key for choosing between candidates naming the SAME ticker."""
+    try:
+        conf = float(cand.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    try:
+        mag = int(cand.get("catalyst_magnitude") or 0)
+    except (TypeError, ValueError):
+        mag = 0
+    # Highest confidence wins, then magnitude, then the newest row — a later
+    # article about the same event is usually the more complete one.
+    return (conf, mag, cand.get("id") or 0)
+
+
+def _dedupe_by_ticker(live: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Collapse candidates that name the same ticker. Returns (kept, superseded).
+
+    One corporate event routinely produces several Benzinga articles, and the
+    scanner stores one candidate PER ARTICLE. Nothing downstream collapsed them,
+    so a single event was evaluated, approved and BOUGHT once per article.
+
+    2026-08-26: Bath & Body Works published three guidance articles before the
+    open (conf 0.75 / 0.85 / 0.90). All three became candidates, all three
+    approved, and all three fired a buy for LB_US_EQ within seconds — six order
+    requests including the precision retries. T212 rate-limited us and every one
+    failed with HTTP 429, the first 429s in nine days. Had they succeeded we
+    would instead have opened three positions in one stock: the 24-hour ticker
+    cooldown only engages once a trade is RECORDED, which these were racing.
+
+    Deduping here — in the sequential, no-I/O pre-pass — also stops us spending
+    a quote credit per duplicate. Across all history 594 candidates covered only
+    550 unique ticker-days.
+    """
+    best: dict[str, dict] = {}
+    superseded: list[dict] = []
+    for cand in live:
+        ticker = cand.get("ticker")
+        incumbent = best.get(ticker)
+        if incumbent is None:
+            best[ticker] = cand
+            continue
+        if _candidate_rank(cand) > _candidate_rank(incumbent):
+            superseded.append(incumbent)
+            best[ticker] = cand
+        else:
+            superseded.append(cand)
+    return list(best.values()), superseded
+
+
 def _live_candidates(
     pending: list[dict], minutes_open: float
 ) -> tuple[list[dict], list[dict]]:
@@ -275,6 +326,28 @@ def _live_candidates(
             graduated.append(cand)
             continue
         live.append(cand)
+
+    # One event, one trade. Duplicate candidates for the same ticker are
+    # retired here rather than each racing the others to the broker.
+    live, superseded = _dedupe_by_ticker(live)
+    for dupe in superseded:
+        keeper = next((c for c in live if c.get("ticker") == dupe.get("ticker")), None)
+        keeper_id = keeper.get("id") if keeper else "?"
+        logger.info(
+            "Pre-market dedupe [%s]: candidate #%s superseded by #%s "
+            "(same ticker, same event, higher confidence)",
+            dupe.get("ticker"), dupe.get("id"), keeper_id,
+        )
+        try:
+            update_premarket_candidate(
+                dupe["id"], "rejected",
+                f"duplicate ticker — superseded by candidate #{keeper_id}",
+            )
+            _clear_strikes(dupe["id"])
+        except Exception as exc:
+            logger.warning(
+                "Could not retire duplicate candidate #%s: %s", dupe.get("id"), exc,
+            )
     return live, graduated
 
 
