@@ -1,3 +1,19 @@
+# Licensed to ParallaxTech Ltd under one or more contributor licence
+# agreements. See the NOTICE file distributed with this work for additional
+# information regarding copyright ownership.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 config/settings.py
 ──────────────────
@@ -538,8 +554,17 @@ class Settings:
     # After-hours entries (16:00–20:00 ET). THE reason v21 exists: FDA
     # decisions and guidance raises overwhelmingly print right after the
     # close — a window the system used to sleep through entirely.
+    # Ships OFF. Extended-hours bars are a paid entitlement on most market-data
+    # plans — a provider without them 403s every pre/post request, and a free
+    # quote endpoint typically freezes at the 16:00 ET close — so an after-hours
+    # signal is usually not confirmable at all. Leaving this on then produces
+    # repeated no-quote misses, which the blackout logic can mistake for "this
+    # ticker has no coverage" and suppress for the session (2026-07-27: nine
+    # liquid large/mid caps blacklisted purely for reporting after the bell).
+    # Turn it on only once you have verified your bars provider returns
+    # extended-session data. See docs/algorithm.md §7 and §12.
     afterhours_trading_enabled: bool = field(
-        default_factory=lambda: os.getenv("AFTERHOURS_TRADING_ENABLED", "true").lower() in ("1", "true", "yes")
+        default_factory=lambda: os.getenv("AFTERHOURS_TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
     )
     # Direct pre-market entries (04:00–09:30 ET). Default OFF: the existing
     # pre-market scanner + at-open gap-and-go evaluation is the deliberate

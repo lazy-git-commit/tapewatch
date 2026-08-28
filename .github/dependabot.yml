@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Python dependencies. Security updates matter here: this software holds
+  # broker credentials, so a vulnerable transitive dependency is a real risk.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+
+  # Keep the Actions themselves current — a stale action is a supply-chain risk.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    labels: ["dependencies", "ci"]

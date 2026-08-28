@@ -1,218 +1,185 @@
-# Momentum Trader
+# Tapewatch
 
-A news-driven momentum trading system for your Trading 212 Stocks ISA.
+**A news-catalyst trading framework — and the measurement tooling to find out
+whether a strategy actually works.**
 
-## How it works
+Tapewatch watches a live newswire, classifies every article with an LLM, confirms
+the market agrees, and executes through a broker API. It is a complete,
+production-hardened event-driven trading system: outage detection, broker
+reconciliation, fail-closed data handling, 563 tests.
 
-```
-Benzinga news (via massive.com) — breaking US equity news with tickers
-       ↓  pre-filters (before Claude API call):
-          • freshness: article must be <60s old at fetch time
-          • crypto tickers stripped (X:BTCUSD etc. are not equities)
-          • roundup articles skipped (>3 tickers = market digest, no catalyst)
-          • T212 symbol map: Benzinga shortName → correct T212 ticker code
-Claude Haiku — expert momentum day trader classifier
-                     scores every article (14-class catalyst taxonomy)
-                     only fda_approval / guidance_raise are tradeable by default
-                     (the classes measured profitable on forward returns — the
-                      rest are scored and stored for the eval loop, not traded)
-       ↓
-Session gate — which of T212's 24/5 sessions are we in? (ET)
-                     regular    09:30–16:00  → full pipeline (always)
-                     afterhours 16:00–20:00  → full pipeline, stricter gates
-                     premarket  04:00–09:30  → scanner + at-open gap-and-go
-                     overnight  20:00–04:00  → stand aside (data-blind, fail-closed)
-       ↓
-Price confirmation — Finnhub quote + Twelvedata fallback/bars
-                     blocks first 5 minutes after the session start (auction noise)
-                     price ≥ $5 and not already extended vs prev close
-                     timestamp-based momentum + time-normalized RVOL
-                     ADV liquidity floor + spread proxy
-                     VWAP confirmation (is the stock being accumulated?)
-                     (extended sessions: session-anchored VWAP/volume, an
-                      absolute participation floor instead of RVOL, half size)
-       ↓
-Buy order (Trading 212 API — demo or live)
-  auto-retries once if T212 rejects for quantity precision mismatch
-  extended sessions carry the extendedHours flag and verify the fill
-       ↓
-Position monitor (every 5s) — Finnhub quote + Twelvedata fallback
-  → Resting stop-loss at the broker (-2%)  ✅ zero-latency loss side (RTH)
-  → Take-profit polled (+5%)               ⏱️
-  → Time stop (60min)                      ⏱️
-  → Breakeven ratchet at +2%
-  → EOD flatten before close; after-hours flatten by 19:45 ET
-  (extended sessions: no resting stop — T212 stops execute RTH-only — so the
-   monitor polls both sides and force-flattens before 20:00 ET)
-       ↓
-Trade logged to PostgreSQL (tagged demo or live, with session)
-       ↓
-Grafana dashboard — live activity and history
-```
-
-Polls every minute around the clock. The **session gate** decides what runs:
-regular and after-hours run the full pipeline; pre-market runs the scanner;
-overnight (Blue Ocean ATS — invisible to our data feeds) stands aside by
-construction. Holidays and early closes are handled automatically via
-`pandas_market_calendars` — no manual configuration needed. Extended-hours
-trading is controlled by `EXTENDED_HOURS_ENABLED` / `AFTERHOURS_TRADING_ENABLED`
-(see settings below).
+It also ships the part most trading projects leave out: tooling that measures,
+honestly, whether a strategy makes money. Pointed at the **bundled reference
+strategy** it currently reports no measurable edge — which is the tooling doing
+its job, and the reason those numbers are published rather than quietly dropped.
+Whether a strategy *you* build with it does better is an open question, and the
+same tooling is there to answer it.
 
 ---
 
-## Setup
+## ⚠️ This is research software
 
-### 1. Prerequisites
+**Tapewatch executes real trades against real brokerage APIs.** It is published
+for research and educational purposes.
 
-- Python 3.12
-- A [Trading 212](https://www.trading212.com) account with a Stocks ISA (demo or live)
-- A [massive.com](https://massive.com) account with Benzinga news subscription
-- A [Finnhub](https://finnhub.io) API key (free tier is sufficient)
-- An [Anthropic](https://console.anthropic.com) API key for Claude Haiku sentiment
-- A VM or server to deploy to (Linux recommended)
+**It is not investment advice.** Nothing here is a recommendation to buy or sell
+any security. **No representation is made that it is profitable.** Measured over
+22 trading days in a single market regime, the maintainers' own path-aware
+measurements of the *bundled reference strategy* show no measurable edge; the
+method and its limits are set out in [`docs/RESULTS.md`](docs/RESULTS.md) so you
+can check them yourself. That is a result for one strategy over one window — not
+a forecast, and not a claim about anything you build.
 
-### 2. Install dependencies
+Trading involves risk of loss. You are solely responsible for any use of this
+software, including any financial loss. **It ships in demo mode**; changing that
+is a deliberate act with consequences that are yours.
 
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 3. Configure your environment
-
-```bash
-cp .env.example .env
-# Fill in your API keys
-```
-
-Key settings in `.env`:
-
-| Variable | Default | Notes |
-|---|---|---|
-| `TRADING_MODE` | `demo` | **Keep as `demo` until confident** |
-| `BLOCKLIST` | `` | Comma-separated Trading 212 codes to never trade (e.g. `TSLA_US_EQ`) |
-| `MIN_PRICE_MOVE_PCT` | `0.2` | Dead-tape floor; VWAP/RVOL do the real confirmation |
-| `MOMENTUM_LOOKBACK_MINUTES` | `5` | Timestamp-based momentum lookback |
-| `MAX_DAY_DROP_PCT` | `3.0` | Reject if stock is down more than this % vs previous close |
-| `MAX_DAY_MOVE_PCT` | `25.0` | Reject if the day move is already exhausted |
-| `MIN_RVOL` / `MAX_RVOL` | `1.5` / `20.0` | Time-of-day-normalized participation band |
-| `REQUIRE_VWAP_CONFIRMATION` | `true` | Require price to hold at/above session VWAP |
-| `MAX_POSITION_SIZE_PCT` | `5.0` | Max % of portfolio per trade |
-| `RISK_PER_TRADE_PCT` | `0.25` | Position risk budget if stop is hit |
-| `MAX_DAILY_LOSS_PCT` | `2.0` | Daily kill switch on realized losses |
-| `TAKE_PROFIT_PCT` | `5.0` | Sell when up this % |
-| `STOP_LOSS_PCT` | `2.0` | Sell when down this % |
-| `TIME_STOP_MINUTES` | `60` | Sell after this many minutes regardless |
-| `EOD_FLATTEN_MINUTES` | `10` | Force-close before the bell |
-| `EXTENDED_HOURS_ENABLED` | `true` | Master switch for all 24/5 extended-session behavior |
-| `AFTERHOURS_TRADING_ENABLED` | `true` | Open new positions in the 16:00–20:00 ET session |
-| `PREMARKET_TRADING_ENABLED` | `false` | Direct pre-market entries (off — the at-open gap-and-go trades the same news) |
-| `EXTENDED_MIN_ADV_DOLLAR` | `50000000` | ADV$ floor for extended-session entries (stricter than RTH) |
-| `EXTENDED_MIN_SESSION_DOLLAR_VOLUME` | `500000` | Absolute session-dollar participation floor (replaces RVOL after hours) |
-| `EXTENDED_MAX_SPREAD_PCT` | `1.5` | Spread ceiling for extended sessions (tighter than RTH's 3%) |
-| `EXTENDED_SIZE_FACTOR` | `0.5` | Position-size multiplier in extended sessions (half size) |
-| `EXTENDED_FLATTEN_BUFFER_MINUTES` | `15` | Force-close everything this many minutes before 20:00 ET |
-
-### 4. Run the tests
-
-```bash
-pytest tests/ -v
-```
-
-### 5. Start the trader
-
-```bash
-python main.py
-```
-
-You'll see live output like:
-```
-INFO  __main__ — ── News cycle starting ──────────────────────────────────
-INFO  news.fetcher — Benzinga: 12 article(s) fetched → 3 eligible → 2 positive ticker signal(s)
-INFO  __main__ — Signal [AAPL_US_EQ] 85% confidence: Apple announces record quarter
-INFO  market.price_check — Price check [AAPL]: recent=+1.8% day=+2.3% volume=2.1× — approved
-INFO  trading.executor — BUY executed: AAPL_US_EQ × 2.381000 | order_id=...
-```
-
-### 6. View performance report
-
-```bash
-python -m reporting.report
-```
+Provided "AS IS" without warranty of any kind. See [`LICENSE`](LICENSE).
 
 ---
 
-## Deployment
+## Why this exists
 
-The system deploys automatically to a Linux VM via GitHub Actions on every push to `main`.
+Most retail algorithmic trading projects show you an equity curve. This one
+ships the tooling that invalidates equity curves.
 
-### Required GitHub Secrets
+Twice during development a change was shipped on evidence that later turned out
+to be wrong — and the modules in `analysis/` are what caught it both times:
 
-| Secret | Description |
+- A strategy change was justified by **+0.667% per trade**, measured by sampling
+  prices at fixed horizons. Re-measured by walking the actual minute-by-minute
+  path a trade would take, the same signals came back at **−0.388%**. The
+  sampling had estimated a 33% stop-out rate; the real rate was 48%.
+- Prompt caching was believed to be working for over a thousand API calls. It
+  had never engaged once — the cached prefix sat below the model's minimum
+  length, so the API silently ignored the request and returned success anyway.
+
+If you are building anything similar, the measurement modules are probably more
+useful to you than the strategy.
+
+---
+
+## What's in the box
+
+| Component | What it does |
 |---|---|
-| `DEPLOY_HOST` | VM the private network IP (after setup) |
-| `DEPLOY_USER` | SSH user (e.g. `root`) |
-| `DEPLOY_SSH_KEY` | SSH private key |
-| `NETWORK_OAUTH_CLIENT_ID` | the private network OAuth client ID — used by `deploy.yml` to join the CI runner to the private network |
-| `NETWORK_OAUTH_CLIENT_SECRET` | Matching OAuth client secret. Scope: **Auth Keys → Write** only. Unlike an auth key it never expires — auth keys cap at 90 days, and when the old one lapsed on 2026-08-11 deploys failed *before* rsync, so the VM silently kept serving the previous build while pushes looked successful. Requires `tag:deploy-runner` in the private network policy file (`tagOwners`) with access to the VM on port 22 — that tag is applied to the CI runner, not to the VM |
-| ~~`NETWORK_AUTH_KEY`~~ | **Deleted 2026-08-11.** Was only still referenced by `setup_vm.yml` (manual-only, already ran). Re-create it *at the time you rebuild a VM* — that workflow joins the VM as a **persistent** node, so it needs a real auth key, not an OAuth client whose derived keys are ephemeral and would drop the VM off the private network whenever it went offline |
-| `TRADING212_API_KEY` | Trading 212 live API key |
-| `TRADING212_API_KEY_ID` | Trading 212 live API key ID |
-| `TRADING212_DEMO_API_KEY` | Trading 212 demo API key |
-| `TRADING212_DEMO_API_KEY_ID` | Trading 212 demo API key ID |
-| `MASSIVE_BENZINGA_API_KEY` | Benzinga news key from massive.com |
-| `FINNHUBIO_API_KEY` | Finnhub API key |
-| `ANTHROPIC_API_KEY` | Anthropic API key for Claude Haiku |
-| `DASHBOARD_ADMIN_PASSWORD` | Grafana admin password |
-
-### Useful commands on the VM
-
-```bash
-# Live log stream
-journalctl -u momentum_trader -f
-
-# Check service status
-systemctl status momentum_trader
-
-# View trade history
-psql postgresql://<db-user>:<db-password>@localhost:5432/momentum_trader -c "SELECT mode, ticker, buy_price, sell_price, profit_loss_pct, status FROM trades"
-
-# Performance report
-cd /opt/tapewatch && .venv/bin/python -m reporting.report
-```
-
-### Grafana dashboard
-
-Grafana runs on port 3000 of your VM. Open `http://<VM-IP>:3000` (default login: `admin` / `admin`).
-
-The dashboard shows open trades, win rate, total P&L, trade history, and signal history. Use the **Mode** dropdown to switch between demo and live views.
-
-To open the firewall port if needed:
-```bash
-firewall-cmd --permanent --add-port=3000/tcp && firewall-cmd --reload
-```
+| **News ingestion** | Polls a newswire, de-duplicates, and filters recaps, digests and analyst noise *before* spending an LLM call |
+| **LLM classification** | 14-class catalyst taxonomy with schema-forced output, confidence, magnitude and an `already_moved` judgement. Optional shadow model for provider comparison |
+| **Price confirmation** | ~14 sequential gates — quote freshness, liquidity, spread, momentum, relative volume, VWAP, extension, exhaustion — each with an explicit rejection code |
+| **Risk gates** | Daily-loss kill switch, drawdown circuit breaker, losing-streak cooldown, position and trade caps, per-ticker cooldown |
+| **Execution** | Limit entries with a price ceiling, broker-resting stop-loss, breakeven ratchet, bounded-limit exits with market fallback, broker reconciliation |
+| **Measurement** | Triple-barrier labelling, deflated Sharpe ratio, walk-forward validation with embargo, nightly forward-return eval loop |
+| **Operations** | Outage detection with severity routing, heartbeats, Grafana dashboards, 563 tests with mutation testing on critical paths |
 
 ---
 
-## Going live ⚠️
+## Quick start
 
-Only switch `TRADING_MODE=live` when:
+Tapewatch needs **Python 3.11+**, **PostgreSQL**, and API credentials for the
+providers you choose. Everything runs in **demo mode** by default.
 
-- [ ] You have run in demo mode for **at least 2–4 weeks**
-- [ ] Your win rate in demo is positive and consistent
-- [ ] You understand every line of the code
-- [ ] You are comfortable with the maximum loss per trade
-- [ ] You have reviewed Trading 212's API terms of service
+```bash
+git clone https://github.com/lazy-git-commit/tapewatch.git
+cd tapewatch
 
-This software is provided as-is. You are responsible for all trading decisions and outcomes. Always consult a financial adviser before deploying real capital.
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+cp .env.example .env               # every setting is documented inline
+                                   # in that file — start there
+
+pytest tests/ -q                   # 563 tests, no credentials needed
+python main.py                     # starts in demo mode
+```
+
+**New here?** [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) walks through
+provider signup, the minimum viable configuration, and how to verify each piece
+works before letting anything trade.
 
 ---
 
-## Extending the system
+## Swapping providers
 
-**Block a company**: Add its Trading 212 instrument code to `BLOCKLIST` in `.env` (e.g. `TSLA_US_EQ`).
+Every external service sits behind a small, documented contract. To use a
+different news source, quote provider or broker you implement a handful of
+functions in a new module and point one environment variable at it — the trading
+logic does not change.
 
-**Tune your strategy**: All parameters are in `.env`. Start conservative and adjust after 20–30 trades.
+[`docs/PROVIDERS.md`](docs/PROVIDERS.md) specifies each contract precisely, with
+a worked example.
 
-**Add notifications**: In `monitor/position_monitor.py`, add an email/SMS alert after a sell executes or fails.
+---
+
+## Developing a strategy
+
+The bundled strategy is a reference implementation, not a recommendation. If you
+want to develop your own — which is the point of a framework — the sequence that
+matters is:
+
+1. **Collect.** Run in demo mode for several weeks. Every classification is
+   stored whether or not it traded, so the dataset builds itself.
+2. **Label path-aware.** `analysis/triple_barrier.py` walks each signal minute by
+   minute and records which exit it would have hit **first**. Do not use
+   fixed-horizon returns — checking the price at 5, 15 and 60 minutes cannot see
+   the dip in between, and the dip is what fills a stop. Here, those two methods
+   gave opposite conclusions on the same signals.
+3. **Test out-of-sample.** `analysis/validation.py` runs walk-forward validation
+   with an embargo: fit on earlier data, test on later data you never looked at,
+   with a gap between the two so information cannot leak backwards.
+4. **Correct for how much you searched.** The same module computes the *deflated
+   Sharpe ratio* — Sharpe is return per unit of risk, and the deflated version
+   asks how good the best of N attempts would look **by luck alone**.
+
+**Tune freely, but judge the result at step 4, not at step 2.** For calibration:
+a sweep of 48 exit-parameter combinations on the bundled strategy found none
+profitable, and across roughly 384 variants the luckiest-by-chance result would
+score about **+3.0** while the best actually observed scored **+0.09**. A number
+that looks good after enough attempts usually isn't one.
+
+That is the honest offer here: not a profitable strategy, but a system that runs
+unattended and the means to find out whether what you feed it has an edge.
+
+---
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [Getting started](docs/GETTING-STARTED.md) | Setup from zero, provider signup, verification steps |
+| [Architecture](docs/ARCHITECTURE.md) | How the pieces fit together, and why |
+| [Algorithm](docs/algorithm.md) | Every filter and threshold, with the incident that motivated it |
+| [Providers](docs/PROVIDERS.md) | Contracts for adding your own data sources and brokers |
+| [Results](docs/RESULTS.md) | What the measurement tooling found, with the method and its limits |
+| [Database schema](docs/database_schema.md) | Tables, columns, and what each is for |
+| [API reference](docs/api_reference.md) | External API usage and quirks |
+| [Changelog](CHANGELOG.md) | Every change, why it was made, and the incident behind it |
+
+The changelog is worth reading on its own — it documents eighteen production
+incidents and their root causes, including several where a previous conclusion
+was overturned by later evidence.
+
+---
+
+## Contributing
+
+Contributions are welcome. Please read [`CONTRIBUTING.md`](CONTRIBUTING.md)
+first: it covers development setup, testing expectations (including mutation
+testing for critical paths), and the contributor licence agreement, which is
+signed automatically on your first pull request.
+
+Security issues should **not** be raised as public issues — see
+[`SECURITY.md`](SECURITY.md).
+
+---
+
+## Licence
+
+Licensed under the **Apache License, Version 2.0** — see [`LICENSE`](LICENSE)
+and [`NOTICE`](NOTICE).
+
+Copyright 2026 **ParallaxTech Ltd and the Tapewatch contributors**. Contributors
+keep the copyright in their own work — see [`CLA.md`](CLA.md).
+
+Maintained by ParallaxTech Ltd. If this is the kind of engineering you need,
+get in touch: `info@parallaxtech.co.uk`.

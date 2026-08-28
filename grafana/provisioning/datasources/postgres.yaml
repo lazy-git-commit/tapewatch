@@ -1,5 +1,9 @@
 apiVersion: 1
 
+# The database password is read from the environment, not stored here.
+# Grafana substitutes ${VAR} in provisioning files at load time, so export
+# GF_TRADER_DB_PASSWORD in Grafana's service environment before starting it.
+
 datasources:
   - name: trader-db
     uid: trader-postgres

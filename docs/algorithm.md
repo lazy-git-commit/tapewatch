@@ -1406,7 +1406,7 @@ WHERE severity = 'critical'
 ```
 
 The 2026-06-11 incident — a missing `TWELVEDATA_API_KEY` crash-looping the
-service for 18 hours unnoticed — is why the deploy workflow now (a) runs the
+service for 18 hours unnoticed — is why any deploy pipeline should (a) run the
 test suite first, (b) validates config on the VM **before** restarting the
 service, (c) health-checks the service after restart and fails the deploy
 loudly.
@@ -1538,7 +1538,7 @@ NYSE calendar (early closes shift the after-hours window with the close:
 > our plan lacks — every `prepost=true` request 403s — and Finnhub's free
 > quote freezes at the 16:00 ET close. No extended signal was ever
 > confirmable (0 of 18 trades all-time are non-`regular`), so
-> `.github/workflows/deploy.yml` now writes `AFTERHOURS_TRADING_ENABLED=false`
+> The code default for `AFTERHOURS_TRADING_ENABLED` is now `false`
 > (`PREMARKET_TRADING_ENABLED` was already off). `twelvedata_bars` still
 > latches the 403 on first sight (`extended_bars_available()`) as a
 > defense-in-depth backstop, independent of the config toggle. `EXTENDED_
@@ -1547,7 +1547,7 @@ NYSE calendar (early closes shift the after-hours window with the close:
 > `is_manage_session` manages a position that leaks into the session even
 > with entries off, see its docstring in `market/sessions.py`. See §7
 > "Extended-hours entitlement wall". Flip `AFTERHOURS_TRADING_ENABLED` back
-> to `true` in the deploy workflow once the plan covers prepost data.
+> to `true` only once your bars provider actually returns prepost data.
 
 Session policy:
 

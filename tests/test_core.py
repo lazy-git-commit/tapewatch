@@ -1,3 +1,19 @@
+# Licensed to ParallaxTech Ltd under one or more contributor licence
+# agreements. See the NOTICE file distributed with this work for additional
+# information regarding copyright ownership.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 tests/test_core.py
 ───────────────────
@@ -3432,40 +3448,54 @@ class TestPrepostCapabilityLatch:
         assert td.extended_bars_available() is True
 
 
-class TestDeployWorkflowAfterhoursDisabled:
-    """v21.6 follow-up: AFTERHOURS_TRADING_ENABLED must ship OFF.
+class TestShippedDefaultsAreSafe:
+    """The code defaults ARE the shipped configuration.
 
-    Nothing on the VM reads config/settings.py's Python default — the deploy
-    workflow rewrites .env from a hardcoded block on every push (see the
-    "Write .env" step in deploy.yml), so that block IS production config.
-    Twelvedata has no pre/post-market data on our plan (every prepost=true
-    request 403s) and Finnhub's quote freezes at the close, so no after-hours
-    signal has ever been confirmable; leaving this flag on again would
-    silently resurrect the no-quote-blackout damage from 2026-07-27 (CDNS,
-    SANM, CLS and six more liquid names blacklisted for reporting after the
-    bell) the moment the entitlement wall is fixed by other means.
+    These were previously asserted against a deployment workflow that pinned
+    every value, so the Python defaults could drift unnoticed — and they did.
+    With no deployment pipeline in this repository, whatever
+    `config/settings.py` says is what a fresh clone runs, so the safety
+    properties are asserted directly against it.
     """
 
-    def _env_block(self) -> str:
-        import pathlib
-        path = pathlib.Path(__file__).resolve().parent.parent / ".github" / "workflows" / "deploy.yml"
-        return path.read_text(encoding="utf-8")
+    def _fresh(self, monkeypatch):
+        """A Settings built as if no environment variables were set at all."""
+        for key in (
+            "AFTERHOURS_TRADING_ENABLED",
+            "EXTENDED_HOURS_ENABLED",
+            "PREMARKET_TRADING_ENABLED",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        from config.settings import Settings
+        return Settings()
 
-    def test_afterhours_trading_disabled(self):
-        assert "AFTERHOURS_TRADING_ENABLED=false" in self._env_block()
-        assert "AFTERHOURS_TRADING_ENABLED=true" not in self._env_block()
+    def test_afterhours_trading_ships_disabled(self, monkeypatch):
+        # Extended-hours bars are a paid entitlement on most plans; a provider
+        # without them cannot confirm an after-hours signal at all. Worse, the
+        # resulting no-quote misses can be mistaken for "this ticker has no
+        # coverage" and blacklist it for the session — nine liquid large/mid
+        # caps were suppressed that way on 2026-07-27, purely for reporting
+        # after the bell.
+        assert self._fresh(monkeypatch).afterhours_trading_enabled is False
 
-    def test_extended_hours_master_switch_stays_on(self):
-        # Management of any position that leaks into an extended session must
-        # not be disabled along with entries — see is_manage_session's
-        # docstring in market/sessions.py for why the master switch and the
-        # entry toggle are intentionally decoupled.
-        assert "EXTENDED_HOURS_ENABLED=true" in self._env_block()
+    def test_extended_hours_master_switch_stays_on(self, monkeypatch):
+        # Management of a position that leaks into an extended session must not
+        # be disabled along with entries — see is_manage_session's docstring in
+        # market/sessions.py for why the master switch and the entry toggle are
+        # intentionally decoupled. Turning entries off must never mean a live
+        # position stops being watched.
+        assert self._fresh(monkeypatch).extended_hours_enabled is True
 
-    def test_premarket_trading_still_disabled(self):
-        # Unrelated to this incident, but a silent flip here would be just as
-        # invisible — assert the known-good default explicitly.
-        assert "PREMARKET_TRADING_ENABLED=false" in self._env_block()
+    def test_premarket_trading_ships_disabled(self, monkeypatch):
+        # Thin 5am books and wide spreads. The pre-market scanner plus the
+        # at-open gap-and-go evaluation is the deliberate pre-market strategy;
+        # it trades the same news with confirmation.
+        assert self._fresh(monkeypatch).premarket_trading_enabled is False
+
+    def test_trading_mode_ships_as_demo(self, monkeypatch):
+        monkeypatch.delenv("TRADING_MODE", raising=False)
+        from config.settings import Settings
+        assert Settings().is_live is False
 
 
 class TestOpeningBlockTransient:

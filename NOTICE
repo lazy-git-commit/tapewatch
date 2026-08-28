@@ -1,0 +1,100 @@
+Tapewatch
+Copyright 2026 ParallaxTech Ltd and the Tapewatch contributors
+
+This product is maintained and distributed by ParallaxTech Ltd.
+
+Copyright in this work is held by ParallaxTech Ltd together with the
+individual contributors who wrote it. Contributors retain the copyright in
+their own contributions and license them to ParallaxTech Ltd and to every
+recipient under the Contributor Licence Agreement in CLA.md; where a
+contributor has instead assigned their rights in writing, those rights are
+held by ParallaxTech Ltd. Individual source files therefore carry no
+per-file copyright line, following the practice of the Apache Software
+Foundation: ownership is recorded here, not repeated in every file where it
+would fall out of date.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+
+================================================================================
+THIRD-PARTY COMPONENTS
+================================================================================
+
+This software depends on the following third-party packages. Each remains
+subject to its own licence; none is redistributed as part of this repository.
+
+  requests                  Apache License 2.0
+  anthropic                 MIT License
+  openai                    Apache License 2.0
+  yfinance                  Apache License 2.0
+  pandas                    BSD 3-Clause License
+  numpy                     BSD 3-Clause License
+  pandas_market_calendars   MIT License
+  APScheduler               MIT License
+  python-dotenv             BSD 3-Clause License
+  pytz                      MIT License
+
+  psycopg2-binary           GNU Lesser General Public License v3 (LGPL-3.0),
+                            with the linking exception granted by the psycopg
+                            authors. This project uses psycopg2 solely as an
+                            imported library through its published Python API
+                            and does not modify or statically link it, which the
+                            exception expressly permits. No psycopg2 source is
+                            redistributed here.
+
+Full licence texts are available from each project's own distribution.
+
+
+================================================================================
+TRADEMARKS
+================================================================================
+
+This software integrates with third-party services. The following names are the
+trademarks or registered trademarks of their respective owners, and are used
+here solely to describe interoperability:
+
+  Trading 212        Trading 212 UK Ltd / Trading 212 Markets Ltd
+  Benzinga           Benzinga
+  Finnhub            Finnhub
+  Twelve Data        Twelve Data
+  Claude, Anthropic  Anthropic PBC
+  Qwen, Alibaba      Alibaba Group
+  Grafana            Raintank, Inc. d/b/a Grafana Labs
+  PostgreSQL         The PostgreSQL Global Development Group
+
+No affiliation with, sponsorship by, or endorsement from any of these
+organisations is claimed or implied. Use of their services through this software
+is subject to their own terms, which you are responsible for reading and
+complying with.
+
+
+================================================================================
+MARKET DATA
+================================================================================
+
+This repository contains NO market data. It contains client code that calls
+third-party APIs using credentials you supply. Any data those services return
+to you remains subject to your agreement with that provider, including any
+restriction on redistribution.
+
+
+================================================================================
+NOT INVESTMENT ADVICE
+================================================================================
+
+This software is published for research and educational purposes. It is not
+investment advice, and nothing in this repository is a recommendation to buy or
+sell any security. No representation is made that it is profitable; the
+maintainers' own measurements are published in docs/RESULTS.md and are negative.
+
+Trading involves risk of loss. See the disclaimer in README.md and the warranty
+and liability provisions in LICENSE.

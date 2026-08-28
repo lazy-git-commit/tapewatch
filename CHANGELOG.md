@@ -7,6 +7,58 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## Public release — 2026-08-28 (the defaults become the configuration)
+
+Published as open source under Apache 2.0. No algorithm change, but one
+**default changed**, and the reason is worth recording because it is a class of
+bug rather than a one-off.
+
+### The deployment file was the real configuration
+
+Production config used to be written by a deployment workflow that pinned every
+setting on each push. Nothing ever read the Python defaults in
+`config/settings.py`, so they were free to drift — and they had:
+
+| Setting | Python default | What production ran |
+|---|---|---|
+| `AFTERHOURS_TRADING_ENABLED` | `true` | `false` |
+| `TIME_STOP_MINUTES` | `60` | `120` |
+
+That workflow is not part of this repository — it described one specific private
+deployment. **With it gone, the Python defaults ARE the shipped configuration.**
+
+`AFTERHOURS_TRADING_ENABLED` now defaults to `false`, because shipping it on was
+a genuine hazard: extended-hours bars are a paid entitlement on most market-data
+plans, so an after-hours signal is usually not confirmable at all. The resulting
+no-quote misses can then be mistaken for "this ticker has no coverage" and
+suppress it for the session — nine liquid large/mid caps were blacklisted that
+way on 2026-07-27, purely for reporting after the bell.
+
+`TIME_STOP_MINUTES` was deliberately **left at 60**. 120 is the measured value
+(v21.8) and `.env.example` carries it, but the two horizon knobs are coupled by
+design: `ENTRY_CUTOFF_MINUTES` falls back to the hold when unset, so raising the
+hold in code would ALSO have stopped entries an hour earlier in the day — the
+window collapse v21.3 exists to prevent. Changing one without the other is worse
+than changing neither, and the hold is a strategy parameter, not a safety
+property. It belongs in the operator's `.env`, which documents it.
+
+`TestShippedDefaultsAreSafe` now asserts the session toggles and `TRADING_MODE`
+against `Settings` directly rather than against a deployment file that no longer
+exists. Mutation-tested: 4 mutations, 4 caught.
+
+The general lesson: *a default that is always overridden is never tested.* When
+the thing doing the overriding goes away, every one of those defaults ships.
+
+### Also in this release
+
+- The Grafana datasource password now reads from the environment
+  (`GF_TRADER_DB_PASSWORD`) instead of being committed.
+- Licence headers follow the Apache Software Foundation convention and carry no
+  per-file copyright line; ownership is recorded once in `NOTICE`.
+- `pandas-ta` dropped from `requirements.txt` — imported nowhere.
+
+---
+
 ## v21.19 — 2026-08-26 (one event, one trade; and a retry that survives a throttle)
 
 Two defects fired together and killed every signal of the day.

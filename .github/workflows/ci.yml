@@ -1,0 +1,51 @@
+name: CI
+
+# Public CI: runs the full test suite on every push and pull request.
+# Deliberately separate from deploy.yml so that forks and outside contributors
+# get a working pipeline that has no access to any deployment credential.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      # The suite is fully mocked — no API keys, no database, no network.
+      # If this ever needs a credential, that is a bug in the test, not here.
+      - name: Run test suite
+        run: pytest tests/ -q
+
+  lint:
+    name: Syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile all sources
+        run: python -m compileall -q . -x '\.venv|__pycache__'
