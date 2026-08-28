@@ -20,7 +20,7 @@ pandas_market_calendars==5.4.0
 APScheduler==3.10.4
 
 # Storage
-psycopg2-binary==2.9.10
+psycopg2-binary==2.9.12
 
 # Utilities
 python-dotenv==1.0.1
