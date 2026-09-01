@@ -135,10 +135,35 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.VM_SSH_KEY }}
 
+      # Retried: the runner joined the private network moments ago and route
+      # propagation is not instantaneous.
+      #
+      # stderr is deliberately NOT suppressed. VM_HOST is a registered secret,
+      # so GitHub masks it in the log wherever it appears — hiding the error
+      # buys no privacy and costs the only diagnostic this step produces.
       - name: Add host to known_hosts
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -H "${VM_HOST}" >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 700 ~/.ssh
+          for attempt in 1 2 3 4 5; do
+            # A non-zero exit is not the only failure mode: ssh-keyscan can
+            # succeed having collected nothing, which would append an empty
+            # entry and fail later at the actual connection.
+            if ssh-keyscan -T 10 -H "${VM_HOST}" > /tmp/hostkey && [ -s /tmp/hostkey ]; then
+              cat /tmp/hostkey >> ~/.ssh/known_hosts
+              echo "Host key collected on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Attempt ${attempt}: no host key yet, retrying in 5s."
+            sleep 5
+          done
+          echo "::error::Could not reach the host on port 22 after 5 attempts. \
+          Check: (1) TAILSCALE_TAG matches a tag that exists in the network \
+          policy's tagOwners AND has an ACL rule permitting it to reach the \
+          host on 22; (2) VM_HOST is the address reachable from inside the \
+          private network, not the public one, which is firewalled; (3) the \
+          host is online."
+          exit 1
 
       - name: Upload code
         run: |
