@@ -51,25 +51,45 @@ fi
 systemctl reload postgresql
 
 # ── 3. Role and database (idempotent) ─────────────────────────────────────────
-# Values are passed as psql parameters rather than interpolated into the SQL
-# string, so a password containing a quote cannot break or alter the statement.
+# Values are passed as psql variables rather than pasted into the SQL text, so a
+# password containing a quote cannot terminate the literal and alter the
+# statement. :'x' interpolates as a quoted literal, :"x" as a quoted identifier.
+#
+# Every statement is fed through STDIN, never `psql -c`. The -c form requires a
+# string "completely parsable by the server" and deliberately performs no
+# psql-side interpolation, so :"role" reaches PostgreSQL verbatim and fails with
+# `syntax error at or near ":"`. Interpolation happens only for input read from
+# stdin or a file.
 cd /tmp
-if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER}'" | grep -q 1; then
-  sudo -u postgres psql -v ON_ERROR_STOP=1 \
-    -v role="${DB_USER}" -v pw="${DB_PASSWORD}" \
-    -c "CREATE ROLE :\"role\" WITH LOGIN PASSWORD :'pw';"
+
+role_exists=$(sudo -u postgres psql -tA -v role="${DB_USER}" << 'SQL'
+SELECT 1 FROM pg_roles WHERE rolname = :'role';
+SQL
+)
+
+if [ -z "${role_exists}" ]; then
+  sudo -u postgres psql -v ON_ERROR_STOP=1 -v role="${DB_USER}" -v pw="${DB_PASSWORD}" << 'SQL'
+CREATE ROLE :"role" WITH LOGIN PASSWORD :'pw';
+SQL
 else
-  # Keep the role's password in step with the secret, so rotating the secret
-  # is sufficient — no manual step on the host.
-  sudo -u postgres psql -v ON_ERROR_STOP=1 \
-    -v role="${DB_USER}" -v pw="${DB_PASSWORD}" \
-    -c "ALTER ROLE :\"role\" WITH LOGIN PASSWORD :'pw';"
+  # Keep the role's password in step with the secret, so rotating the secret is
+  # sufficient — no manual step on the host.
+  sudo -u postgres psql -v ON_ERROR_STOP=1 -v role="${DB_USER}" -v pw="${DB_PASSWORD}" << 'SQL'
+ALTER ROLE :"role" WITH LOGIN PASSWORD :'pw';
+SQL
 fi
 
-if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'" | grep -q 1; then
-  sudo -u postgres psql -v ON_ERROR_STOP=1 \
-    -v db="${DB_NAME}" -v owner="${DB_USER}" \
-    -c "CREATE DATABASE :\"db\" OWNER :\"owner\";"
+db_exists=$(sudo -u postgres psql -tA -v db="${DB_NAME}" << 'SQL'
+SELECT 1 FROM pg_database WHERE datname = :'db';
+SQL
+)
+
+if [ -z "${db_exists}" ]; then
+  # CREATE DATABASE cannot run inside a transaction block, so it gets its own
+  # invocation rather than being grouped with anything above.
+  sudo -u postgres psql -v ON_ERROR_STOP=1 -v db="${DB_NAME}" -v owner="${DB_USER}" << 'SQL'
+CREATE DATABASE :"db" OWNER :"owner";
+SQL
 fi
 
 # ── 4. Grafana ────────────────────────────────────────────────────────────────

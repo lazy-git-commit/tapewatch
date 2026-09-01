@@ -387,6 +387,30 @@ jobs:
           scp -q /tmp/rendered.service \
             "${VM_USER}@${VM_HOST}:/etc/systemd/system/${SERVICE_NAME}.service"
 
+      # Runs BEFORE the service restart, deliberately.
+      #
+      # This step rotates the database role's password to match DB_PASSWORD, and
+      # the .env written earlier already carries that same value. Restarting the
+      # service first would hand it a credential the database does not yet have
+      # — and if this step then failed, the deploy would end with a running
+      # service that cannot reach its database. That is exactly what happened on
+      # 2026-09-01, and the health check never saw it because a failure here
+      # skips it.
+      - name: Provision Grafana and the database
+        env:
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+        run: |
+          ssh -T "${VM_USER}@${VM_HOST}" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' \
+             DB_NAME='${DB_NAME}' \
+             DB_USER='${DB_USER}' \
+             DB_PASSWORD='${DB_PASSWORD}' \
+             GRAFANA_ADMIN_PASSWORD='${GRAFANA_ADMIN_PASSWORD}' \
+             bash ${DEPLOY_PATH}/deploy/grafana.sh"
+
       - name: Install dependencies, validate config, restart service
         run: |
           ssh -T "${VM_USER}@${VM_HOST}" \
@@ -412,21 +436,6 @@ jobs:
           systemctl enable "${SERVICE_NAME}"
           systemctl restart "${SERVICE_NAME}"
           EOF
-
-      - name: Provision Grafana and the database
-        env:
-          DB_NAME: ${{ secrets.DB_NAME }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
-        run: |
-          ssh -T "${VM_USER}@${VM_HOST}" \
-            "DEPLOY_PATH='${DEPLOY_PATH}' \
-             DB_NAME='${DB_NAME}' \
-             DB_USER='${DB_USER}' \
-             DB_PASSWORD='${DB_PASSWORD}' \
-             GRAFANA_ADMIN_PASSWORD='${GRAFANA_ADMIN_PASSWORD}' \
-             bash ${DEPLOY_PATH}/deploy/grafana.sh"
 
       # The service can start and then die on its first real work. Wait, then
       # verify it is alive and not throwing tracebacks.
