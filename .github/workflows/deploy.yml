@@ -130,10 +130,38 @@ jobs:
           tags: ${{ secrets.TAILSCALE_TAG }}
           args: --ssh --accept-routes
 
+      # Loads the deploy key silently.
+      #
+      # webfactory/ssh-agent is the usual choice here, but it prints
+      # "Identity added: <path> (<comment>)", and an SSH key comment is
+      # conventionally user@host — which would publish the identifiers every
+      # other part of this workflow keeps behind secrets. Its
+      # `log-public-key: false` input hides the public key but not that line,
+      # and an action's output cannot be redirected, so the agent is started
+      # here instead.
+      #
+      # The key is piped straight into ssh-add and never written to disk. CR
+      # characters are stripped: a key pasted from a Windows editor carries
+      # CRLF endings, which ssh-add rejects with an error that says only
+      # "error loading key".
       - name: Set up SSH
-        uses: webfactory/ssh-agent@v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.VM_SSH_KEY }}
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          eval "$(ssh-agent -s)" > /dev/null 2>&1
+          if ! printf '%s\n' "${SSH_PRIVATE_KEY}" | tr -d '\r' | ssh-add - > /dev/null 2>&1; then
+            echo "::error::Could not load the deploy key. Check that VM_SSH_KEY \
+            holds a complete private key including its BEGIN and END lines, and \
+            that it is not passphrase-protected."
+            exit 1
+          fi
+          # The agent's socket lives in this step's shell only; later steps get
+          # it through the environment file.
+          echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}" >> "${GITHUB_ENV}"
+          echo "SSH_AGENT_PID=${SSH_AGENT_PID}" >> "${GITHUB_ENV}"
+          echo "Deploy key loaded."
 
       # Retried: the runner joined the private network moments ago and route
       # propagation is not instantaneous.
