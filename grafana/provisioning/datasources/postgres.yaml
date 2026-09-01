@@ -1,8 +1,9 @@
 apiVersion: 1
 
-# The database password is read from the environment, not stored here.
-# Grafana substitutes ${VAR} in provisioning files at load time, so export
-# GF_TRADER_DB_PASSWORD in Grafana's service environment before starting it.
+# The database name, user and password are read from the environment rather
+# than committed. Grafana substitutes ${VAR} in provisioning files at load
+# time; deploy/grafana.sh writes them into a systemd drop-in for
+# grafana-server from the deployment secrets.
 
 datasources:
   - name: trader-db
@@ -10,8 +11,8 @@ datasources:
     type: postgres
     access: proxy
     url: localhost:5432
-    user: trader
-    database: momentum_trader
+    user: ${GF_TRADER_DB_USER}
+    database: ${GF_TRADER_DB_NAME}
     isDefault: true
     jsonData:
       sslmode: disable

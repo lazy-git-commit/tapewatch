@@ -108,12 +108,25 @@ Logs go to stdout (captured by systemd journald on the VM). Each module uses `lo
 
 ### Deployment
 
-This repository ships **no deployment pipeline**. How you run the service is
-yours to decide — a systemd unit on a small VM is what it was developed
-against, and `docs/GETTING-STARTED.md` covers running it directly.
+Deploy by pushing to `main` — `.github/workflows/deploy.yml` gates on the test
+suite, then rsyncs to the host and restarts the service. **Never SSH and change
+files directly**; the next deploy overwrites them. Read-only SSH for diagnostics
+is fine.
 
-If you do automate a deploy, keep every credential in your platform's secret
-store and write the `.env` on the target at deploy time; never commit one.
+Every host identifier — hostname, user, install path, unit name, network tag,
+database name and credentials — comes from GitHub Actions secrets, so nothing in
+this repository names a host. This is as much about the LOGS as the YAML:
+GitHub redacts registered secret values from Actions output, which is what keeps
+the install path and unit name out of a public log when the health check dumps
+the journal on failure. Values *derived* from a secret are not masked — register
+them with `::add-mask::` first.
+
+There is deliberately no `DB_URL` secret; it is assembled from its parts at
+deploy time so the role password, the Grafana datasource and the application's
+connection string cannot drift apart. Rotate the database password by changing
+`DB_PASSWORD` and redeploying.
+
+See `deploy/README.md` for the full secret list and the order of operations.
 
 ### Test classes
 

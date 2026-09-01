@@ -1,0 +1,401 @@
+name: Deploy
+
+# Deploys this repository to a private host.
+#
+# ── Why every host detail is a secret ────────────────────────────────────────
+# This repository is intended to be public. Two consequences drive the design:
+#
+#   1. The workflow file is world-readable, so it may contain no hostname,
+#      username, install path, unit name, network tag, database name or
+#      credential. Every one of those arrives through `secrets`.
+#   2. Actions LOGS are world-readable too. GitHub automatically redacts
+#      registered secret values wherever they appear in log output — including
+#      inside rsync output, journalctl excerpts and error messages. Registering
+#      the install path and service name as secrets is therefore not paranoia
+#      about the YAML; it is what keeps them out of the logs.
+#
+# Values derived from secrets are NOT masked. Never echo a computed path, a
+# resolved IP, or a command that embeds one.
+#
+# ── Triggers ─────────────────────────────────────────────────────────────────
+# `push` to main and manual dispatch only. Never `pull_request_target`, and
+# never any trigger a fork can influence — those run with repository secrets in
+# scope, and a pull request can modify the workflow that consumes them.
+#
+# workflow_dispatch exists because on 2026-08-07 a push landed on main and
+# GitHub created no workflow run at all. With a push-only trigger there was no
+# way to retry short of fabricating a commit.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Two deploys rsyncing the same directory and restarting the same unit will
+# interleave. Queue them instead, and never cancel one midway: a cancelled
+# deploy can leave the host with new code and an old service.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Test gate ────────────────────────────────────────────────────────────
+  # Nothing reaches the host unless the suite passes. Added after 2026-06-11,
+  # when a deploy with a missing environment variable crash-looped the service
+  # for 18 hours unnoticed.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Run test suite
+        run: pytest tests/ -q
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    # Set an environment protection rule on `production` in repository settings
+    # to require manual approval before any deploy reaches the host.
+    environment: production
+
+    env:
+      VM_HOST: ${{ secrets.VM_HOST }}
+      VM_USER: ${{ secrets.VM_USER }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+      SERVICE_NAME: ${{ secrets.SERVICE_NAME }}
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Verify required secrets are present
+        # A missing secret expands to an empty string, which turns
+        # `user@host` into `@host` and `rm -rf $PATH/x` into something far
+        # worse. Fail loudly here instead of discovering it mid-deploy.
+        env:
+          REQUIRED: ${{ join(fromJSON('["VM_HOST","VM_USER","DEPLOY_PATH","SERVICE_NAME"]'), ' ') }}
+          TS_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          TS_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
+          TS_TAG: ${{ secrets.TAILSCALE_TAG }}
+          SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+        run: |
+          missing=""
+          for name in VM_HOST VM_USER DEPLOY_PATH SERVICE_NAME TS_ID TS_SECRET TS_TAG \
+                      SSH_KEY DB_NAME DB_USER DB_PASSWORD GRAFANA_ADMIN_PASSWORD; do
+            [ -n "${!name}" ] || missing="${missing} ${name}"
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::Missing required secret(s):${missing}"
+            exit 1
+          fi
+          case "${DEPLOY_PATH}" in
+            /*/*) : ;;
+            *) echo "::error::DEPLOY_PATH must be an absolute path at least two levels deep"; exit 1 ;;
+          esac
+          echo "All required secrets present."
+
+      # Joins the runner to the private network so it can reach the host.
+      #
+      # An OAuth client, not a plain auth key (changed 2026-08-11). Auth keys
+      # expire after at most 90 days, and when one did, the deploy failed in the
+      # most misleading way available: the push succeeded, the workflow ran, and
+      # it died here — before any file transfer — so the host silently kept
+      # serving the previous build while two commits sat on GitHub looking
+      # deployed.
+      #
+      # An OAuth client does not expire. The action exchanges it for a
+      # short-lived ephemeral key per run, which is why a tag is mandatory: the
+      # runner joins as a tagged machine rather than as a user, so the tag must
+      # exist in the network policy and be permitted to reach the host on 22.
+      # The tag lands on the CI RUNNER, not on the host.
+      - name: Join private network
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
+          tags: ${{ secrets.TAILSCALE_TAG }}
+          args: --ssh --accept-routes
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.VM_SSH_KEY }}
+
+      - name: Add host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${VM_HOST}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Upload code
+        run: |
+          rsync -az --delete \
+            --exclude='.git' \
+            --exclude='.venv' \
+            --exclude='*.pyc' \
+            --exclude='__pycache__' \
+            --exclude='trader.db' \
+            --exclude='trader.log' \
+            ./ "${VM_USER}@${VM_HOST}:${DEPLOY_PATH}/"
+
+      # CONTRACT: every setting in config/settings.py must be represented here
+      # and in .env.example. A required key missing from this block is a
+      # startup crash-loop on the host.
+      #
+      # The unquoted heredoc is deliberate — expansion happens on the RUNNER, so
+      # the secrets are substituted before the text is streamed over ssh. It is
+      # written to a private temporary file first and moved into place, so a
+      # failed transfer cannot leave a half-written .env that the service then
+      # loads.
+      - name: Write .env
+        env:
+          TRADING212_API_KEY: ${{ secrets.TRADING212_API_KEY }}
+          TRADING212_API_KEY_ID: ${{ secrets.TRADING212_API_KEY_ID }}
+          TRADING212_DEMO_API_KEY: ${{ secrets.TRADING212_DEMO_API_KEY }}
+          TRADING212_DEMO_API_KEY_ID: ${{ secrets.TRADING212_DEMO_API_KEY_ID }}
+          MASSIVE_BENZINGA_API_KEY: ${{ secrets.MASSIVE_BENZINGA_API_KEY }}
+          FINNHUBIO_API_KEY: ${{ secrets.FINNHUBIO_API_KEY }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Qwen (Alibaba Model Studio) — OPTIONAL. Shadow mode scores every
+          # Claude batch in parallel, fire-and-forget, for provider comparison;
+          # Claude still makes every trading decision. Unset means "no shadow
+          # data" — cfg.validate() must never require it, or a missing secret
+          # would crash-loop the service.
+          QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
+          QWEN_BASE_URL: ${{ secrets.QWEN_BASE_URL }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+        run: |
+          # The connection string is BUILT from its parts rather than stored as
+          # a separate secret. Storing both invites them to drift: rotating the
+          # role password without editing the URL leaves the service unable to
+          # connect, and the failure surfaces as a crash-loop on the host rather
+          # than as a failed deploy. One secret now drives the role password,
+          # the Grafana datasource and this URL together.
+          #
+          # Percent-encoded, because a password containing @ : / or # would
+          # otherwise silently parse into a different host and database.
+          # Written as `python3 -c` rather than a heredoc on purpose: this block
+          # is indented by YAML, and an unquoted-delimiter heredoc preserves
+          # that indentation, which is fatal to Python but harmless to the .env
+          # heredoc below (dotenv and systemd both strip leading whitespace).
+          DB_URL="$(python3 -c 'import os, urllib.parse as u; print("postgresql://%s:%s@%s:%s/%s" % (u.quote(os.environ["DB_USER"], safe=""), u.quote(os.environ["DB_PASSWORD"], safe=""), os.environ.get("DB_HOST") or "localhost", os.environ.get("DB_PORT") or "5432", os.environ["DB_NAME"]))')"
+          # Values DERIVED from secrets are not masked automatically. Register
+          # this one, so it cannot reach a public log through any later command.
+          echo "::add-mask::${DB_URL}"
+
+          ssh -T "${VM_USER}@${VM_HOST}" "umask 077 && cat > ${DEPLOY_PATH}/.env.tmp" << EOF
+          TRADING212_API_KEY=${TRADING212_API_KEY}
+          TRADING212_API_KEY_ID=${TRADING212_API_KEY_ID}
+          TRADING212_DEMO_API_KEY=${TRADING212_DEMO_API_KEY}
+          TRADING212_DEMO_API_KEY_ID=${TRADING212_DEMO_API_KEY_ID}
+          MASSIVE_BENZINGA_API_KEY=${MASSIVE_BENZINGA_API_KEY}
+          FINNHUBIO_API_KEY=${FINNHUBIO_API_KEY}
+          TWELVEDATA_API_KEY=${TWELVEDATA_API_KEY}
+          ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+          QWEN_API_KEY=${QWEN_API_KEY}
+          QWEN_BASE_URL=${QWEN_BASE_URL}
+          DB_URL=${DB_URL}
+          TRADING_MODE=demo
+          BLOCKLIST=
+          MIN_SENTIMENT_CONFIDENCE=7
+          MIN_CATALYST_MAGNITUDE=2
+          MIN_PRICE_MOVE_PCT=0.2
+          MAX_PRICE_MOVE_PCT=15.0
+          REQUIRE_VWAP_CONFIRMATION=true
+          VWAP_TOLERANCE_PCT=0.1
+          MAX_VWAP_EXTENSION_PCT=1.5
+          REQUIRE_EXHAUSTION_CHECK=true
+          EXHAUSTION_MIN_RANGE_PCT=5.0
+          EXHAUSTION_RECOVERY_THRESHOLD=0.75
+          # v21.11 (2026-08-01): 25.0 -> 10.0. Calibrated on all 24 closed
+          # trades — 25% never bound on a real trade, while 10% blocks three
+          # losers and costs no winner.
+          MAX_DAY_MOVE_PCT=10.0
+          # Max age of the quote an ENTRY is decided on. Separate from the
+          # 20-min coverage staleness guard: on 2026-07-31 a signal was
+          # confirmed on a quote that honestly reported itself ~3 min old, and
+          # every gate agreed on a market that had already moved 1.1% lower.
+          MAX_ENTRY_QUOTE_AGE_SECONDS=90
+          MOMENTUM_LOOKBACK_MINUTES=5
+          MAX_DAY_DROP_PCT=3.0
+          MIN_DAILY_DOLLAR_VOLUME=5000000
+          MIN_RVOL=1.5
+          MAX_RVOL=20.0
+          RVOL_BYPASS_MIN_ADV_DOLLAR=50000000
+          MIN_STOCK_PRICE=5.0
+          MAX_SPREAD_PCT=3.0
+          OPEN_BLOCK_MINUTES=5
+          # v21.16: ranking classes by raw forward return asks "does the stock
+          # drift up?"; simulating the actual trade asks whether a trade
+          # survives to collect it. guidance_raise cleared that bar on the
+          # sampled measurement and fda_approval did not. Both are still scored
+          # and both still accrue forward returns.
+          TRADEABLE_CATALYSTS=guidance_raise
+          # v21.16: enter these classes at the signal instead of waiting for the
+          # momentum floor. The floor is a real filter, but the WAIT costs ~2% of
+          # entry price, which puts the -2% stop back at the price the news
+          # fired at. Only the FLOOR is skipped, and only on flat tape.
+          SKIP_MOMENTUM_CATALYSTS=guidance_raise
+          MAX_POSITION_SIZE_PCT=5.0
+          RISK_PER_TRADE_PCT=0.25
+          MAX_ADV_PARTICIPATION_PCT=0.5
+          MAX_OPEN_POSITIONS=8
+          MAX_TRADES_PER_DAY=10
+          MAX_DAILY_LOSS_PCT=2.0
+          TAKE_PROFIT_PCT=5.0
+          STOP_LOSS_PCT=2.0
+          # v21.8: the forward-return panel showed the edge still climbing at
+          # 120 min, so a 60-min hold was clipping the move mid-catalyst.
+          # ENTRY_CUTOFF_MINUTES is set explicitly to the OLD 60-min value so
+          # lengthening the hold does not also shrink the entry window.
+          TIME_STOP_MINUTES=120
+          ENTRY_CUTOFF_MINUTES=60
+          # v21.17: buy with a LIMIT at decision-price x (1 + slack), not at
+          # market. An unfilled limit re-queues the signal, it does not reject
+          # it — refusing a bad price must cost the fill, never the idea.
+          ENTRY_LIMIT_ENABLED=true
+          ENTRY_LIMIT_SLACK_PCT=0.4
+          # v21.17: MAX_DAILY_LOSS_PCT resets at midnight, so it cannot see a
+          # slow bleed — -1.9% a day forever never trips it. These cover the
+          # shapes the daily limit is blind to. Set MAX_DRAWDOWN_PCT=0 to
+          # disable.
+          MAX_DRAWDOWN_PCT=10.0
+          DRAWDOWN_LOOKBACK_DAYS=30
+          LOSS_STREAK_HALT=4
+          LOSS_STREAK_COOLDOWN_MINUTES=90
+          RESTING_STOP_ENABLED=true
+          RATCHET_TRIGGER_PCT=2.0
+          RATCHET_LOCK_PCT=0.1
+          # v21.18: we are not told when news appears, we ask — so an article
+          # published just after a poll waits the full interval and the AVERAGE
+          # wait is half of it. Only the FETCH runs at this cadence; the
+          # re-eval, retry and pre-market steps stay on 60s spacing so the
+          # fail-closed market-data quota is safe.
+          NEWS_CYCLE_SECONDS=10
+          MONITOR_INTERVAL_SECONDS=5
+          EOD_FLATTEN_MINUTES=10
+          SELL_LIMIT_SLACK_PCT=1.0
+          PREMARKET_ENABLED=true
+          PREMARKET_SCAN_START_ET=07:00
+          MIN_GAP_PCT=1.0
+          MAX_GAP_PCT=20.0
+          EXTENDED_HOURS_ENABLED=true
+          # After-hours ENTRIES off: the bars plan has no pre/post-market data
+          # (every prepost request 403s) and the free quote endpoint freezes at
+          # the close, so no after-hours signal has ever been confirmable.
+          # EXTENDED_HOURS_ENABLED stays true so any position that leaks into
+          # the session is still managed and flattened; only NEW entries stop.
+          AFTERHOURS_TRADING_ENABLED=false
+          PREMARKET_TRADING_ENABLED=false
+          EXTENDED_MIN_ADV_DOLLAR=50000000
+          EXTENDED_MIN_SESSION_DOLLAR_VOLUME=500000
+          EXTENDED_MAX_SPREAD_PCT=1.5
+          EXTENDED_SIZE_FACTOR=0.5
+          EXTENDED_FLATTEN_BUFFER_MINUTES=15
+          ZERO_TRADE_ALERT_SESSIONS=3
+          EOF
+          ssh -T "${VM_USER}@${VM_HOST}" \
+            "chmod 600 ${DEPLOY_PATH}/.env.tmp && mv ${DEPLOY_PATH}/.env.tmp ${DEPLOY_PATH}/.env"
+
+      - name: Write VERSION file
+        run: |
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "deployed_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "deployed_by=github-actions"
+          } > VERSION
+          rsync -az VERSION "${VM_USER}@${VM_HOST}:${DEPLOY_PATH}/VERSION"
+
+      # Rendered on the runner from a template that carries no real path or
+      # unit name, then copied into place.
+      - name: Render and install the service unit
+        run: |
+          sed -e "s|__DEPLOY_PATH__|${DEPLOY_PATH}|g" \
+              -e "s|__SERVICE_NAME__|${SERVICE_NAME}|g" \
+              deploy/service.template > /tmp/rendered.service
+          scp -q /tmp/rendered.service \
+            "${VM_USER}@${VM_HOST}:/etc/systemd/system/${SERVICE_NAME}.service"
+
+      - name: Install dependencies, validate config, restart service
+        run: |
+          ssh -T "${VM_USER}@${VM_HOST}" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' SERVICE_NAME='${SERVICE_NAME}' bash -s" << 'EOF'
+          set -euo pipefail
+
+          dnf install -y python3.12 unzip
+
+          cd "${DEPLOY_PATH}"
+
+          if [ ! -d .venv ]; then
+            python3.12 -m venv .venv
+          fi
+          .venv/bin/pip install -q --upgrade pip
+          .venv/bin/pip install -q -r requirements.txt
+
+          # Validate BEFORE touching the running service — a missing required
+          # variable fails the deploy here, loudly, instead of crash-looping the
+          # service (the 2026-06-11 incident).
+          .venv/bin/python -c "from config.settings import cfg; cfg.validate(); print('Config validation OK')"
+
+          systemctl daemon-reload
+          systemctl enable "${SERVICE_NAME}"
+          systemctl restart "${SERVICE_NAME}"
+          EOF
+
+      - name: Provision Grafana and the database
+        env:
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+        run: |
+          ssh -T "${VM_USER}@${VM_HOST}" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' \
+             DB_NAME='${DB_NAME}' \
+             DB_USER='${DB_USER}' \
+             DB_PASSWORD='${DB_PASSWORD}' \
+             GRAFANA_ADMIN_PASSWORD='${GRAFANA_ADMIN_PASSWORD}' \
+             bash ${DEPLOY_PATH}/deploy/grafana.sh"
+
+      # The service can start and then die on its first real work. Wait, then
+      # verify it is alive and not throwing tracebacks.
+      #
+      # journalctl output is echoed on failure. Every host identifier in it is a
+      # registered secret, so GitHub redacts it from the public log.
+      - name: Post-restart health check
+        run: |
+          ssh -T "${VM_USER}@${VM_HOST}" \
+            "SERVICE_NAME='${SERVICE_NAME}' bash -s" << 'EOF'
+          set -euo pipefail
+          sleep 25
+          if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
+            echo "::error::Service is NOT active after restart — recent logs:"
+            journalctl -u "${SERVICE_NAME}" -n 50 --no-pager
+            exit 1
+          fi
+          if journalctl -u "${SERVICE_NAME}" --since "40 seconds ago" --no-pager \
+               | grep -qiE "traceback|crash-?loop"; then
+            echo "::error::Service is active but logging tracebacks — recent logs:"
+            journalctl -u "${SERVICE_NAME}" -n 50 --no-pager
+            exit 1
+          fi
+          echo "Health check passed — service running cleanly."
+          EOF

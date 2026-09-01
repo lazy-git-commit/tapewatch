@@ -1,0 +1,30 @@
+# systemd unit TEMPLATE.
+#
+# Deliberately a template rather than a finished unit file: the service name
+# and install path are supplied from GitHub Actions secrets at deploy time, so
+# no real path or unit name is committed to this repository. The deploy
+# workflow renders this file on the runner and copies the result to
+# /etc/systemd/system/<service>.service on the target host.
+#
+# Placeholders substituted at deploy time:
+#   __SERVICE_NAME__  the systemd unit name
+#   __DEPLOY_PATH__   absolute install directory on the target host
+#
+# Restart=always rather than on-failure: on 2026-05-29 the scheduler died while
+# the process stayed alive, and the service ran for three days with no logs and
+# no trades. on-failure does not restart a hung-but-living process.
+
+[Unit]
+Description=__SERVICE_NAME__
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__DEPLOY_PATH__
+EnvironmentFile=__DEPLOY_PATH__/.env
+ExecStart=__DEPLOY_PATH__/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
