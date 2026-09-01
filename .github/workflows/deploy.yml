@@ -130,6 +130,30 @@ jobs:
           tags: ${{ secrets.TAILSCALE_TAG }}
           args: --ssh --accept-routes
 
+      # The step above reports success even when it has completely failed.
+      #
+      # On 2026-09-01 it logged five consecutive `backend error: invalid key:
+      # unable to validate API key` lines and still exited with
+      # `conclusion=success`. The runner was never on the network, and the run
+      # died three steps later at ssh-keyscan — which looked like a firewall or
+      # ACL problem and was nothing of the kind. Ninety seconds and two wrong
+      # diagnoses downstream of the actual cause.
+      #
+      # Assert the node is genuinely connected, here, where the error is
+      # actionable.
+      - name: Verify the private network is connected
+        run: |
+          state="$(tailscale status --json 2>/dev/null | jq -r '.BackendState // empty')"
+          if [ "${state}" != "Running" ]; then
+            echo "::error::Not connected to the private network (backend state: ${state:-unknown}). \
+            The join step reports success even when authentication fails, so read its log for \
+            'backend error'. Usual causes: the OAuth secret is not a tskey-client- value; the \
+            client id and secret come from different clients; the client was revoked; or the \
+            tag is absent from the network policy's tagOwners."
+            exit 1
+          fi
+          echo "Private network connected."
+
       # Loads the deploy key silently.
       #
       # webfactory/ssh-agent is the usual choice here, but it prints
