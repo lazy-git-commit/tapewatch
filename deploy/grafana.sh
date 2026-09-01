@@ -148,6 +148,32 @@ for _ in $(seq 1 20); do
   sleep 2
 done
 
+# Make GRAFANA_ADMIN_PASSWORD authoritative.
+#
+# Grafana keeps the admin password in its OWN database, and the value in the
+# config file is applied only when that database is first created. Setting the
+# secret therefore does nothing on an existing install, and the API call below
+# fails with 401 against a password Grafana has never held. Reset it explicitly
+# on every run, so rotating the secret is sufficient — the same property the
+# database role has above.
+#
+# Consequence worth knowing: a password changed in the Grafana UI is reverted by
+# the next deploy. The secret is the source of truth.
+if echo "${GRAFANA_ADMIN_PASSWORD}" \
+     | grafana-cli --homepath /usr/share/grafana \
+         admin reset-admin-password --password-from-stdin > /dev/null 2>&1; then
+  echo "Grafana admin password set."
+elif grafana-cli --homepath /usr/share/grafana \
+       admin reset-admin-password "${GRAFANA_ADMIN_PASSWORD}" > /dev/null 2>&1; then
+  # Older grafana-cli has no --password-from-stdin. The password is then visible
+  # in the process list for the moment the command runs, which is why this is
+  # the fallback and not the first choice.
+  echo "Grafana admin password set (legacy CLI form)."
+else
+  echo "::error::Could not set the Grafana admin password."
+  exit 1
+fi
+
 # The password reaches Python through the environment, never argv — a command
 # line is readable by any local user via /proc.
 DASHBOARD_PATH="${REPO_DIR}/dashboards/momentum_trader.json" \
