@@ -128,7 +128,11 @@ jobs:
           oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
           tags: ${{ secrets.TAILSCALE_TAG }}
-          args: --ssh --accept-routes
+          # --accept-routes is NOT passed here. The v4 action applies it
+          # itself, and passing it again fails the whole step with
+          # "invalid boolean flag accept-routes: flag provided multiple times".
+          # v3 did not, which is why this only broke on the v4 upgrade.
+          args: --ssh
 
       # The step above reports success even when it has completely failed.
       #
