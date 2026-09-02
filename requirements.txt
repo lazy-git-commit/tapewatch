@@ -7,7 +7,7 @@ requests==2.34.2
 # raises TypeError before any request — stopping the pipeline at its entry
 # point. Every test mocks the client, so CI cannot see it. See the note in
 # .github/dependabot.yml before changing this.
-anthropic==0.54.0
+anthropic==0.125.0
 
 # Offline classifier comparison only (analysis/qwen_eval.py). Alibaba Model
 # Studio speaks the OpenAI protocol, so the OpenAI SDK is the client for it.
