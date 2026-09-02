@@ -22,7 +22,7 @@ pandas_market_calendars==5.4.0
 # Order execution — Trading 212 REST API called directly via requests
 
 # Scheduling
-APScheduler==3.10.4
+APScheduler==3.11.3
 
 # Storage
 psycopg2-binary==2.9.12
