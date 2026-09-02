@@ -1,7 +1,12 @@
 # News ingestion
 requests==2.32.3
 
-# Sentiment classification
+# Sentiment classification.
+# PINNED BELOW 1.0.0 ON PURPOSE. anthropic 1.0.0 removed `temperature` from
+# messages.create and accepts no **kwargs, so news/fetcher.py's temperature=0
+# raises TypeError before any request — stopping the pipeline at its entry
+# point. Every test mocks the client, so CI cannot see it. See the note in
+# .github/dependabot.yml before changing this.
 anthropic==0.54.0
 
 # Offline classifier comparison only (analysis/qwen_eval.py). Alibaba Model

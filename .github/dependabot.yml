@@ -8,6 +8,27 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 5
     labels: ["dependencies"]
+    ignore:
+      # anthropic 1.0.0 removed `temperature` (and top_p/top_k) from
+      # messages.create, and the method takes no **kwargs to absorb it:
+      #
+      #   TypeError: Messages.create() got an unexpected keyword argument
+      #              'temperature'
+      #
+      # news/fetcher.py passes temperature=0 on every classification call, so
+      # the upgrade raises before any network request and stops the pipeline at
+      # its entry point. No test catches this — all 563 mock the client — so CI
+      # goes green on a change that breaks production.
+      #
+      # Removing the argument is not a fix either: temperature=0 is deliberate,
+      # because a classifier that samples disagrees with itself and the forward
+      # -return dataset depends on stable scoring.
+      #
+      # Lift this once the call is adapted (extra_body={"temperature": 0}, if
+      # the API still accepts it — verify with one live call) AND a test
+      # exercises the real client signature rather than a mock.
+      - dependency-name: "anthropic"
+        update-types: ["version-update:semver-major"]
 
   # Keep the Actions themselves current — a stale action is a supply-chain risk.
   - package-ecosystem: "github-actions"
