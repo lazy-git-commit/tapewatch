@@ -1,5 +1,5 @@
 # News ingestion
-requests==2.32.3
+requests==2.34.2
 
 # Sentiment classification.
 # PINNED BELOW 1.0.0 ON PURPOSE. anthropic 1.0.0 removed `temperature` from
