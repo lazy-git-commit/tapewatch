@@ -125,4 +125,13 @@ def _reset_process_level_state():
     import main as _main
     _main._slow_path_last_run.clear()
 
+    # Retry/re-eval queues (main.py) — a signal parked by one test (e.g. a
+    # data-outage or transient-rejection scenario) would otherwise be drained
+    # and evaluated for REAL by the next test that calls news_cycle(), hitting
+    # a live network/DB call with no mocks in scope for that signal. Found via
+    # TestIdleCycleLogging: a leaked GTES_US_EQ retry entry from an earlier
+    # test made an unrelated later test attempt a real DB connection.
+    _main._retry_queue.clear()
+    _main._reeval_queue.clear()
+
     yield

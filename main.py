@@ -417,6 +417,39 @@ def _slow_path_due(name: str,
     return True
 
 
+# ── Idle-cycle logging ───────────────────────────────────────────────────────
+# Outside an entry session the news cycle has nothing to do, and at the 10s
+# production cadence saying so every time is six lines a minute, all night,
+# every night. On the 2026-09-20 zero-trade investigation the two idle lines
+# ("News cycle starting" + "No entries in session=…") were 60,608 of the
+# 89,777 journal lines the host still held, and that churn had already evicted
+# everything from before 15 Sep — the evidence for a nine-session drought had
+# a four-day shelf life. (The host's journal was also RAM-backed; deploy.yml
+# now makes it persistent. Both halves were needed: retention buys days, this
+# buys the same days back tenfold.)
+#
+# So an idle REASON is announced once, when it begins, and again only when it
+# changes (closed → overnight → premarket → …). Every transition is still
+# timestamped, so nothing is lost but the repetition. A cycle that does work
+# clears the marker, so the next onset is announced again.
+_idle_reason: str | None = None
+
+
+def _note_idle(reason: str, message: str, *args) -> None:
+    """Log an idle cycle at INFO when its reason changes, DEBUG while it lasts."""
+    global _idle_reason
+    if reason != _idle_reason:
+        _idle_reason = reason
+        logger.info(message, *args)
+    else:
+        logger.debug(message, *args)
+
+
+def _clear_idle() -> None:
+    global _idle_reason
+    _idle_reason = None
+
+
 def _drain_retry_queue() -> list[NewsItem]:
     """Pop all unexpired retry entries; expired ones are dropped with a log."""
     now = datetime.now(timezone.utc)
@@ -1026,10 +1059,6 @@ def news_cycle() -> None:
     where a job replacing itself mid-execution is silently dropped.
     """
     cycle_start = datetime.now(pytz.timezone("Europe/London"))
-    logger.info(
-        "── News cycle starting [%s] ─────────────────────────────",
-        cycle_start.strftime("%H:%M:%S"),
-    )
 
     try:
         touch_heartbeat("news_cycle")
@@ -1060,17 +1089,29 @@ def news_cycle() -> None:
             logger.error("premarket_scan failed: %s", exc, exc_info=True)
 
     if not is_entry_session(session):
-        if session != "premarket":
-            logger.info("No entries in session=%s — skipping cycle", session)
+        _note_idle(
+            f"session={session}",
+            "No entries in session=%s — skipping cycles until the session changes",
+            session,
+        )
         return
 
     if is_too_late_to_buy(session):
-        logger.info(
+        _note_idle(
+            f"too_late:{session}",
             "Too close to the %s session's hard exit boundary to open new "
-            "positions (time_stop=%d min) — skipping cycle",
+            "positions (time_stop=%d min) — skipping cycles until the session changes",
             session, cfg.time_stop_minutes,
         )
         return
+
+    # Past the idle gates: this cycle does work, so it gets a banner and the
+    # next idle onset will be announced again.
+    _clear_idle()
+    logger.info(
+        "── News cycle starting [%s] ─────────────────────────────",
+        cycle_start.strftime("%H:%M:%S"),
+    )
 
     fetched_at = cycle_start.isoformat()
 

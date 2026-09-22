@@ -28,6 +28,7 @@ Unit tests for the most critical logic:
 Run with: pytest tests/
 """
 
+import logging
 import pytest
 import json
 import threading
@@ -5248,3 +5249,77 @@ class TestOrderStatusRetriesTransientFailure:
         mock_get.side_effect = requests.exceptions.Timeout("timeout")
         assert get_order_status("1") is None
         assert mock_get.call_count == 2
+
+
+class TestIdleCycleLogging:
+    """
+    Idle cycles announce their reason once, on transition, not every 10s.
+
+    On the 2026-09-20 zero-trade investigation the two per-cycle idle lines
+    were 60,608 of the 89,777 journal lines the host still held, and that
+    churn had evicted every line from before 15 Sep — the evidence for the
+    first five sessions of a nine-session drought was already gone. These
+    assert the shape that fixes it: one INFO line when an idle reason begins
+    or changes, DEBUG while it persists, and the marker cleared by a working
+    cycle so the next onset is announced again.
+    """
+
+    def setup_method(self):
+        import main
+        main._clear_idle()
+
+    @patch("main.touch_heartbeat")
+    @patch("main.get_trading_session", return_value="closed")
+    def test_same_idle_reason_logs_info_once_then_debug(self, _session, _hb, caplog):
+        import main
+        with caplog.at_level(logging.DEBUG, logger="main"):
+            main.news_cycle()
+            main.news_cycle()
+            main.news_cycle()
+        idle = [r for r in caplog.records if "No entries in session=closed" in r.getMessage()]
+        assert [r.levelno for r in idle] == [logging.INFO, logging.DEBUG, logging.DEBUG]
+
+    @patch("main.touch_heartbeat")
+    @patch("main.get_trading_session")
+    def test_changed_idle_reason_logs_info_again(self, mock_session, _hb, caplog):
+        import main
+        mock_session.side_effect = ["closed", "closed", "overnight", "overnight"]
+        with caplog.at_level(logging.DEBUG, logger="main"):
+            for _ in range(4):
+                main.news_cycle()
+        info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert sum("session=closed" in m for m in info) == 1
+        assert sum("session=overnight" in m for m in info) == 1
+
+    @patch("main.touch_heartbeat")
+    @patch("main.get_trading_session", return_value="closed")
+    def test_idle_cycles_emit_no_banner(self, _session, _hb, caplog):
+        # The banner is a delimiter between cycles that do work; an idle cycle
+        # has nothing to delimit, and at 6/min it was the single largest line
+        # in the journal.
+        import main
+        with caplog.at_level(logging.DEBUG, logger="main"):
+            main.news_cycle()
+        assert not any("News cycle starting" in r.getMessage() for r in caplog.records)
+
+    @patch("main.was_recently_traded", return_value=False)
+    @patch("main.evaluate_premarket_candidates", return_value=([], []))
+    @patch("main._risk_gates_pass", return_value=(True, ""))
+    @patch("main.is_too_late_to_buy", return_value=False)
+    @patch("main.get_trading_session")
+    @patch("main.touch_heartbeat")
+    def test_working_cycle_clears_marker_so_next_onset_is_announced(
+        self, _hb, mock_session, _late, _gates, _eval, _traded, caplog
+    ):
+        import main
+        mock_session.side_effect = ["closed", "regular", "closed"]
+        with caplog.at_level(logging.DEBUG, logger="main"), \
+             patch("main.fetch_all_news", return_value=[]):
+            main.news_cycle()   # idle → INFO
+            main.news_cycle()   # works → banner, clears marker
+            main.news_cycle()   # idle again → INFO again, not DEBUG
+        msgs = [(r.levelno, r.getMessage()) for r in caplog.records]
+        idle_info = [m for lvl, m in msgs if lvl == logging.INFO and "session=closed" in m]
+        banners = [m for lvl, m in msgs if "News cycle starting" in m]
+        assert len(idle_info) == 2
+        assert len(banners) == 1

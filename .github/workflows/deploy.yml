@@ -458,6 +458,33 @@ jobs:
              GRAFANA_ADMIN_PASSWORD='${GRAFANA_ADMIN_PASSWORD}' \
              bash ${DEPLOY_PATH}/deploy/grafana.sh"
 
+      # journald only writes to disk when /var/log/journal exists; otherwise it
+      # keeps a small ring buffer in /run (tmpfs, RAM) that is capped at a
+      # fraction of that filesystem and gone entirely on reboot. The host had
+      # never been given the directory, so its journal was ~75 MB of RAM —
+      # about four days of this service's output. On the 2026-09-20
+      # zero-trade investigation every line from before 15 Sep was already
+      # gone: nine sessions without a trade, and the log of the first five of
+      # them had a four-day shelf life. MaxRetentionSec=30day was set in
+      # journald.conf, but that only means anything once there is a disk to
+      # retain on.
+      #
+      # `systemd-tmpfiles --create` applies the ownership and ACLs journald
+      # expects on the directory; `--flush` moves what is currently in /run
+      # across so nothing is lost at the switch. Idempotent — a no-op once the
+      # directory is there.
+      - name: Make the journal persistent
+        run: |
+          ssh -T "${VM_USER}@${VM_HOST}" bash -s << 'EOF'
+          set -euo pipefail
+          if [ ! -d /var/log/journal ]; then
+            mkdir -p /var/log/journal
+            systemd-tmpfiles --create --prefix /var/log/journal
+            journalctl --flush
+            echo "Journal storage switched from volatile to persistent"
+          fi
+          EOF
+
       - name: Install dependencies, validate config, restart service
         run: |
           ssh -T "${VM_USER}@${VM_HOST}" \
