@@ -447,6 +447,15 @@ _CASH_CACHE_TTL_SECONDS = 15
 # scheduled jobs, it just declines to reuse an older answer.
 _CASH_CACHE_TTL_SIZING_SECONDS = 3
 _CASH_RETRY_BACKOFF_SECONDS = 2.0
+
+# Deliberately shorter than the 2.0s used for cash and order POSTs.
+# get_order_status() is called from the monitor's exit path, once per open
+# trade (throttled to 15s/trade). With MAX_OPEN_POSITIONS at 8, a broker-wide
+# outage would add this backoff once per trade being checked, and the monitor
+# runs on a 5s cadence — 2.0s could stack into overlapping cycles during
+# exactly the outage where exits matter most. 1.0s still absorbs the single
+# transient blip this exists for.
+_STATUS_RETRY_BACKOFF_SECONDS = 1.0
 _cash_lock = threading.Lock()
 _cash_cache: tuple[float, dict] | None = None
 
@@ -655,38 +664,74 @@ def get_order_status(order_id: str) -> str | None:
       None   — network/API error: status UNKNOWN. Callers must NOT treat
                None as filled — closing a DB trade on a transient timeout
                while the real position is still open would desync the book.
+
+    Retries ONCE on a transient failure, following the same rule as
+    `_post_order_with_retry` and `_fetch_cash`: a non-HTTP exception (timeout,
+    connection reset) or a retryable status (429/5xx). This is a GET and
+    therefore idempotent, so a retry cannot double-act.
+
+    Why the retry matters more here than the `None` contract suggests. `None`
+    means "the lookup failed", not "the order is absent", and callers correctly
+    refuse to infer a fill from it — but refusing to infer is not the same as
+    knowing, and the caller is left with a real broker state it cannot see. On
+    2026-09-08 a PM_US_EQ limit buy filled while this function returned None on
+    a single failed call; the caller then tried to cancel, the cancel failed
+    because the order had already filled, and `open_trade()` was never reached.
+    The position existed at the broker for 29 hours with no DB row, so nothing
+    managed it: no resting stop, no take-profit, no time stop, no EOD flatten.
+    One retry would very likely have resolved that same order to FILLED.
+
+    A 404 is NOT retried. It is a meaningful answer — "not live on the book" —
+    routed to the history lookup below, and `T212HTTPError.retryable` already
+    excludes it. Retrying it would only delay a correct result.
     """
-    try:
-        item = _get(f"/equity/orders/{order_id}")
-        return str(item.get("status", "")).upper() or None
-    except T212HTTPError as exc:
-        if exc.status_code == 404:
-            # Pending endpoint 404 means "not live on the book", but that can
-            # be a fill, cancellation, expiry, or history pagination miss. Check
-            # recent order history before making the caller infer too much.
-            try:
-                data = _get("/equity/history/orders?limit=50")
-                for item in data.get("items", []):
-                    order = item.get("order", {})
-                    if str(order.get("id") or item.get("id")) != str(order_id):
-                        continue
-                    status = str(order.get("status") or item.get("status") or "").upper()
-                    if "fill" in item or status == "FILLED":
-                        return "FILLED"
-                    if status:
-                        return status
-            except Exception as hist_exc:
-                logger.warning("get_order_status(%s): history lookup failed after 404: %s", order_id, hist_exc)
-                return None
-            return "GONE"
-        # Any other HTTP status (429, 403, 500...) is a real API failure, not
-        # proof the order is gone — surface the status code so it's clear
-        # from the logs which kind of failure this was.
-        logger.warning("get_order_status(%s): HTTP %d — %s", order_id, exc.status_code, exc.body[:200])
-        return None
-    except Exception as exc:
-        logger.warning("get_order_status(%s): %s", order_id, exc)
-        return None
+    for attempt in range(2):
+        try:
+            item = _get(f"/equity/orders/{order_id}")
+            return str(item.get("status", "")).upper() or None
+        except T212HTTPError as exc:
+            if exc.status_code == 404:
+                # Pending endpoint 404 means "not live on the book", but that can
+                # be a fill, cancellation, expiry, or history pagination miss. Check
+                # recent order history before making the caller infer too much.
+                try:
+                    data = _get("/equity/history/orders?limit=50")
+                    for item in data.get("items", []):
+                        order = item.get("order", {})
+                        if str(order.get("id") or item.get("id")) != str(order_id):
+                            continue
+                        status = str(order.get("status") or item.get("status") or "").upper()
+                        if "fill" in item or status == "FILLED":
+                            return "FILLED"
+                        if status:
+                            return status
+                except Exception as hist_exc:
+                    logger.warning("get_order_status(%s): history lookup failed after 404: %s", order_id, hist_exc)
+                    return None
+                return "GONE"
+            if attempt == 0 and exc.retryable:
+                logger.warning(
+                    "get_order_status(%s): HTTP %d — retrying once in %.1fs",
+                    order_id, exc.status_code, _STATUS_RETRY_BACKOFF_SECONDS,
+                )
+                time.sleep(_STATUS_RETRY_BACKOFF_SECONDS)
+                continue
+            # A non-retryable status (401/403/400), or a retryable one that has
+            # already had its second attempt. Not proof the order is gone —
+            # surface the code so the logs say which kind of failure this was.
+            logger.warning("get_order_status(%s): HTTP %d — %s", order_id, exc.status_code, exc.body[:200])
+            return None
+        except Exception as exc:
+            if attempt == 0:
+                logger.warning(
+                    "get_order_status(%s): %s — retrying once in %.1fs",
+                    order_id, exc, _STATUS_RETRY_BACKOFF_SECONDS,
+                )
+                time.sleep(_STATUS_RETRY_BACKOFF_SECONDS)
+                continue
+            logger.warning("get_order_status(%s): %s", order_id, exc)
+            return None
+    return None
 
 
 def cancel_order(order_id: str) -> bool:

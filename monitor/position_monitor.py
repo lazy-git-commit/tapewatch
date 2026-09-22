@@ -696,6 +696,11 @@ def _reconcile_positions(db_open_trades: list[dict]) -> None:
                 "truly flat, or investigate if the sell failed silently.",
                 trade["id"], ticker, trade["quantity"],
             )
+            record_system_event(
+                "phantom_position",
+                f"trade={trade['id']} {ticker} qty={trade['quantity']:.4f} open "
+                f"in DB but absent from the broker portfolio",
+            )
     _suspect_phantoms = phantoms_now
 
     # Orphan: broker says open, DB says flat.
@@ -717,6 +722,11 @@ def _reconcile_positions(db_open_trades: list[dict]) -> None:
                 "Manual review required: close the position manually if it is an "
                 "orphan, or add a DB record if it was a manual entry.",
                 qty, ticker,
+            )
+            record_system_event(
+                "orphan_position",
+                f"{ticker} qty={qty:.4f} held at the broker with no open trade "
+                f"in the DB — unmanaged: no stop, no take-profit, no time stop",
             )
     _suspect_orphans = orphans_now
 

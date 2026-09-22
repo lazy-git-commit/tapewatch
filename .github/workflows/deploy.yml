@@ -317,7 +317,26 @@ jobs:
           MAX_ENTRY_QUOTE_AGE_SECONDS=90
           MOMENTUM_LOOKBACK_MINUTES=5
           MAX_DAY_DROP_PCT=3.0
-          MIN_DAILY_DOLLAR_VOLUME=5000000
+          # 5,000,000 -> 2,000,000 (2026-09-07). Chosen from the ADV$ actually
+          # seen on rejected candidates rather than picked round: the names
+          # sitting just under the old bar were BWAY ($2.14M) and PRE ($2.90M),
+          # while JRSH ($395K) is genuinely micro-cap. $2M admits the first two
+          # and still excludes the third.
+          #
+          # ⚠️ This WIDENS a gate, against the standing rule not to. Justified
+          # only because TRADING_MODE=demo, so the purpose is sample collection,
+          # not P&L. The evidence is currently AGAINST it: triple-barrier
+          # labelling of the `illiquid`-rejected guidance_raise signals returned
+          # -2.460%/trade, 0% win, 100% stopped. That is n=3 DISTINCT tickers
+          # (PRE appears 3x), far too small to conclude from, and the labeller's
+          # same-bar rule -- when one 1-minute bar spans both barriers, assume
+          # the stop filled -- penalises thin-volume names hardest, so the
+          # figure is partly an artifact of the method. Neither vindicated nor
+          # refuted; that is the reason to gather more of them.
+          #
+          # REVERT TO 5000000 BEFORE TRADING_MODE=live unless the accumulated
+          # sample has by then shown these names are not simply worse.
+          MIN_DAILY_DOLLAR_VOLUME=2000000
           MIN_RVOL=1.5
           MAX_RVOL=20.0
           RVOL_BYPASS_MIN_ADV_DOLLAR=50000000

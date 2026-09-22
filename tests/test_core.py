@@ -32,6 +32,7 @@ import pytest
 import json
 import threading
 import time
+import requests
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
@@ -932,6 +933,64 @@ class TestBrokerReconciliation:
         assert any("RECONCILIATION" in r.message and "TSLA_US_EQ" in r.message
                    and "broker holds" in r.message
                    for r in caplog.records)
+
+    # ── The divergence must reach the ALERT channel, not just the log ────────
+    #
+    # On 2026-09-08 a PM_US_EQ buy filled while get_order_status() returned
+    # None, so open_trade() was never reached and the position was left
+    # unmanaged at the broker. Reconciliation detected it correctly and logged
+    # CRITICAL every 60s for 29 hours -- about 1,650 times -- but recorded no
+    # system_event, and the documented Grafana alert queries system_events for
+    # severity='critical'. Detection was never the problem; notification was.
+    #
+    # These assert the recording, not the logging, because a CRITICAL log line
+    # that nothing watches is what already failed.
+
+    @patch("monitor.position_monitor.record_system_event")
+    @patch("monitor.position_monitor.get_broker_positions")
+    def test_confirmed_orphan_records_alertable_event(self, mock_broker, mock_event):
+        """A CONFIRMED orphan must record an `orphan_position` system_event."""
+        mock_broker.return_value = {"TSLA_US_EQ": 5.0}
+        self._run_pass([])
+        assert mock_event.call_count == 0, "first sighting must not alert"
+        self._run_pass([])
+        assert mock_event.call_count == 1
+        event_type, detail = mock_event.call_args[0]
+        assert event_type == "orphan_position"
+        assert "TSLA_US_EQ" in detail
+
+    @patch("monitor.position_monitor.record_system_event")
+    @patch("monitor.position_monitor.get_broker_positions")
+    def test_confirmed_phantom_records_alertable_event(self, mock_broker, mock_event):
+        """A CONFIRMED phantom must record a `phantom_position` system_event."""
+        mock_broker.return_value = {}
+        self._run_pass([self._trade(42, "AAPL_US_EQ")])
+        assert mock_event.call_count == 0, "first sighting must not alert"
+        self._run_pass([self._trade(42, "AAPL_US_EQ")])
+        assert mock_event.call_count == 1
+        event_type, detail = mock_event.call_args[0]
+        assert event_type == "phantom_position"
+        assert "AAPL_US_EQ" in detail
+
+    @patch("monitor.position_monitor.record_system_event")
+    @patch("monitor.position_monitor.get_broker_positions")
+    def test_broker_query_failure_alerts_nothing(self, mock_broker, mock_event):
+        """A failed portfolio query is not evidence of a divergence. None must
+        never be read as "broker holds nothing", or every open trade would be
+        alerted as a phantom during a transient API outage."""
+        mock_broker.return_value = None
+        self._run_pass([self._trade(42, "AAPL_US_EQ")])
+        self._run_pass([self._trade(42, "AAPL_US_EQ")])
+        assert mock_event.call_count == 0
+
+    def test_both_divergence_types_are_registered_critical(self):
+        """Severity is derived from membership of _CRITICAL_EVENT_TYPES, and the
+        Grafana alert filters on severity='critical'. Recording an event that
+        lands at 'warning' would reproduce the exact silence being fixed --
+        which is how `claude_truncated_batch` originally shipped mute."""
+        from storage.database import _CRITICAL_EVENT_TYPES
+        assert "orphan_position" in _CRITICAL_EVENT_TYPES
+        assert "phantom_position" in _CRITICAL_EVENT_TYPES
 
     @patch("monitor.position_monitor.get_broker_positions")
     def test_orphan_resolved_between_passes_not_logged(self, mock_broker, caplog):
@@ -5107,3 +5166,85 @@ class TestEntrySlippageInstrumentation:
     def test_event_failure_is_swallowed(self, _evt):
         import main
         main._record_entry_slippage("X_US_EQ", 100.0, 105.0, 3.0)   # must not raise
+
+
+# ── get_order_status transient-failure retry ─────────────────────────────────
+
+class TestOrderStatusRetriesTransientFailure:
+    """
+    trading/executor.py::get_order_status
+
+    `None` from this function means "the lookup failed", NOT "the order is
+    absent", and callers correctly refuse to infer a fill from it. But refusing
+    to infer is not the same as knowing: the caller is left blind to a real
+    broker state.
+
+    2026-09-08, PM_US_EQ: a limit buy FILLED while this function returned None
+    on a single failed call. The caller then tried to cancel, the cancel failed
+    because the order had already filled, and open_trade() was never reached.
+    The position sat at the broker for 29 hours with no DB row behind it, so
+    nothing managed it — no resting stop, no take-profit, no time stop, no EOD
+    flatten, because every one of those iterates DB-tracked trades.
+
+    One retry resolves the transient case. A GET is idempotent, so retrying
+    cannot double-act.
+    """
+
+    @patch("trading.executor.time.sleep")          # never actually sleep in tests
+    @patch("trading.executor._get")
+    def test_the_pm_scenario_now_resolves_to_filled(self, mock_get, _sleep):
+        """THE regression test. A transient failure followed by a FILLED must
+        return FILLED, not None — that single None is what orphaned PM."""
+        from trading.executor import get_order_status
+        mock_get.side_effect = [
+            requests.exceptions.ConnectionError("connection reset"),
+            {"status": "FILLED"},
+        ]
+        assert get_order_status("54750053113") == "FILLED"
+        assert mock_get.call_count == 2
+
+    @patch("trading.executor.time.sleep")
+    @patch("trading.executor._get")
+    def test_retryable_http_status_is_retried(self, mock_get, _sleep):
+        """429/5xx are transient by definition — retry once."""
+        from trading.executor import get_order_status, T212HTTPError
+        mock_get.side_effect = [T212HTTPError(429, "too many requests"),
+                                {"status": "NEW"}]
+        assert get_order_status("1") == "NEW"
+        assert mock_get.call_count == 2
+
+    @patch("trading.executor.time.sleep")
+    @patch("trading.executor._get")
+    def test_non_retryable_status_is_not_retried(self, mock_get, _sleep):
+        """A 403 fails identically on retry with the same credentials.
+        Spending a second call on it only delays the answer."""
+        from trading.executor import get_order_status, T212HTTPError
+        mock_get.side_effect = T212HTTPError(403, "forbidden")
+        assert get_order_status("1") is None
+        assert mock_get.call_count == 1
+
+    @patch("trading.executor.time.sleep")
+    @patch("trading.executor._get")
+    def test_404_is_not_retried_and_still_reaches_history(self, mock_get, _sleep):
+        """A 404 is a MEANINGFUL answer ("not live on the book"), not a
+        failure. It must route to the history lookup on the FIRST attempt —
+        retrying it would delay a correct result and could mask a fill."""
+        from trading.executor import get_order_status, T212HTTPError
+        mock_get.side_effect = [
+            T212HTTPError(404, "not found"),
+            {"items": [{"order": {"id": "1", "status": "FILLED"}}]},
+        ]
+        assert get_order_status("1") == "FILLED"
+        # exactly two calls: the 404 probe, then history — NOT a retried probe
+        assert mock_get.call_count == 2
+        assert "history" in mock_get.call_args_list[1][0][0]
+
+    @patch("trading.executor.time.sleep")
+    @patch("trading.executor._get")
+    def test_both_attempts_failing_still_returns_none(self, mock_get, _sleep):
+        """The contract is unchanged: a genuinely unavailable API yields None,
+        never a guessed fill. Callers must still never read None as filled."""
+        from trading.executor import get_order_status
+        mock_get.side_effect = requests.exceptions.Timeout("timeout")
+        assert get_order_status("1") is None
+        assert mock_get.call_count == 2

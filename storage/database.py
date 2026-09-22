@@ -1208,6 +1208,27 @@ _CRITICAL_EVENT_TYPES = {
     # `WHERE severity = 'critical'`, so a session-long scoring blackout raised
     # no alert at all.
     "claude_truncated_batch",
+    # A reconciliation divergence means our record of what we own and the
+    # broker's disagree, and neither direction can self-heal.
+    #
+    # `orphan_position` (broker holds it, DB does not) is the more dangerous of
+    # the two: nothing manages that position — no resting stop, no take-profit,
+    # no time stop, no EOD flatten — because every one of those is driven off a
+    # DB row that does not exist. On 2026-09-08 a PM_US_EQ limit buy filled
+    # while `get_order_status()` returned None (the lookup failed, which is NOT
+    # the same as "absent"), the cancel then failed because the order had
+    # already filled, and `open_trade()` was never reached. Reconciliation
+    # detected it correctly 60 seconds later and logged CRITICAL every minute
+    # for 29 hours — roughly 1,650 times — but recorded NO system_event, so the
+    # documented Grafana alert (which queries severity='critical' in
+    # system_events) never fired and the position sat unmanaged until it was
+    # noticed by eye. Detection was never the problem; notification was.
+    #
+    # `phantom_position` (DB holds it, broker does not) is the mirror: we
+    # believe we are exposed when we are not, so the daily-loss and drawdown
+    # gates are reasoning about a position that isn't there.
+    "orphan_position",
+    "phantom_position",
     # NOT critical, and deliberately so (v21.16): `claude_cache_ineffective`
     # means every call is paying full input price for a rubric that should be
     # cached — a cost regression, not a trading outage. Nothing stops being

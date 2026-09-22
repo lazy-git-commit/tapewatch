@@ -4,6 +4,17 @@ name: CLA
 # Signatures are stored in this repository's own git history (see
 # path-to-signatures below), so there is no external dependency and no
 # third-party processor holding contributor data.
+#
+# `branch:` below points at `cla-signatures`, NOT `main` — the action's own
+# README says so explicitly ("branch should not be protected"). It writes a
+# signature back via a direct Contents-API commit, which is a different
+# credential path from an admin's `git push`: the default GITHUB_TOKEN this
+# step runs with has no admin bypass, so a protected `main` rejects the write
+# outright ("Changes must be made through a pull request. 3 of 3 required
+# status checks are expected") — the read path had already been fixed by then
+# (see the file-shape note in cla-signatures.json's history), so this was the
+# second, independent half of the same underlying mismatch. `cla-signatures`
+# carries no branch protection and exists only for this action to write to.
 on:
   issue_comment:
     types: [created]
@@ -31,7 +42,7 @@ jobs:
         with:
           path-to-signatures: '.github/cla-signatures.json'
           path-to-document: 'https://github.com/lazy-git-commit/tapewatch/blob/main/CLA.md'
-          branch: 'main'
+          branch: 'cla-signatures'
           allowlist: lazy-git-commit,dependabot[bot]
           custom-notsigned-prcomment: |
             Thank you for your contribution.
