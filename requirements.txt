@@ -16,7 +16,7 @@ openai==3.16.2
 
 # Market data & price confirmation
 yfinance==1.7.0
-pandas==3.0.5
+pandas==3.0.6
 pandas_market_calendars==5.4.0
 
 # Order execution — Trading 212 REST API called directly via requests
