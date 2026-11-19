@@ -744,6 +744,19 @@ class Settings:
                 "MANUAL_ACCOUNT must be 'live' or 'demo' when MANUAL_TICKERS is set "
                 "— which account receives real orders is never left implicit"
             )
+        # The two managers' isolation rests on owning DIFFERENT accounts. In one
+        # shared account the strategy's ticker cooldown cannot see a manual
+        # position (it filters origin='strategy'), so it can buy the same
+        # stock; the manager would then adopt those shares into its own stop,
+        # read the strategy's resting stop as "your sell order" and stand by
+        # for good, while the strategy's reconciliation flags the manual
+        # holding as an orphan every minute.
+        elif self.manual_enabled and self.manual_account == self.trading_mode.strip().lower():
+            errors.append(
+                "MANUAL_ACCOUNT must be a different account from TRADING_MODE — in one "
+                "shared account the strategy and the manual manager can act on the same "
+                "shares"
+            )
         if not self.benzinga_api_key:
             missing.append("MASSIVE_BENZINGA_API_KEY")
         if not self.finnhub_api_key:

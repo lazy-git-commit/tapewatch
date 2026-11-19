@@ -1643,7 +1643,10 @@ the broker is a sell order.
 
 | Rule | Why |
 |---|---|
-| A new high counts once two consecutive readings agree (the lower of the two) | One bad print would drag the stop to a price the market never held |
+| A new high counts once two consecutive, DISTINCT observations agree (the lower of the two); quotes older than 120 s are not acted on; prices read every 10 s | One bad print — or one print read twice from a frozen feed or an unrefreshed broker snapshot — would drag the stop to a price the market never held |
+| GTC → DAY only when the broker refuses the GTC order itself (HTTP 400) | A passing 429 must not leave every later stop expiring at 16:00 |
+| A stop that vanishes with no visible fill is "probably filled" until a later sync shows every share still held | Re-stopping early rests a sell stop on shares that are already sold |
+| `MANUAL_ACCOUNT` must differ from `TRADING_MODE` | In one account the strategy could buy the same stock and the two would fight over its shares |
 | The stop rests at the broker, GOOD_TILL_CANCEL | It fires without us; protection survives the VM being down |
 | Moves only by ≥ `MANUAL_STOP_STEP_PCT`, at most every `MANUAL_STOP_MIN_MOVE_SECONDS` | Each move is cancel + re-place with no stop in between, and bursts draw 429s (HOG) |
 | Only ever up — in code and in SQL | A trailing stop that can be lowered is not one |

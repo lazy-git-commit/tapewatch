@@ -120,14 +120,55 @@ from the running high over the first two sessions was 23.7% (middle half
 holding over the window in that sample (holding −0.6% mean) — the stop is a
 cap on the loss, not an edge. n=14, one year, hot IPOs only.
 
+### Review fixes (before the first live deploy)
+
+A review of the PR found nine real defects; each is fixed and pinned by a test.
+
+- **A passing blip could cost the overnight stop.** `place_stop_loss()` returns
+  None for every failure, so one 429 on a GOOD_TILL_CANCEL placement (likely
+  right after cancelling the old stop) was read as "GTC unsupported" and
+  latched every later stop to DAY — expiring at 16:00, so nothing rests
+  overnight or at the open. `place_stop_order()` now returns the error, and the
+  switch happens only when the broker REFUSES the GTC order itself (HTTP 400)
+  and accepts DAY.
+- **The de-spike rule could be fooled by one observation read twice.** The
+  broker's price only refreshes with each sync and a frozen feed repeats its
+  quote, so `min(spike, spike)` raised the trail permanently. Readings now carry
+  an observation identity (quote timestamp, or sync epoch) and a repeat is
+  ignored; quotes older than 120 s are not acted on (the upstream 20-minute
+  limit is a coverage check, not a trading one); and prices are read every
+  10 s, not every cycle — ~6 quote calls a minute from the shared budget.
+- **A stop that vanished without visible fill detail was treated as expired**,
+  so a new sell stop was placed on shares that were probably already sold, and
+  the sale was later recorded as yours at an estimate. It is now held as
+  "probably filled" until a sync AFTER the disappearance shows every share
+  still held (then: expired, re-place), or the shares are gone (then: the stop
+  filled — recorded as `trailing_stop`, attributed to its order).
+- **After a restart, an expired DAY stop was read as your cancellation**,
+  leaving ten minutes with no stop at the open. "Cancelled by a person" is now
+  decided by the validity the ORDER was placed with; unknown means expiry.
+- **Fill detail could be fetched twice** (up to 60 s blocked, ~40 rate-limited
+  calls) on the cancel/fill race path.
+- **`MANUAL_ACCOUNT` may no longer equal `TRADING_MODE`.** In one shared
+  account the strategy could buy the same stock, the manager would adopt those
+  shares, read the strategy's stop as yours and stand by for good.
+- **Each listed ticker is masked individually** in the deploy job: GitHub masks
+  a secret's whole value, and the service logs tickers one by one.
+- **Grafana's strategy panels now filter `origin = 'strategy'`** (all but
+  "Open Trades", where a live hand-opened position should be visible).
+
+Not changed: `_num()` duplicates the `_safe_float()` helpers in the market
+modules — a style point, left alone in a real-money change.
+
 ### Tests
 
-`tests/test_manual_positions.py` (77 tests). **Mutation-tested: 31 mutations,
-31 caught.** The first run caught 28 of 29: removing the previous stop from the
-target formula broke nothing, because a RESTING stop is protected by two other
-layers — but tracing it found the POLLED fallback (no resting order) used the
-formula directly, so widening the trail would have silently lowered the
-trigger. A test for exactly that path closed it.
+`tests/test_manual_positions.py` (90 tests). **Mutation-tested: 43 mutations,
+43 caught** — 31 for the original design, 12 for the review fixes. The first
+run caught 28 of 29: removing the previous stop from the target formula broke
+nothing, because a RESTING stop is protected by two other layers — but tracing
+it found the POLLED fallback (no resting order) used the formula directly, so
+widening the trail would have silently lowered the trigger. A test for exactly
+that path closed it.
 
 ---
 

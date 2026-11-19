@@ -932,6 +932,26 @@ def place_stop_loss(ticker: str, quantity: float, stop_price: float,
     anyway); "GOOD_TILL_CANCEL" for manual positions held across sessions, so
     the stop is already resting when the next session opens (v22).
     """
+    order_id, exc = place_stop_order(ticker, quantity, stop_price, time_validity)
+    if order_id is None:
+        logger.warning(
+            "Could not place resting stop for %s (monitor will poll the stop instead): %s",
+            ticker, exc,
+        )
+    return order_id
+
+
+def place_stop_order(ticker: str, quantity: float, stop_price: float,
+                     time_validity: str = "DAY") -> tuple[str | None, Exception | None]:
+    """
+    place_stop_loss() that also says WHY it failed: (order_id, None) or
+    (None, exception).
+
+    The manual-position manager needs the reason. "The broker rejects this
+    order type" (HTTP 400) and "the broker is busy" (429, 5xx, a timeout) call
+    for opposite responses — fall back to another validity for good, versus try
+    the same order again shortly — and a bare None cannot tell them apart.
+    """
     try:
         order = _post("/equity/orders/stop", {
             "quantity": -quantity,           # negative = sell
@@ -939,18 +959,16 @@ def place_stop_loss(ticker: str, quantity: float, stop_price: float,
             "stopPrice": _round_price(stop_price),
             "timeValidity": time_validity,
         })
-        order_id = str(order.get("id", "")) or None
-        logger.info(
-            "Resting STOP placed: %s × %.4f @ $%.4f | order_id=%s",
-            ticker, quantity, stop_price, order_id,
-        )
-        return order_id
     except Exception as exc:
-        logger.warning(
-            "Could not place resting stop for %s (monitor will poll the stop instead): %s",
-            ticker, exc,
-        )
-        return None
+        return None, exc
+    order_id = str(order.get("id", "")) or None
+    if order_id is None:
+        return None, RuntimeError("broker response carried no order id")
+    logger.info(
+        "Resting STOP placed: %s × %.4f @ $%.4f (%s) | order_id=%s",
+        ticker, quantity, stop_price, time_validity, order_id,
+    )
+    return order_id, None
 
 
 def _post_order_with_retry(endpoint: str, payload: dict, ticker: str,

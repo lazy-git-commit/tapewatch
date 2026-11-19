@@ -53,6 +53,9 @@ class _Clock:
     def monotonic(self):
         return self.t
 
+    def time(self):
+        return 1.7e9 + self.t  # wall clock, moving with the test clock
+
     def sleep(self, _seconds):
         pass  # never wait in a test
 
@@ -121,9 +124,11 @@ class _FakeBroker:
         self.fills: dict[str, dict] = {}
         self.status_override: dict[str, object] = {}
         self.calls: list[tuple] = []
-        self.refuse_gtc = False
-        self.fail_place = False
+        self.refuse_gtc = False       # GTC rejected as an invalid order (HTTP 400)
+        self.fail_place = False       # every placement fails transiently (HTTP 503)
+        self.throttle_next = False    # the NEXT placement is throttled (HTTP 429)
         self.portfolio_down = False
+        self.fill_lookups = 0
         self._next = 1
 
     def hold(self, code, qty, avg, price, pie=0.0, fill_date=None):
@@ -142,16 +147,22 @@ class _FakeBroker:
     def get_pending_orders(self):
         return [dict(o) for o in self.orders.values() if o["status"] == "NEW"]
 
-    def place_stop_loss(self, ticker, quantity, stop_price, time_validity="DAY"):
+    def place_stop_order(self, ticker, quantity, stop_price, time_validity="DAY"):
+        from trading.executor import T212HTTPError
         self.calls.append(("place", ticker, quantity, round(stop_price, 2), time_validity))
-        if self.fail_place or (self.refuse_gtc and time_validity == "GOOD_TILL_CANCEL"):
-            return None
+        if self.throttle_next:
+            self.throttle_next = False
+            return None, T212HTTPError(429, "TooManyRequests")
+        if self.fail_place:
+            return None, T212HTTPError(503, "Service Unavailable")
+        if self.refuse_gtc and time_validity == "GOOD_TILL_CANCEL":
+            return None, T212HTTPError(400, '{"detail": "timeValidity not supported"}')
         oid = f"o{self._next}"
         self._next += 1
         self.orders[oid] = dict(id=oid, ticker=ticker, quantity=-quantity,
                                 stopPrice=round(stop_price, 2), status="NEW",
                                 timeValidity=time_validity)
-        return oid
+        return oid, None
 
     def cancel_order(self, order_id):
         order = self.orders.get(order_id)
@@ -168,6 +179,7 @@ class _FakeBroker:
         return order["status"] if order else "GONE"
 
     def fetch_fill(self, order_id):
+        self.fill_lookups += 1
         return self.fills.get(order_id)
 
     def sell(self, ticker, quantity, price, reason, *, force_market=False, extended=False):
@@ -187,6 +199,10 @@ class _FakeBroker:
 
     def user_cancel(self, order_id):
         self.orders[order_id]["status"] = "CANCELLED"
+
+    def vanish_order(self, order_id):
+        """The order leaves the book and no fill detail is (yet) available."""
+        self.orders.pop(order_id, None)
 
     def resting(self):
         return [o for o in self.orders.values() if o["status"] == "NEW"]
@@ -208,7 +224,22 @@ def h():
         mp=mp, cfg=cfg, db=db, broker=broker, clock=clock, prices={},
         session=mp.REGULAR,
         bounds=(now - timedelta(hours=2), now + timedelta(hours=4)),
+        feed_down=False,    # market-data feed returns nothing (broker price only)
+        quote_t=None,       # pin the quote's timestamp (a frozen feed)
+        quote_age=None,     # every quote this many seconds old (a lagging feed)
+        quote_calls=0,
     )
+
+    def quote(symbol, fast=True):
+        ns.quote_calls += 1
+        price = ns.prices.get(f"{symbol}_US_EQ")
+        if ns.feed_down or price is None:
+            return None
+        if ns.quote_t is not None:
+            t = ns.quote_t
+        else:
+            t = clock.time() - (ns.quote_age or 0)
+        return {"c": price, "t": t}
 
     def run(price=None, dt=5.0, n=1, code="ACME_US_EQ"):
         for _ in range(n):
@@ -230,13 +261,14 @@ def h():
         # Real cadences are covered by their own tests; here every cycle syncs
         # and checks status so scenarios read cycle-by-cycle.
         for name, value in (("_SYNC_EVERY_SECONDS", 0), ("_STATUS_CHECK_EVERY_SECONDS", 0),
-                            ("_PLACE_RETRY_SECONDS", 0), ("_time", clock)):
+                            ("_PLACE_RETRY_SECONDS", 0), ("_PRICE_EVERY_SECONDS", 0),
+                            ("_time", clock)):
             stack.enter_context(patch.object(mp, name, value))
         stack.enter_context(patch.object(mp, "get_trading_session", lambda *a, **k: ns.session))
         stack.enter_context(patch.object(mp, "session_bounds", lambda *a, **k: ns.bounds))
-        stack.enter_context(patch.object(mp, "get_current_price", lambda code: ns.prices.get(code)))
+        stack.enter_context(patch.object(mp, "get_quote_with_fallback", quote))
         stack.enter_context(patch.object(mp, "t212_to_symbol", lambda code: code.split("_")[0]))
-        for name in ("get_broker_portfolio", "get_pending_orders", "place_stop_loss",
+        for name in ("get_broker_portfolio", "get_pending_orders", "place_stop_order",
                      "cancel_order", "get_order_status", "sell"):
             stack.enter_context(patch.object(mp, name, getattr(broker, name)))
         stack.enter_context(patch.object(mp, "_fetch_fill", broker.fetch_fill))
@@ -919,7 +951,148 @@ class TestLogging:
         assert len(opens) == 1 and "held: none yet" in opens[0].getMessage()
 
 
-# ── 10. Scheduler wiring ──────────────────────────────────────────────────────
+# ── 10. Review fixes (PR #33) ─────────────────────────────────────────────────
+
+class TestReviewFixes:
+    """Each test pins one defect found in review before the first live deploy."""
+
+    def _adopt(self, h, price=100.0):
+        h.broker.hold("ACME_US_EQ", 10, 100.0, price)
+        h.run(price)
+
+    def test_a_transient_failure_never_downgrades_the_stop_to_day(self, h):
+        # A 429 right after cancelling the old stop says nothing about GTC.
+        # Downgrading on it would leave every later stop expiring at 16:00.
+        h.broker.throttle_next = True
+        self._adopt(h)
+        h.run(100.0)
+        validities = [c[4] for c in h.broker.kinds("place")]
+        assert validities == ["GOOD_TILL_CANCEL", "GOOD_TILL_CANCEL"]
+        assert h.mp._stop_validity == "GOOD_TILL_CANCEL"
+        assert [o["timeValidity"] for o in h.broker.resting()] == ["GOOD_TILL_CANCEL"]
+
+    def test_one_observation_seen_twice_cannot_confirm_a_spike(self, h):
+        self._adopt(h)
+        h.quote_t = h.clock.time() + 5     # the next quote's timestamp …
+        h.run(200.0)                       # … a bad print
+        h.run(200.0)                       # the SAME quote again (frozen feed)
+        h.quote_t = None
+        h.run(100.0)                       # a genuinely new observation
+        assert h.db.only()["trail_high_price"] == 100.0
+        assert not h.broker.kinds("cancel")
+
+    def test_one_broker_snapshot_read_twice_cannot_confirm_a_spike(self, h):
+        # Feeds have no price (a new listing), so the broker's position price is
+        # used — and it only refreshes with each sync.
+        self._adopt(h)
+        h.feed_down = True
+        with patch.object(h.mp, "_SYNC_EVERY_SECONDS", 1e9):  # no new snapshot
+            h.broker.positions["ACME_US_EQ"]["currentPrice"] = 200.0
+            h.mp._broker_positions["ACME_US_EQ"]["currentPrice"] = 200.0
+            h.run(dt=40, n=3)
+        assert h.db.only()["trail_high_price"] == 100.0
+
+    def test_a_stale_quote_is_not_acted_on(self, h):
+        self._adopt(h)
+        h.quote_age = 600                  # each quote a DIFFERENT, ten-minute-old one
+        h.prices["ACME_US_EQ"] = 200.0     # the lagging feed says 200 …
+        h.broker.positions["ACME_US_EQ"]["currentPrice"] = 100.0  # … the broker 100
+        h.run(dt=40, n=3)
+        assert h.db.only()["trail_high_price"] == 100.0
+
+    def test_after_a_restart_a_cancelled_stop_is_replaced_not_waited_on(self, h):
+        # The order's validity is unknown after a restart: read it as expiry,
+        # never as "you took over" — that would mean ten minutes with no stop.
+        self._adopt(h)
+        h.mp.reset_state()
+        h.broker.user_cancel("o1")
+        h.run(100.0)
+        assert len(h.broker.kinds("place")) == 2
+        assert "manual_stop_cancelled_externally" not in h.db.event_types()
+
+    def test_a_vanished_stop_is_not_replaced_until_the_account_confirms(self, h):
+        self._adopt(h)
+        h.broker.vanish_order("o1")        # off the book, no fill detail yet
+        h.run(100.0, n=3)                  # within the grace period
+        assert len(h.broker.kinds("place")) == 1, "must not stop shares that may be sold"
+        h.run(100.0, dt=25)                # grace over, newer sync, all shares held
+        assert len(h.broker.kinds("place")) == 2
+
+    def test_a_stop_that_vanishes_mid_move_is_not_replaced_on_top(self, h):
+        with patch.object(h.mp, "_STATUS_CHECK_EVERY_SECONDS", 1e9):  # presume live
+            self._adopt(h)
+            h.broker.vanish_order("o1")
+            h.run(120.0, dt=40, n=2)  # new high → move → cancel fails: it is GONE
+        assert len(h.broker.kinds("place")) == 1, "no second sell stop on maybe-sold shares"
+        assert not h.broker.kinds("sell")
+
+    def test_a_vanished_stop_with_the_shares_gone_counts_as_the_stop_filling(self, h):
+        self._adopt(h)
+        h.broker.vanish_order("o1")
+        h.broker.positions.pop("ACME_US_EQ")
+        h.run(100.0, n=3)
+        row = h.db.only()
+        assert (row["status"], row["exit_reason"], row["sell_price"]) == ("closed", "trailing_stop", 92.0)
+        assert row["sell_order_id"] == "o1"
+        assert len(h.broker.kinds("place")) == 1
+
+    def test_fill_detail_is_fetched_once_not_twice(self, h):
+        # _fetch_fill blocks for up to 30 s; asking twice stalls every position.
+        # The double ask lived on the cancel/fill race path: the stop filled
+        # while being moved, and its fill detail was not yet available.
+        with patch.object(h.mp, "_STATUS_CHECK_EVERY_SECONDS", 1e9):  # presume live
+            self._adopt(h)
+            h.broker.orders["o1"]["status"] = "FILLED"
+            before = h.broker.fill_lookups
+            h.run(120.0, dt=40, n=2)  # new high → move → cancel fails: it FILLED
+        assert h.db.only()["exit_reason"] == "trailing_stop"
+        assert h.broker.fill_lookups - before == 1
+
+    def test_prices_are_read_at_most_every_ten_seconds(self, h):
+        with patch.object(h.mp, "_PRICE_EVERY_SECONDS", 10.0):
+            self._adopt(h)
+            before = h.quote_calls
+            h.run(100.0, dt=5, n=6)
+        assert h.quote_calls - before == 3
+
+
+class TestReviewFixesOutsideTheManager:
+
+    def test_the_manager_cannot_share_the_strategys_account(self, monkeypatch):
+        with pytest.raises(ValueError, match="different account"):
+            _settings(monkeypatch, MANUAL_TICKERS="ACME", MANUAL_ACCOUNT="demo",
+                      MANUAL_TRAIL_PCT="10").validate()
+
+    def test_strategy_panels_exclude_manual_trades(self):
+        import json
+        import pathlib
+        dash = json.loads(pathlib.Path("grafana/dashboards/momentum_trader.json")
+                          .read_text(encoding="utf-8"))
+
+        def panels(node):
+            for p in node.get("panels", []):
+                yield p
+                yield from panels(p)
+
+        queries = [(p.get("title"), t.get("rawSql", "")) for p in panels(dash)
+                   for t in p.get("targets", []) if "FROM trades" in t.get("rawSql", "")]
+        assert len(queries) >= 12
+        for title, sql in queries:
+            if title == "Open Trades":
+                # A live hand-opened position SHOULD be visible here.
+                assert "origin" not in sql
+            else:
+                assert "origin = 'strategy'" in sql, title
+
+    def test_each_listed_ticker_is_masked_before_the_journal_can_be_printed(self):
+        import pathlib
+        text = pathlib.Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+        mask = text.index('echo "::add-mask::${entry}"')
+        assert "secrets.MANUAL_TICKERS" in text[:mask]
+        assert mask < text.index("name: Post-restart health check")
+
+
+# ── 11. Scheduler wiring ──────────────────────────────────────────────────────
 
 class TestSchedulerWiring:
 

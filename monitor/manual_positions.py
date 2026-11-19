@@ -86,7 +86,7 @@ from datetime import datetime, timedelta, timezone
 import pytz
 
 from config.settings import cfg
-from market.price_check import get_current_price
+from market.price_check import get_quote_with_fallback
 from market.sessions import (
     AFTERHOURS, PREMARKET, REGULAR, get_trading_session, session_bounds,
 )
@@ -95,9 +95,9 @@ from storage.database import (
     record_system_event, set_stop_order_id, update_manual_position,
 )
 from trading.executor import (
-    _fetch_fill, _parse_fill, _round_price, cancel_order, get_broker_portfolio,
-    get_order_status, get_pending_orders, place_stop_loss, sell, t212_to_symbol,
-    use_account,
+    T212HTTPError, _fetch_fill, _parse_fill, _round_price, cancel_order,
+    get_broker_portfolio, get_order_status, get_pending_orders, place_stop_order,
+    sell, t212_to_symbol, use_account,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,10 +132,26 @@ _MAX_HOLD_EXIT_AFTER_OPEN_MINUTES = 15
 _UNPROTECTED_ALERT_AFTER_SECONDS = 120.0
 # A brand-new listing may not be covered by the market-data feeds yet. After
 # this many consecutive misses the feeds are skipped (the broker's own position
-# price is used instead) for _CHAIN_BACKOFF_SECONDS — otherwise every 5 s cycle
+# price is used instead) for _CHAIN_BACKOFF_SECONDS — otherwise every cycle
 # would spend a Twelvedata credit asking for a symbol it does not have.
 _CHAIN_MAX_MISSES = 3
 _CHAIN_BACKOFF_SECONDS = 300.0
+# How often a NEW price is read. The resting stop does the protecting; this only
+# paces how quickly the stop is raised, so 10 s costs nothing in protection —
+# and it matches the broker sync, keeps the manager to ~6 quote calls a minute
+# out of the market-data budget the strategy shares, and means every reading is
+# a genuinely new observation rather than the same one seen twice.
+_PRICE_EVERY_SECONDS = 10.0
+# A quote older than this is not acted on (the broker's own price is used
+# instead). The coverage check upstream accepts quotes up to 20 minutes old —
+# right for "is this instrument priced at all?", far too old to move a stop on.
+_MAX_OBS_AGE_SECONDS = 120.0
+# A GOOD_TILL_CANCEL stop that has left the book without a visible fill almost
+# always FILLED — fill detail lags, and the history lookup is tightly rate
+# limited. Wait this long, and for a broker sync taken after the disappearance,
+# before concluding it expired instead; replacing it early would rest a new sell
+# stop on shares that are already sold.
+_GONE_GRACE_SECONDS = 20.0
 # Recurring status / warning lines are throttled to one per this many seconds.
 _SAY_EVERY_SECONDS = 60.0
 
@@ -148,8 +164,11 @@ class _TradeState:
     """Process-lifetime state for one manual trade. Losing it (a restart) is
     safe by construction: everything that protects money is in the DB or at
     the broker; this only holds pacing and the previous price reading."""
-    prev_reading: tuple[float, float] | None = None   # (monotonic, price)
+    prev_reading: tuple[float, float, object] | None = None  # (monotonic, price, obs id)
     last_price: float | None = None
+    last_observed: float = float("-inf")
+    gone_since: float | None = None
+    gone_epoch: int = 0
     last_status_check: float = float("-inf")
     partial_fill: bool = False
     last_place_attempt: float = float("-inf")
@@ -173,12 +192,22 @@ _quantity_suspects: dict[int, float] = {}
 _said_once: set[str] = set()
 _stop_validity = _GTC
 _announced_day: str | None = None
+# Increments on every SUCCESSFUL broker sync: identifies which snapshot a
+# broker-sourced price came from, and whether a sync has happened since.
+_sync_epoch = 0
+# order id → the validity it was placed with. Read when the order shows up
+# cancelled: only a GOOD_TILL_CANCEL stop we placed can have been cancelled by a
+# person. Unknown (e.g. after a restart) is read as expiry, so a lost entry
+# costs a re-placement, never a stretch without a stop.
+_order_validity: dict[str, str] = {}
 
 
 def reset_state() -> None:
     """Forget all process-lifetime state (tests — see tests/conftest.py)."""
-    global _last_sync, _stop_validity, _announced_day
+    global _last_sync, _stop_validity, _announced_day, _sync_epoch
     _announced_day = None
+    _sync_epoch = 0
+    _order_validity.clear()
     _states.clear()
     _broker_positions.clear()
     _foreign_sells.clear()
@@ -399,7 +428,7 @@ def _drop_unlisted(trades: list[dict]) -> list[dict]:
 
 
 def _sync_with_broker(trades: list[dict]) -> list[dict]:
-    global _last_sync
+    global _last_sync, _sync_epoch
     now = _time.monotonic()
     if now - _last_sync < _SYNC_EVERY_SECONDS:
         return trades
@@ -410,6 +439,7 @@ def _sync_with_broker(trades: list[dict]) -> list[dict]:
         # Unreachable is not empty. Treating a timeout as "you sold it" would
         # close the record and stop the trailing on a position you still own.
         return trades
+    _sync_epoch += 1
     positions = {str(p["ticker"]): p for p in portfolio if p.get("ticker")}
     managed = {code: pos for code, pos in positions.items() if _listed_entry(code)}
     _broker_positions.clear()
@@ -605,10 +635,12 @@ def _resolve_vanished(trade: dict) -> bool:
         if status is None:
             return False  # can't tell whether our stop filled — never guess
         if status in ("FILLED", "GONE", "PARTIALLY_FILLED"):
-            fill = _fetch_fill(order_id)
-            if fill or status == "FILLED":
-                _close_from_fill(trade, order_id, fill)
-                return True
+            # Our stop left the book AND the shares left the account: that is
+            # our stop executing, even when its fill detail has not arrived.
+            # (A sale of yours would show the stop CANCELLED, not gone — T212
+            # will not sell shares a resting order has reserved.)
+            _close_from_fill(trade, order_id, _fetch_fill(order_id), fetched=True)
+            return True
         if status not in ("CANCELLED", "REJECTED", "GONE", "PARTIALLY_FILLED"):
             # Still pending against shares that no longer exist. It cannot
             # execute (an ISA cannot go short) but it should not linger.
@@ -647,9 +679,14 @@ def _announce_close(trade: dict, price: float, reason: str) -> None:
     )
 
 
-def _close_from_fill(trade: dict, order_id: str, fill: dict | None = None) -> None:
-    """Our resting stop executed at the broker — record it with the real fill."""
-    if fill is None:
+def _close_from_fill(trade: dict, order_id: str, fill: dict | None = None,
+                     *, fetched: bool = False) -> None:
+    """Our resting stop executed at the broker — record it with the real fill.
+
+    `fetched=True` means the caller already asked for the fill: _fetch_fill()
+    blocks for up to 30 s, so asking twice would stall every listed position for
+    a minute exactly when one of them has just sold."""
+    if fill is None and not fetched:
         fill = _fetch_fill(order_id)
     filled, net_gbp, fx_rate, fees_gbp = _parse_fill(fill)
     price = filled if filled is not None else (
@@ -680,14 +717,52 @@ def _clear_stop(trade: dict) -> None:
     trade["stop_order_id"] = None
 
 
-def _release_stop(trade: dict) -> bool:
+def _gone_resolution(trade: dict, st: _TradeState, now: float) -> bool | None:
+    """
+    Our stop has left the book and no fill is visible. Returns None while that
+    is unresolved (do nothing on this position), or False once it is known to
+    have EXPIRED — its id is then cleared and a new stop may be placed.
+
+    Most likely it filled and the fill detail is late, so the default is to wait.
+    It only counts as expired once _GONE_GRACE_SECONDS have passed AND a broker
+    sync taken after the disappearance still shows every share held. If the
+    shares are gone instead, the sync's vanish path closes the trade as the stop
+    filling (_resolve_vanished) — with the stop id still attached, so the fill
+    is attributed to it rather than recorded as a sale of yours.
+    """
+    if st.gone_since is None:
+        st.gone_since, st.gone_epoch = now, _sync_epoch
+        logger.warning(
+            "MANUAL [%s] trade=%d: stop %s left the book with no fill visible yet — most "
+            "likely it FILLED. Placing nothing else until the account confirms the "
+            "shares are still held.",
+            trade["ticker"], trade["id"], trade.get("stop_order_id"),
+        )
+        return None
+    pos = _broker_positions.get(trade["ticker"])
+    still_held = (pos is not None
+                  and _manageable_quantity(pos) >= float(trade["quantity"]) - 1e-6)
+    if now - st.gone_since >= _GONE_GRACE_SECONDS and _sync_epoch > st.gone_epoch and still_held:
+        logger.warning(
+            "MANUAL [%s] trade=%d: stop %s expired without filling (all %.4f shares are "
+            "still held) — placing a new one",
+            trade["ticker"], trade["id"], trade.get("stop_order_id"), float(trade["quantity"]),
+        )
+        _clear_stop(trade)
+        st.gone_since = None
+        return False
+    return None
+
+
+def _release_stop(trade: dict, st: _TradeState) -> bool:
     """
     Cancel our resting stop so its shares are free to sell or re-stop.
 
     True: no order of ours rests any more — safe to proceed. False: stop
-    processing this cycle — either the stop FILLED during the cancel (the trade
-    has been closed here) or its state is unknown (try again next cycle; a
-    second sell order on top of a live stop could double-exit).
+    processing this cycle — the stop FILLED during the cancel (the trade has been
+    closed here), it left the book without a visible fill (probably filled — see
+    _gone_resolution), or its state is unknown. In each of those cases a second
+    sell order on top of it could sell shares that are already gone.
     """
     order_id = trade.get("stop_order_id")
     if not order_id:
@@ -699,11 +774,10 @@ def _release_stop(trade: dict) -> bool:
     if status in ("FILLED", "GONE", "PARTIALLY_FILLED"):
         fill = _fetch_fill(order_id)
         if fill or status == "FILLED":
-            _close_from_fill(trade, order_id, fill)
+            _close_from_fill(trade, order_id, fill, fetched=True)
             return False
         if status == "GONE":
-            _clear_stop(trade)
-            return True
+            _gone_resolution(trade, st, _time.monotonic())
         return False
     if status in ("CANCELLED", "REJECTED"):
         _clear_stop(trade)
@@ -719,7 +793,7 @@ def _release_stop(trade: dict) -> bool:
 def _exit(trade: dict, st: _TradeState, price: float) -> None:
     """Sell the whole position at market. Retried every cycle until it lands."""
     reason = st.exit_pending or "trailing_stop"
-    if not _release_stop(trade):
+    if not _release_stop(trade, st):
         return
     result = sell(trade["ticker"], float(trade["quantity"]), price, reason, force_market=True)
     if not result.success:
@@ -749,6 +823,8 @@ def _check_resting_stop(trade: dict, st: _TradeState, now: float) -> bool | None
     order_id = trade.get("stop_order_id")
     if not order_id:
         return False
+    if st.gone_since is not None:
+        return _gone_resolution(trade, st, now)
     if now - st.last_status_check < _STATUS_CHECK_EVERY_SECONDS:
         return None if st.partial_fill else True
     st.last_status_check = now
@@ -769,13 +845,12 @@ def _check_resting_stop(trade: dict, st: _TradeState, now: float) -> bool | None
     if status == "GONE":
         fill = _fetch_fill(order_id)
         if fill:
-            _close_from_fill(trade, order_id, fill)
+            _close_from_fill(trade, order_id, fill, fetched=True)
             return None
-        _clear_stop(trade)  # expired without filling — a new one is placed below
-        return False
+        return _gone_resolution(trade, st, now)
     if status in ("CANCELLED", "REJECTED", "REPLACED"):
         _clear_stop(trade)
-        if status == "CANCELLED" and _cancelled_by_human(st):
+        if status == "CANCELLED" and _cancelled_by_human(order_id, st):
             st.standby_until = now + _HUMAN_CANCEL_STANDBY_SECONDS
             logger.warning(
                 "MANUAL [%s] trade=%d: the bot's stop %s was CANCELLED outside the bot — "
@@ -798,47 +873,86 @@ def _check_resting_stop(trade: dict, st: _TradeState, now: float) -> bool | None
     return True  # NEW / CONFIRMED / LOCAL / CANCELLING …: still on the book
 
 
-def _cancelled_by_human(st: _TradeState) -> bool:
-    """A cancelled GOOD_TILL_CANCEL stop was cancelled by a person. A DAY stop
-    also expires at every close, so only a same-day cancel during regular hours
-    counts — and after a restart (placement day unknown) it is read as expiry."""
-    if _stop_validity == _GTC:
+def _cancelled_by_human(order_id: str, st: _TradeState) -> bool:
+    """
+    Was this cancellation a person's doing? Decided by the validity the ORDER
+    was placed with, not by the process-wide setting — which resets on restart
+    and would misread yesterday's expired DAY stop as your cancellation, leaving
+    the position with no stop for ten minutes at the open.
+
+    GOOD_TILL_CANCEL: never expires, so yes. DAY: also expires at every close,
+    so only a same-day cancel during regular hours counts. Unknown (placed
+    before a restart): read as expiry — a needless re-placement is the cheap
+    mistake; a stretch with no stop is the expensive one.
+    """
+    validity = _order_validity.get(str(order_id))
+    if validity is None:
+        return False
+    if validity == _GTC:
         return True
     return st.stop_placed_et_day == _et_day() and get_trading_session() == REGULAR
 
 
-def _price(trade: dict, st: _TradeState) -> float | None:
-    """Latest price: the market-data chain (timestamped and freshness-guarded),
-    else the broker's own price for the position from the last sync."""
-    now = _time.monotonic()
+def _observe(trade: dict, st: _TradeState, now: float) -> tuple[float, object] | None:
+    """
+    A price to act on, and the identity of the observation it came from — or
+    None when nothing usable is available.
+
+    Primary: the market-data quote (timestamped). A quote older than
+    _MAX_OBS_AGE_SECONDS is not acted on. Fallback: the broker's own price for
+    the position from the last sync, which covers a listing the feeds do not
+    carry yet. The identity — the quote's own timestamp, or the sync it came
+    from — lets the de-spike rule refuse to count one observation twice.
+    """
     if now >= st.chain_retry_at:
-        price = _num(get_current_price(trade["ticker"]))
+        quote = get_quote_with_fallback(t212_to_symbol(trade["ticker"]), fast=True)
+        price = _num(quote.get("c")) if isinstance(quote, dict) else None
         if price is not None and price > 0:
             st.chain_misses = 0
-            return price
-        st.chain_misses += 1
-        if st.chain_misses >= _CHAIN_MAX_MISSES:
-            st.chain_misses = 0
-            st.chain_retry_at = now + _CHAIN_BACKOFF_SECONDS
-            logger.warning(
-                "MANUAL [%s]: the market-data feeds have no price for this instrument (a "
-                "new listing may not be covered yet) — using the broker's own position "
-                "price for the next %d min",
-                trade["ticker"], int(_CHAIN_BACKOFF_SECONDS // 60),
-            )
+            ts = _num(quote.get("t"))
+            if ts is None or _time.time() - ts <= _MAX_OBS_AGE_SECONDS:
+                return price, ("feed", ts if ts is not None else now)
+            if _due(st, "stale"):
+                logger.warning(
+                    "MANUAL [%s]: the market-data quote is %.0f s old — not acting on it; "
+                    "using the broker's own price instead",
+                    trade["ticker"], _time.time() - ts,
+                )
+        else:
+            st.chain_misses += 1
+            if st.chain_misses >= _CHAIN_MAX_MISSES:
+                st.chain_misses = 0
+                st.chain_retry_at = now + _CHAIN_BACKOFF_SECONDS
+                logger.warning(
+                    "MANUAL [%s]: the market-data feeds have no price for this instrument "
+                    "(a new listing may not be covered yet) — using the broker's own "
+                    "position price for the next %d min",
+                    trade["ticker"], int(_CHAIN_BACKOFF_SECONDS // 60),
+                )
     pos = _broker_positions.get(trade["ticker"])
     broker = _num(pos.get("currentPrice")) if pos else None
-    return broker if broker is not None and broker > 0 else None
+    if broker is not None and broker > 0:
+        return broker, ("broker", _sync_epoch)
+    return None
 
 
-def _confirmed_high_candidate(st: _TradeState, price: float, now: float) -> float | None:
-    """The lower of this reading and the previous one, if they are consecutive.
+def _confirmed_high_candidate(st: _TradeState, price: float, obs_id: object,
+                              now: float) -> float | None:
+    """The lower of this reading and the previous one, if they are consecutive
+    AND genuinely different observations.
 
     A single spike between two normal readings can never raise the high: the
     lower of (normal, spike) is normal, and so is the lower of (spike, normal).
-    A genuine move up holds across two readings and counts one cycle later."""
+    A genuine move up holds across two readings and counts one cycle later.
+
+    "Different observations" matters: the broker's price only refreshes with
+    each sync, and a frozen feed repeats its last quote. Reading one bad print
+    twice would make min(spike, spike) = spike, and the stop would be raised to
+    a price the market never held — permanently, since the trail only goes up."""
     prev = st.prev_reading
-    st.prev_reading = (now, price)
+    if prev is not None and prev[2] == obs_id:
+        return None  # the same observation seen again proves nothing
+    st.prev_reading = (now, price, obs_id)
     if prev is None or now - prev[0] > _DESPIKE_MAX_GAP_SECONDS:
         return None
     return min(prev[1], price)
@@ -860,21 +974,41 @@ def _max_hold_due(trade: dict) -> bool:
     return now_utc >= bounds[0] + timedelta(minutes=_MAX_HOLD_EXIT_AFTER_OPEN_MINUTES)
 
 
-def _place_stop(ticker: str, quantity: float, level: float) -> str | None:
-    """Place a resting stop, GOOD_TILL_CANCEL first; DAY only if GTC is refused."""
+def _is_order_refusal(exc: Exception | None) -> bool:
+    """The broker rejected the ORDER ITSELF (HTTP 400) — as opposed to a
+    throttle, an outage, an auth problem or a timeout, which say nothing about
+    whether a GOOD_TILL_CANCEL stop is acceptable."""
+    return isinstance(exc, T212HTTPError) and exc.status_code == 400
+
+
+def _place_stop(ticker: str, quantity: float, level: float) -> tuple[str | None, str]:
+    """
+    Place a resting stop. Returns (order_id or None, validity used).
+
+    GOOD_TILL_CANCEL first. DAY only if the broker REFUSED the GTC order itself
+    (HTTP 400) and then accepted the same stop as DAY — that is evidence GTC is
+    unsupported, and the process switches for good. Any other failure (a 429
+    right after cancelling the old stop, a 5xx, a timeout) is just retried as
+    GTC next cycle: switching on a passing blip would leave every later stop
+    expiring at 16:00, i.e. no protection overnight or at the next open.
+    """
     global _stop_validity
-    order_id = place_stop_loss(ticker, quantity, level, time_validity=_stop_validity)
-    if order_id is None and _stop_validity == _GTC:
+    validity = _stop_validity
+    order_id, exc = place_stop_order(ticker, quantity, level, validity)
+    if order_id is None and validity == _GTC and _is_order_refusal(exc):
         _time.sleep(_VALIDITY_FALLBACK_PAUSE_SECONDS)
-        order_id = place_stop_loss(ticker, quantity, level, time_validity=_DAY)
+        order_id, _ = place_stop_order(ticker, quantity, level, _DAY)
         if order_id is not None:
-            _stop_validity = _DAY
+            _stop_validity = validity = _DAY
             logger.warning(
-                "Manual positions: the broker refused a GOOD_TILL_CANCEL stop but accepted "
-                "DAY — stops will be re-placed at each regular-session open. Between "
-                "sessions, and if this VM is down at the open, there is NO resting stop.",
+                "Manual positions: the broker refused a GOOD_TILL_CANCEL stop (%s) but "
+                "accepted DAY — stops will be re-placed at each regular-session open. "
+                "Between sessions, and if this VM is down at the open, there is NO "
+                "resting stop.", exc,
             )
-    return order_id
+    elif order_id is None:
+        logger.warning("Manual positions: stop placement for %s failed: %s", ticker, exc)
+    return order_id, validity
 
 
 def _place_and_record(trade: dict, st: _TradeState, level: float, now: float) -> bool:
@@ -886,7 +1020,7 @@ def _place_and_record(trade: dict, st: _TradeState, level: float, now: float) ->
     trade["trail_stop_price"] = max(_num(trade.get("trail_stop_price")) or level, level)
     st.last_place_attempt = now
     level = trade["trail_stop_price"]
-    order_id = _place_stop(trade["ticker"], float(trade["quantity"]), level)
+    order_id, validity = _place_stop(trade["ticker"], float(trade["quantity"]), level)
     if order_id is None:
         logger.error(
             "MANUAL [%s] trade=%d: could not place the stop at $%.2f — falling back to a "
@@ -909,9 +1043,11 @@ def _place_and_record(trade: dict, st: _TradeState, level: float, now: float) ->
     st.requantify = False
     st.unprotected_since = None
     st.stop_placed_et_day = _et_day()
+    st.gone_since = None
+    _order_validity[str(order_id)] = validity
     logger.info(
         "MANUAL [%s] trade=%d: resting STOP at $%.2f for %.4f shares (%s) — order %s",
-        trade["ticker"], trade["id"], level, float(trade["quantity"]), _stop_validity, order_id,
+        trade["ticker"], trade["id"], level, float(trade["quantity"]), validity, order_id,
     )
     return True
 
@@ -926,7 +1062,7 @@ def _move_stop(trade: dict, st: _TradeState, target: float, price: float, now: f
         _num(trade.get("trail_high_price")) or float(trade["buy_price"]), price,
         cfg.manual_trail_pct,
     )
-    if not _release_stop(trade):
+    if not _release_stop(trade, st):
         return
     st.last_move = now
     if price <= target:
@@ -995,7 +1131,8 @@ def _manage(trade: dict) -> None:
 
     # An exit already decided on keeps being retried until it lands.
     if st.exit_pending:
-        price = (_price(trade, st) or st.last_price
+        obs = _observe(trade, st, now)
+        price = ((obs[0] if obs else None) or st.last_price
                  or _num(trade.get("trail_stop_price")) or float(trade["buy_price"]))
         _exit(trade, st, price)
         return
@@ -1004,8 +1141,15 @@ def _manage(trade: dict) -> None:
     if live is None:
         return
 
-    price = _price(trade, st)
-    if price is None:
+    # Price-dependent decisions only on a NEW observation, at most every
+    # _PRICE_EVERY_SECONDS. Between them there is nothing new to decide on —
+    # the resting stop is what protects the position meanwhile.
+    if now - st.last_observed < _PRICE_EVERY_SECONDS:
+        _note_unprotected(trade, st, now, live)
+        return
+    st.last_observed = now
+    obs = _observe(trade, st, now)
+    if obs is None:
         _note_unprotected(trade, st, now, live)
         if _due(st, "noprice"):
             logger.warning(
@@ -1015,12 +1159,13 @@ def _manage(trade: dict) -> None:
                 "NO resting stop and no price: unprotected until a price is available",
             )
         return
+    price, obs_id = obs
     prev_price, st.last_price = st.last_price, price
 
     # The highest confirmed price is tracked even while standing by, so that
     # when control comes back the trail resumes from the real high.
     high = _num(trade.get("trail_high_price")) or float(trade["buy_price"])
-    candidate = _confirmed_high_candidate(st, price, now)
+    candidate = _confirmed_high_candidate(st, price, obs_id, now)
     if candidate is not None and candidate > high:
         high = candidate
         raise_manual_trail(trade["id"], high=high)
