@@ -277,6 +277,31 @@ def _manageable_quantity(pos: dict) -> float:
     return max(0.0, qty - max(0.0, pie))
 
 
+def _order_quantity(trade: dict) -> float:
+    """
+    How many shares to put on a sell order: the BROKER's own figure, never the
+    stored one when the two describe the same holding.
+
+    trades.quantity is a REAL (32-bit float) column. A fractional holding such
+    as 3.14159265 reads back as 3.1415927 — a hair MORE than is held — and the
+    broker rejects a sell for more shares than you own. That is exactly what
+    happened on the first live position (2026-11-19): the first stop, placed
+    from the broker's figure, rested fine; every re-placement, sized from the
+    database, was refused, leaving the position with no resting stop.
+
+    When the snapshot and the record genuinely differ (a size change awaiting
+    confirmation) the SMALLER is used, so an order can never exceed the holding.
+    With no snapshot at all, the stored figure is floored to 6 decimal places,
+    which removes the float32 excess for any realistic holding.
+    """
+    stored = float(trade["quantity"])
+    pos = _broker_positions.get(trade["ticker"])
+    held = _manageable_quantity(pos) if pos else 0.0
+    if held > 0:
+        return held if math.isclose(held, stored, rel_tol=0, abs_tol=1e-6) else min(held, stored)
+    return math.floor(stored * 1e6) / 1e6
+
+
 def _parse_time(value) -> datetime | None:
     if not value:
         return None
@@ -795,7 +820,7 @@ def _exit(trade: dict, st: _TradeState, price: float) -> None:
     reason = st.exit_pending or "trailing_stop"
     if not _release_stop(trade, st):
         return
-    result = sell(trade["ticker"], float(trade["quantity"]), price, reason, force_market=True)
+    result = sell(trade["ticker"], _order_quantity(trade), price, reason, force_market=True)
     if not result.success:
         logger.error(
             "MANUAL [%s] trade=%d: %s sell FAILED (%s) — retrying next cycle. Until it "
@@ -997,7 +1022,7 @@ def _place_stop(ticker: str, quantity: float, level: float) -> tuple[str | None,
     order_id, exc = place_stop_order(ticker, quantity, level, validity)
     if order_id is None and validity == _GTC and _is_order_refusal(exc):
         _time.sleep(_VALIDITY_FALLBACK_PAUSE_SECONDS)
-        order_id, _ = place_stop_order(ticker, quantity, level, _DAY)
+        order_id, day_exc = place_stop_order(ticker, quantity, level, _DAY)
         if order_id is not None:
             _stop_validity = validity = _DAY
             logger.warning(
@@ -1005,6 +1030,14 @@ def _place_stop(ticker: str, quantity: float, level: float) -> tuple[str | None,
                 "accepted DAY — stops will be re-placed at each regular-session open. "
                 "Between sessions, and if this VM is down at the open, there is NO "
                 "resting stop.", exc,
+            )
+        else:
+            # Both refused: the ORDER is the problem, not its validity. Say what
+            # the broker said — without it, "could not place" is undiagnosable.
+            logger.error(
+                "Manual positions: the broker refused a stop for %s × %.8f @ $%.2f as "
+                "both GTC (%s) and DAY (%s)",
+                ticker, quantity, level, exc, day_exc,
             )
     elif order_id is None:
         logger.warning("Manual positions: stop placement for %s failed: %s", ticker, exc)
@@ -1020,7 +1053,7 @@ def _place_and_record(trade: dict, st: _TradeState, level: float, now: float) ->
     trade["trail_stop_price"] = max(_num(trade.get("trail_stop_price")) or level, level)
     st.last_place_attempt = now
     level = trade["trail_stop_price"]
-    order_id, validity = _place_stop(trade["ticker"], float(trade["quantity"]), level)
+    order_id, validity = _place_stop(trade["ticker"], _order_quantity(trade), level)
     if order_id is None:
         logger.error(
             "MANUAL [%s] trade=%d: could not place the stop at $%.2f — falling back to a "

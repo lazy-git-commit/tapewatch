@@ -33,6 +33,7 @@ are therefore organised around the safety properties rather than the features:
 """
 
 import base64
+import struct
 import threading
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
@@ -60,10 +61,15 @@ class _Clock:
         pass  # never wait in a test
 
 
+def _real(x):
+    """Round-trip through a 32-bit float, exactly as a PostgreSQL REAL column does."""
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
 class _FakeDB:
     """The manual-trade slice of storage.database, in memory. Mirrors the real
-    SQL semantics that matter — notably raise_manual_trail's widen-only
-    GREATEST()."""
+    SQL semantics that matter — raise_manual_trail's widen-only GREATEST(), and
+    quantity stored as a 32-bit REAL (which can read back MORE than was held)."""
 
     def __init__(self):
         self.rows: dict[int, dict] = {}
@@ -75,7 +81,7 @@ class _FakeDB:
         tid = self._next
         self._next += 1
         self.rows[tid] = dict(
-            id=tid, ticker=ticker, quantity=quantity, buy_price=buy_price,
+            id=tid, ticker=ticker, quantity=_real(quantity), buy_price=buy_price,
             mode=mode, buy_time=buy_time, trail_high_price=trail_high_price,
             trail_stop_price=trail_stop_price, stop_order_id=None,
             status="open", origin="manual", exit_reason=None, sell_price=None,
@@ -94,7 +100,7 @@ class _FakeDB:
             r["trail_stop_price"] = max(r["trail_stop_price"] or stop, stop)
 
     def update_manual_position(self, trade_id, quantity, buy_price):
-        self.rows[trade_id].update(quantity=quantity, buy_price=buy_price)
+        self.rows[trade_id].update(quantity=_real(quantity), buy_price=buy_price)
 
     def set_stop_order_id(self, trade_id, order_id):
         self.rows[trade_id]["stop_order_id"] = order_id
@@ -157,6 +163,9 @@ class _FakeBroker:
             return None, T212HTTPError(503, "Service Unavailable")
         if self.refuse_gtc and time_validity == "GOOD_TILL_CANCEL":
             return None, T212HTTPError(400, '{"detail": "timeValidity not supported"}')
+        if quantity > self._sellable(ticker) + 1e-12:
+            # T212 will not accept a sell for more shares than are held.
+            return None, T212HTTPError(400, '{"code": "SellingEquityNotOwned"}')
         oid = f"o{self._next}"
         self._next += 1
         self.orders[oid] = dict(id=oid, ticker=ticker, quantity=-quantity,
@@ -182,9 +191,18 @@ class _FakeBroker:
         self.fill_lookups += 1
         return self.fills.get(order_id)
 
+    def _sellable(self, ticker):
+        pos = self.positions.get(ticker)
+        if not pos:
+            return 0.0
+        return pos["quantity"] - (pos.get("pieQuantity") or 0.0)
+
     def sell(self, ticker, quantity, price, reason, *, force_market=False, extended=False):
         from trading.executor import OrderResult
         self.calls.append(("sell", ticker, quantity, reason, force_market))
+        if quantity > self._sellable(ticker) + 1e-12:
+            return OrderResult(success=False, ticker=ticker, quantity=quantity, price=price,
+                               order_id=None, error="HTTP 400 - SellingEquityNotOwned")
         self.positions.pop(ticker, None)
         return OrderResult(success=True, ticker=ticker, quantity=quantity,
                            price=price, order_id="sell-1", error=None)
@@ -1054,6 +1072,45 @@ class TestReviewFixes:
             before = h.quote_calls
             h.run(100.0, dt=5, n=6)
         assert h.quote_calls - before == 3
+
+
+class TestFractionalQuantity:
+    """2026-11-19, the first live position: 3.14159265 shares. The first stop
+    (sized from the broker) rested; every re-placement (sized from the REAL
+    column, 3.1415927 — more than held) was refused, so no stop rested."""
+
+    QTY = 3.14159265
+
+    def test_the_record_really_is_rounded_up(self):
+        assert _real(self.QTY) > self.QTY  # the premise of the bug
+
+    def test_a_moved_stop_is_sized_from_the_broker(self, h):
+        h.broker.hold("ACME_US_EQ", self.QTY, 100.0, 100.0)
+        h.run(100.0)
+        h.run(120.0, dt=40, n=2)  # new high → cancel + re-place
+        resting = h.broker.resting()
+        assert [o["stopPrice"] for o in resting] == [108.0]
+        assert -resting[0]["quantity"] == pytest.approx(self.QTY, abs=0) and \
+            -resting[0]["quantity"] <= self.QTY
+
+    def test_an_exit_sells_exactly_what_is_held(self, h):
+        h.broker.fail_place = True  # polled stop only
+        h.broker.hold("ACME_US_EQ", self.QTY, 100.0, 100.0)
+        h.run(100.0)
+        h.run(95.0)
+        h.run(91.0)  # falls through 92 → market sell
+        assert h.broker.kinds("sell")[0][2] <= self.QTY
+        assert h.db.only()["exit_reason"] == "trailing_stop"
+
+    def test_without_a_snapshot_the_record_is_floored_below_the_holding(self):
+        import monitor.manual_positions as mp
+        mp._broker_positions.clear()
+        assert mp._order_quantity({"ticker": "X", "quantity": _real(self.QTY)}) <= self.QTY
+
+    def test_a_pending_size_change_never_oversells(self):
+        import monitor.manual_positions as mp
+        mp._broker_positions["X"] = {"quantity": 4.0, "pieQuantity": 0}
+        assert mp._order_quantity({"ticker": "X", "quantity": 6.0}) == 4.0
 
 
 class TestReviewFixesOutsideTheManager:

@@ -7,6 +7,35 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v22.1 — 2026-11-19 (a fractional holding could not be re-stopped)
+
+Found on the first live position, within three minutes of its first stop move.
+
+The holding was 3.14159265 shares. The first stop was sized from the broker's
+own figure and rested fine. The first time the stop was RAISED it was
+re-placed from `trades.quantity` — a `REAL` (32-bit float) column, which reads
+3.14159265 back as 3.1415927: a hair MORE than is held. The broker refuses a
+sell for more shares than you own, so every re-placement, GTC and DAY alike,
+was rejected, and the position sat on the polled fallback with no resting stop
+while the `manual_stop_unprotected` alert fired.
+
+- Every manual sell order (stop or exit) is now sized by `_order_quantity()`:
+  the broker's own figure from the latest sync — the smaller of the two if a
+  size change is still awaiting confirmation — or, with no snapshot, the
+  stored figure floored to 6 decimal places. Never more than is held.
+- When the broker refuses a stop as BOTH GTC and DAY, its reason is now logged.
+  Without it, "could not place the stop" had no diagnosis in the log.
+- The test fakes now behave like production where it mattered: the fake
+  database stores quantity as a 32-bit REAL, and the fake broker refuses to
+  sell more than is held. The original suite used whole-share quantities,
+  which a float32 stores exactly — which is how this survived 43 mutations.
+
+`TestFractionalQuantity`, 5 tests. Not changed here: widening the column to
+DOUBLE PRECISION would fix the storage itself, but altering a column type on the
+live trades table belongs in its own change, not in a hotfix.
+
+---
+
 ## v22 — unreleased (a trailing stop for trades you open by hand; a lock on live money)
 
 The first code in the project that acts on a REAL-MONEY account — and on an
