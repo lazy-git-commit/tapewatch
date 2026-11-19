@@ -134,4 +134,9 @@ def _reset_process_level_state():
     _main._retry_queue.clear()
     _main._reeval_queue.clear()
 
+    # Manual-position manager (v22): pacing timers, previous readings, the
+    # broker snapshot and the GTC→DAY validity latch are all process-lifetime.
+    import monitor.manual_positions as _mp
+    _mp.reset_state()
+
     yield
