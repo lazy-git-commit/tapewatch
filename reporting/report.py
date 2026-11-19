@@ -31,16 +31,21 @@ logger = logging.getLogger(__name__)
 
 
 def generate_report() -> str:
-    """Return a plain-text performance report from all closed trades."""
+    """Return a plain-text performance report from all closed STRATEGY trades.
+
+    v22: positions opened by hand (origin='manual') are excluded — this report
+    is the strategy's record, and one hand-picked trade must not distort it."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM trades WHERE status = 'closed' AND mode = %s ORDER BY sell_time DESC",
+                "SELECT * FROM trades WHERE status = 'closed' AND mode = %s "
+                "AND origin = 'strategy' ORDER BY sell_time DESC",
                 (cfg.trading_mode,),
             )
             trades = cur.fetchall()
             cur.execute(
-                "SELECT * FROM trades WHERE status = 'open' AND mode = %s",
+                "SELECT * FROM trades WHERE status = 'open' AND mode = %s "
+                "AND origin = 'strategy'",
                 (cfg.trading_mode,),
             )
             open_trades = cur.fetchall()

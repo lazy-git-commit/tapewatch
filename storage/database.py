@@ -272,6 +272,38 @@ def init_db() -> None:
                 ALTER TABLE trades
                 ADD COLUMN IF NOT EXISTS entry_delay_seconds INTEGER
             """)
+            # ── Manual positions (v22) ───────────────────────────────────────
+            # origin: who opened the position. 'strategy' — the news pipeline;
+            # 'manual' — bought by hand and adopted by monitor/manual_positions.py
+            # for trailing-stop management.
+            #
+            # WHY a column and not just `mode`: a manual position lives in the
+            # live account while the strategy runs demo, so `mode` separates
+            # them TODAY — but only by coincidence of configuration. Every risk
+            # gate (kill switch, loss streak, max positions, ticker cooldown)
+            # and the strategy's own exit rules (take-profit, time stop, EOD
+            # flatten) must never see a hand-opened position, whatever the
+            # modes are set to, and its result must never enter the strategy's
+            # performance record. NOT NULL DEFAULT 'strategy' labels every
+            # existing row correctly in one statement.
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'strategy'
+            """)
+            # trail_high_price: highest CONFIRMED price since adoption (the
+            # trailing stop's anchor). trail_stop_price: the stop level in
+            # force — resting at the broker, or polled if placement failed.
+            # Both are persisted so a restart resumes the trail instead of
+            # resetting it to the buy price, and both are widen-only in SQL
+            # (raise_manual_trail) so no bug or race can ever lower the stop.
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS trail_high_price REAL
+            """)
+            cur.execute("""
+                ALTER TABLE trades
+                ADD COLUMN IF NOT EXISTS trail_stop_price REAL
+            """)
             # One-time backfill (v21.2): every pre-v21.1 row was a regular-hours
             # entry (extended-hours trading didn't exist before 2026-07-17), so
             # stamp them instead of re-deriving session from buy_time in every
@@ -658,11 +690,16 @@ def close_trade(
 
 
 def get_open_trades() -> list[dict]:
-    """Return currently open trades for the active trading mode only."""
+    """Return currently open STRATEGY trades for the active trading mode only.
+
+    v22: hand-opened positions (origin='manual') are excluded — this list
+    drives the strategy monitor's take-profit, time stop and EOD flatten, none
+    of which may ever act on a position you opened yourself."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM trades WHERE status = 'open' AND mode = %s",
+                "SELECT * FROM trades WHERE status = 'open' AND mode = %s "
+                "AND origin = 'strategy'",
                 (cfg.trading_mode,),
             )
             return [dict(r) for r in cur.fetchall()]
@@ -676,6 +713,7 @@ def was_recently_traded(ticker: str, hours: int = 24) -> bool:
                 """SELECT 1 FROM trades
                    WHERE ticker = %s
                    AND mode = %s
+                   AND origin = 'strategy'
                    AND (status = 'open'
                         OR buy_time::timestamptz >= (NOW() - make_interval(hours => %s)))
                    LIMIT 1""",
@@ -693,7 +731,8 @@ def count_open_trades() -> int:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT COUNT(*) AS n FROM trades WHERE status = 'open' AND mode = %s",
+                "SELECT COUNT(*) AS n FROM trades WHERE status = 'open' AND mode = %s "
+                "AND origin = 'strategy'",
                 (cfg.trading_mode,),
             )
             return int(cur.fetchone()["n"])
@@ -706,6 +745,7 @@ def count_trades_today() -> int:
             cur.execute(
                 """SELECT COUNT(*) AS n FROM trades
                    WHERE mode = %s
+                     AND origin = 'strategy'
                      AND (buy_time::timestamptz AT TIME ZONE 'Europe/London')::date =
                          (NOW() AT TIME ZONE 'Europe/London')::date""",
                 (cfg.trading_mode,),
@@ -750,7 +790,8 @@ def trading_days_since_last_trade() -> int | None:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT MAX((buy_time::timestamptz AT TIME ZONE 'Europe/London')::date) AS d
-                   FROM trades WHERE mode = %s AND buy_time IS NOT NULL""",
+                   FROM trades WHERE mode = %s AND origin = 'strategy'
+                   AND buy_time IS NOT NULL""",
                 (cfg.trading_mode,),
             )
             row = cur.fetchone()
@@ -798,7 +839,8 @@ def get_loss_streak() -> tuple[int, str | None]:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT profit_loss_pct, sell_time FROM trades
-                   WHERE mode = %s AND status = 'closed' AND sell_time IS NOT NULL
+                   WHERE mode = %s AND origin = 'strategy'
+                     AND status = 'closed' AND sell_time IS NOT NULL
                    ORDER BY sell_time DESC LIMIT 20""",
                 (cfg.trading_mode,),
             )
@@ -861,6 +903,7 @@ def get_today_realized_pnl() -> float:
             cur.execute(
                 """SELECT COALESCE(SUM(profit_loss), 0) AS pnl FROM trades
                    WHERE mode = %s
+                     AND origin = 'strategy'
                      AND status = 'closed'
                      AND sell_time IS NOT NULL
                      AND (sell_time::timestamptz AT TIME ZONE 'Europe/London')::date =
@@ -924,6 +967,95 @@ def update_trade_excursion(trade_id: int, gain_pct: float) -> None:
                           max_adverse_pct   = LEAST(COALESCE(max_adverse_pct, %s), %s)
                     WHERE id = %s""",
                 (gain_pct, gain_pct, gain_pct, gain_pct, trade_id),
+            )
+
+
+# ── Manual positions (v22) ────────────────────────────────────────────────────
+# Positions bought by hand and adopted by monitor/manual_positions.py. Every
+# write below is scoped `origin = 'manual'` in its WHERE clause, so none of them
+# can modify a strategy trade even if handed a strategy trade's id.
+
+def open_manual_trade(
+    ticker: str,
+    quantity: float,
+    buy_price: float,
+    mode: str,
+    buy_time: str,
+    trail_high_price: float,
+    trail_stop_price: float,
+) -> int:
+    """
+    Record a hand-opened position the manager has just adopted. Returns the id.
+
+    Quantity and price come from the BROKER's portfolio entry, not from a fill
+    this system observed — so buy_net_gbp / fx / fees are unknown and stay NULL,
+    and close_trade() falls back to the USD price difference for its P&L.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO trades
+                   (mode, origin, ticker, quantity, buy_price, buy_time, status,
+                    trail_high_price, trail_stop_price)
+                   VALUES (%s, 'manual', %s, %s, %s, %s, 'open', %s, %s)
+                   RETURNING id""",
+                (mode, ticker, quantity, buy_price, buy_time,
+                 trail_high_price, trail_stop_price),
+            )
+            row_id = cur.fetchone()["id"]
+            logger.info(
+                "Manual trade adopted: %s × %.4f @ $%.4f (mode=%s, id=%d)",
+                ticker, quantity, buy_price, mode, row_id,
+            )
+            return row_id
+
+
+def get_open_manual_trades(mode: str) -> list[dict]:
+    """Open hand-opened positions in `mode`'s account, oldest first."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT * FROM trades
+                   WHERE status = 'open' AND origin = 'manual' AND mode = %s
+                   ORDER BY id""",
+                (mode,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def raise_manual_trail(
+    trade_id: int,
+    high: float | None = None,
+    stop: float | None = None,
+) -> None:
+    """
+    Raise the trailing anchor and/or the stop level. WIDEN-ONLY, in SQL.
+
+    GREATEST() ignores a NULL argument in PostgreSQL, so passing None for
+    either value leaves that column untouched, and a lower value than the one
+    already stored is silently ignored. A trailing stop that can be LOWERED —
+    by a restart that recomputes from the buy price, a stale quote, or two
+    writers racing — is not a trailing stop, so the database refuses it.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE trades
+                      SET trail_high_price = GREATEST(trail_high_price, %s),
+                          trail_stop_price = GREATEST(trail_stop_price, %s)
+                    WHERE id = %s AND origin = 'manual'""",
+                (high, stop, trade_id),
+            )
+
+
+def update_manual_position(trade_id: int, quantity: float, buy_price: float) -> None:
+    """Follow a size change made by hand (bought more / sold part) in the app."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE trades SET quantity = %s, buy_price = %s
+                    WHERE id = %s AND origin = 'manual' AND status = 'open'""",
+                (quantity, buy_price, trade_id),
             )
 
 
@@ -1229,6 +1361,19 @@ _CRITICAL_EVENT_TYPES = {
     # gates are reasoning about a position that isn't there.
     "orphan_position",
     "phantom_position",
+    # v22 manual positions — each means a REAL-MONEY position is, or may be,
+    # without the protection you think it has:
+    #   manual_stop_unprotected   — regular hours, no resting stop for minutes
+    #   manual_below_stop         — price is already below the configured stop,
+    #                               so no stop can be placed (a sell stop above
+    #                               the market is not a valid order)
+    #   manual_account_unreachable — the account's API key does not work, so
+    #                               nothing can be adopted or protected at all
+    # The informational ones (adopted / closed / standing by for your own
+    # order) stay 'warning'.
+    "manual_stop_unprotected",
+    "manual_below_stop",
+    "manual_account_unreachable",
     # NOT critical, and deliberately so (v21.16): `claude_cache_ineffective`
     # means every call is paying full input price for a rubric that should be
     # cached — a cost regression, not a trading outage. Nothing stops being

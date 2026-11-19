@@ -111,7 +111,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(100.0 * SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS win_rate_pct FROM trades WHERE status = 'closed' AND mode = '$mode'",
+          "rawSql": "SELECT ROUND(100.0 * SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS win_rate_pct FROM trades WHERE status = 'closed' AND mode = '$mode' AND origin = 'strategy'",
           "format": "table",
           "refId": "A"
         }
@@ -162,7 +162,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(SUM(CASE WHEN sell_net_gbp IS NOT NULL AND buy_net_gbp IS NOT NULL THEN ABS(sell_net_gbp) - ABS(buy_net_gbp) ELSE profit_loss END)::numeric, 2) AS total_pnl FROM trades WHERE status = 'closed' AND mode = '$mode'",
+          "rawSql": "SELECT ROUND(SUM(CASE WHEN sell_net_gbp IS NOT NULL AND buy_net_gbp IS NOT NULL THEN ABS(sell_net_gbp) - ABS(buy_net_gbp) ELSE profit_loss END)::numeric, 2) AS total_pnl FROM trades WHERE status = 'closed' AND mode = '$mode' AND origin = 'strategy'",
           "format": "table",
           "refId": "A"
         }
@@ -195,7 +195,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT COUNT(*) AS total_trades FROM trades WHERE status = 'closed' AND mode = '$mode'",
+          "rawSql": "SELECT COUNT(*) AS total_trades FROM trades WHERE status = 'closed' AND mode = '$mode' AND origin = 'strategy'",
           "format": "table",
           "refId": "A"
         }
@@ -244,7 +244,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ticker, COALESCE(session, 'unknown') AS session, ROUND(quantity::numeric, 4) AS quantity, buy_time, ROUND(buy_price::numeric, 4) AS buy_price_usd, COALESCE(ROUND(buy_net_gbp::numeric, 2)::text, '—') AS buy_total_gbp, COALESCE(ROUND(buy_fees_gbp::numeric, 2)::text, '—') AS buy_fees_gbp, COALESCE(ROUND(buy_fx_rate::numeric, 4)::text, '—') AS buy_fx_rate, sell_time, ROUND(sell_price::numeric, 4) AS sell_price_usd, ROUND(sell_net_gbp::numeric, 2) AS sell_total_gbp, ROUND(sell_fees_gbp::numeric, 2) AS sell_fees_gbp, ROUND(sell_fx_rate::numeric, 4) AS sell_fx_rate, ROUND(profit_loss::numeric, 2) AS pnl_gbp, ROUND(profit_loss_pct::numeric, 2) AS pnl_pct, ROUND(max_favorable_pct::numeric, 2) AS mfe_pct, ROUND(max_adverse_pct::numeric, 2) AS mae_pct, ROUND((max_favorable_pct - profit_loss_pct)::numeric, 2) AS left_on_table_pct, exit_reason FROM trades WHERE status = 'closed' AND mode = '$mode' ORDER BY sell_time DESC LIMIT 100",
+          "rawSql": "SELECT ticker, COALESCE(session, 'unknown') AS session, ROUND(quantity::numeric, 4) AS quantity, buy_time, ROUND(buy_price::numeric, 4) AS buy_price_usd, COALESCE(ROUND(buy_net_gbp::numeric, 2)::text, '—') AS buy_total_gbp, COALESCE(ROUND(buy_fees_gbp::numeric, 2)::text, '—') AS buy_fees_gbp, COALESCE(ROUND(buy_fx_rate::numeric, 4)::text, '—') AS buy_fx_rate, sell_time, ROUND(sell_price::numeric, 4) AS sell_price_usd, ROUND(sell_net_gbp::numeric, 2) AS sell_total_gbp, ROUND(sell_fees_gbp::numeric, 2) AS sell_fees_gbp, ROUND(sell_fx_rate::numeric, 4) AS sell_fx_rate, ROUND(profit_loss::numeric, 2) AS pnl_gbp, ROUND(profit_loss_pct::numeric, 2) AS pnl_pct, ROUND(max_favorable_pct::numeric, 2) AS mfe_pct, ROUND(max_adverse_pct::numeric, 2) AS mae_pct, ROUND((max_favorable_pct - profit_loss_pct)::numeric, 2) AS left_on_table_pct, exit_reason FROM trades WHERE status = 'closed' AND mode = '$mode' AND origin = 'strategy' ORDER BY sell_time DESC LIMIT 100",
           "format": "table",
           "refId": "A"
         }
@@ -432,7 +432,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT ROUND(COALESCE(SUM(profit_loss), 0)::numeric, 2) AS today_pnl FROM trades WHERE mode = '$mode' AND status = 'closed' AND sell_time IS NOT NULL AND (sell_time::timestamptz AT TIME ZONE 'Europe/London')::date = (NOW() AT TIME ZONE 'Europe/London')::date",
+          "rawSql": "SELECT ROUND(COALESCE(SUM(profit_loss), 0)::numeric, 2) AS today_pnl FROM trades WHERE mode = '$mode' AND origin = 'strategy' AND status = 'closed' AND sell_time IS NOT NULL AND (sell_time::timestamptz AT TIME ZONE 'Europe/London')::date = (NOW() AT TIME ZONE 'Europe/London')::date",
           "format": "table",
           "refId": "A"
         }
@@ -486,7 +486,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT COUNT(*) AS trades_today FROM trades WHERE mode = '$mode' AND (buy_time::timestamptz AT TIME ZONE 'Europe/London')::date = (NOW() AT TIME ZONE 'Europe/London')::date",
+          "rawSql": "SELECT COUNT(*) AS trades_today FROM trades WHERE mode = '$mode' AND origin = 'strategy' AND (buy_time::timestamptz AT TIME ZONE 'Europe/London')::date = (NOW() AT TIME ZONE 'Europe/London')::date",
           "format": "table",
           "refId": "A"
         }
@@ -971,7 +971,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT COALESCE(session, 'unknown') AS session, COUNT(*) AS n, ROUND(100.0 * SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS win_rate_pct, ROUND(AVG(profit_loss_pct)::numeric, 2) AS avg_pnl_pct, ROUND(SUM(profit_loss)::numeric, 2) AS total_pnl_gbp FROM trades WHERE status = 'closed' AND mode = '$mode' GROUP BY 1 ORDER BY total_pnl_gbp DESC",
+          "rawSql": "SELECT COALESCE(session, 'unknown') AS session, COUNT(*) AS n, ROUND(100.0 * SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS win_rate_pct, ROUND(AVG(profit_loss_pct)::numeric, 2) AS avg_pnl_pct, ROUND(SUM(profit_loss)::numeric, 2) AS total_pnl_gbp FROM trades WHERE status = 'closed' AND mode = '$mode' AND origin = 'strategy' GROUP BY 1 ORDER BY total_pnl_gbp DESC",
           "format": "table",
           "refId": "A"
         }
@@ -1000,7 +1000,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT exit_reason, COUNT(*) AS n, ROUND(AVG(profit_loss_pct)::numeric, 2) AS avg_pnl_pct, ROUND(SUM(profit_loss)::numeric, 2) AS total_pnl_gbp FROM trades WHERE status = 'closed' AND mode = '$mode' AND exit_reason IS NOT NULL AND sell_time::timestamptz >= NOW() - INTERVAL '30 days' GROUP BY exit_reason ORDER BY n DESC",
+          "rawSql": "SELECT exit_reason, COUNT(*) AS n, ROUND(AVG(profit_loss_pct)::numeric, 2) AS avg_pnl_pct, ROUND(SUM(profit_loss)::numeric, 2) AS total_pnl_gbp FROM trades WHERE status = 'closed' AND mode = '$mode' AND origin = 'strategy' AND exit_reason IS NOT NULL AND sell_time::timestamptz >= NOW() - INTERVAL '30 days' GROUP BY exit_reason ORDER BY n DESC",
           "format": "table",
           "refId": "A"
         }
@@ -1029,7 +1029,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT exit_reason, COUNT(*) AS n, ROUND(AVG(profit_loss_pct)::numeric, 2) AS avg_realised_pct, ROUND(AVG(max_favorable_pct)::numeric, 2) AS avg_mfe_pct, ROUND(AVG(max_adverse_pct)::numeric, 2) AS avg_mae_pct, ROUND(AVG(max_favorable_pct - profit_loss_pct)::numeric, 2) AS avg_left_on_table, ROUND(MAX(max_favorable_pct)::numeric, 2) AS best_mfe_pct FROM trades WHERE status = 'closed' AND mode = '$mode' AND exit_reason IS NOT NULL AND max_favorable_pct IS NOT NULL GROUP BY exit_reason ORDER BY n DESC",
+          "rawSql": "SELECT exit_reason, COUNT(*) AS n, ROUND(AVG(profit_loss_pct)::numeric, 2) AS avg_realised_pct, ROUND(AVG(max_favorable_pct)::numeric, 2) AS avg_mfe_pct, ROUND(AVG(max_adverse_pct)::numeric, 2) AS avg_mae_pct, ROUND(AVG(max_favorable_pct - profit_loss_pct)::numeric, 2) AS avg_left_on_table, ROUND(MAX(max_favorable_pct)::numeric, 2) AS best_mfe_pct FROM trades WHERE status = 'closed' AND mode = '$mode' AND origin = 'strategy' AND exit_reason IS NOT NULL AND max_favorable_pct IS NOT NULL GROUP BY exit_reason ORDER BY n DESC",
           "format": "table",
           "refId": "A"
         }
@@ -1058,7 +1058,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT COALESCE(t.entry_reason, 'pre-v21.16 (unrecorded)') AS entry_reason, COUNT(*) AS n, ROUND(AVG(t.entry_momentum_pct)::numeric, 2) AS avg_entry_momentum_pct, ROUND(AVG(t.entry_delay_seconds)::numeric, 0) AS avg_wait_secs, ROUND(AVG((t.buy_price - t.signal_price) / t.signal_price * 100)::numeric, 2) AS avg_wait_cost_pct, ROUND(AVG(t.profit_loss_pct)::numeric, 2) AS avg_realised_pct, ROUND((100.0 * SUM(CASE WHEN t.profit_loss_pct > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0))::numeric, 0) AS win_pct, ROUND((100.0 * SUM(CASE WHEN t.exit_reason = 'stop_loss' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0))::numeric, 0) AS stopped_out_pct FROM trades t WHERE t.status = 'closed' AND t.mode = '$mode' GROUP BY 1 ORDER BY n DESC",
+          "rawSql": "SELECT COALESCE(t.entry_reason, 'pre-v21.16 (unrecorded)') AS entry_reason, COUNT(*) AS n, ROUND(AVG(t.entry_momentum_pct)::numeric, 2) AS avg_entry_momentum_pct, ROUND(AVG(t.entry_delay_seconds)::numeric, 0) AS avg_wait_secs, ROUND(AVG((t.buy_price - t.signal_price) / t.signal_price * 100)::numeric, 2) AS avg_wait_cost_pct, ROUND(AVG(t.profit_loss_pct)::numeric, 2) AS avg_realised_pct, ROUND((100.0 * SUM(CASE WHEN t.profit_loss_pct > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0))::numeric, 0) AS win_pct, ROUND((100.0 * SUM(CASE WHEN t.exit_reason = 'stop_loss' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0))::numeric, 0) AS stopped_out_pct FROM trades t WHERE t.status = 'closed' AND t.mode = '$mode' AND t.origin = 'strategy' GROUP BY 1 ORDER BY n DESC",
           "format": "table",
           "refId": "A"
         }
@@ -1087,7 +1087,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT t.ticker, to_char(t.buy_time::timestamptz, 'MM-DD HH24:MI') AS bought, s.catalyst_type, t.entry_reason, ROUND(t.entry_momentum_pct::numeric, 2) AS entry_momentum_pct, t.entry_delay_seconds AS wait_secs, ROUND(t.signal_price::numeric, 2) AS signal_price, ROUND(t.buy_price::numeric, 2) AS fill_price, ROUND(((t.buy_price - t.signal_price) / t.signal_price * 100)::numeric, 2) AS wait_cost_pct, ROUND(t.profit_loss_pct::numeric, 2) AS realised_pct, ROUND(t.max_favorable_pct::numeric, 2) AS mfe_pct, t.exit_reason FROM trades t LEFT JOIN news_signals s ON s.id = t.signal_id WHERE t.mode = '$mode' ORDER BY t.buy_time DESC LIMIT 50",
+          "rawSql": "SELECT t.ticker, to_char(t.buy_time::timestamptz, 'MM-DD HH24:MI') AS bought, s.catalyst_type, t.entry_reason, ROUND(t.entry_momentum_pct::numeric, 2) AS entry_momentum_pct, t.entry_delay_seconds AS wait_secs, ROUND(t.signal_price::numeric, 2) AS signal_price, ROUND(t.buy_price::numeric, 2) AS fill_price, ROUND(((t.buy_price - t.signal_price) / t.signal_price * 100)::numeric, 2) AS wait_cost_pct, ROUND(t.profit_loss_pct::numeric, 2) AS realised_pct, ROUND(t.max_favorable_pct::numeric, 2) AS mfe_pct, t.exit_reason FROM trades t LEFT JOIN news_signals s ON s.id = t.signal_id WHERE t.mode = '$mode' AND t.origin = 'strategy' ORDER BY t.buy_time DESC LIMIT 50",
           "format": "table",
           "refId": "A"
         }

@@ -29,11 +29,13 @@ the portfolio's total value, capped to available cash.
 """
 
 import base64
+import contextvars
 import logging
 import math
 import threading
 import time
 import requests
+from contextlib import contextmanager
 from dataclasses import dataclass
 from config.settings import cfg
 from market.twelvedata_bars import get_gbp_usd_rate
@@ -42,6 +44,93 @@ logger = logging.getLogger(__name__)
 
 _T212_DEMO = "https://demo.trading212.com/api/v0"
 _T212_LIVE = "https://live.trading212.com/api/v0"
+
+# ── Which account a call goes to (v22) ───────────────────────────────────────
+# Every T212 call used to go to ONE account, chosen globally by TRADING_MODE.
+# Manual-position management needs a second one — the strategy keeps trading
+# demo while a position you opened by hand is protected in the live account —
+# so the account is now chosen per EXECUTION CONTEXT: `with use_account("live")`
+# redirects every call made inside the block, and nothing outside it.
+#
+# A ContextVar rather than a module global or a parameter threaded through
+# every function, because the scheduler runs jobs on a shared pool of worker
+# threads: a global would leak the live account into whichever strategy job ran
+# next on that thread, and a parameter would have to reach every helper (and
+# every test double) without exception. A ContextVar is per-thread by default
+# and is restored by `use_account` on exit, however the block exits.
+_account_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "t212_account_override", default=None,
+)
+
+
+def active_account() -> str:
+    """'live' or 'demo' — the account the next T212 call from here will hit."""
+    override = _account_override.get()
+    if override is not None:
+        return override
+    return "live" if cfg.is_live else "demo"
+
+
+@contextmanager
+def use_account(account: str):
+    """
+    Route every T212 call made inside the block to `account`.
+
+    SELL-SIDE ONLY: buy orders placed from inside this block are refused by
+    _guard_order() regardless of any setting. It exists to manage positions
+    opened by hand, and nothing that manages a position may also add to it.
+    """
+    account = (account or "").strip().lower()
+    if account not in ("demo", "live"):
+        raise ValueError(f"unknown Trading 212 account {account!r} (expected 'demo' or 'live')")
+    token = _account_override.set(account)
+    try:
+        yield
+    finally:
+        _account_override.reset(token)
+
+
+class OrderBlocked(Exception):
+    """A buy order refused locally, before any request reached the broker."""
+
+
+def _buy_block_reason() -> str | None:
+    """Why a BUY may not be placed from the current context, or None if it may."""
+    if _account_override.get() is not None:
+        return ("manual-position management is sell-only — it never opens or "
+                "adds to a position")
+    if active_account() == "live" and not cfg.live_entries_enabled:
+        return ("LIVE_ENTRIES_ENABLED is false — the automated strategy may not "
+                "buy in the live account")
+    return None
+
+
+def _guard_order(path: str, payload: dict) -> None:
+    """
+    The chokepoint: every write to the broker passes through _post(), and
+    whenever buying is blocked this lets exactly ONE kind of request through —
+    a SELL order (a finite NEGATIVE quantity on an /equity/orders/ endpoint,
+    T212's convention).
+
+    Placed at the HTTP layer rather than only in buy() so that no code path —
+    including one written later — can reach the live account with a buy.
+    Everything else is refused: a positive, missing or unparseable quantity,
+    and any POST to a non-order endpoint (a Pie, say, can buy indirectly). In
+    a blocked context a sell is the only write this system ever needs, so an
+    allow-list of one is not a restriction, it is the specification. Failing
+    closed is the point.
+    """
+    reason = _buy_block_reason()
+    if reason is None:
+        return
+    if path.startswith("/equity/orders/"):
+        try:
+            qty = float(payload.get("quantity")) if isinstance(payload, dict) else math.nan
+        except (TypeError, ValueError):
+            qty = math.nan
+        if math.isfinite(qty) and qty < 0:
+            return  # a sell — always allowed
+    raise OrderBlocked(f"request to {path} refused before reaching the broker: {reason}")
 
 # symbol → T212 ticker code, e.g. "SUNE" → "JCS_US_EQ"
 # T212 keeps original IPO/SPAC codes even after a company changes its exchange ticker,
@@ -63,11 +152,11 @@ _t212_to_symbol: dict[str, str] = {}
 
 
 def _base_url() -> str:
-    return _T212_LIVE if cfg.is_live else _T212_DEMO
+    return _T212_LIVE if active_account() == "live" else _T212_DEMO
 
 
 def _auth_header() -> dict:
-    if cfg.is_live:
+    if active_account() == "live":
         key_id, key = cfg.trading212_api_key_id, cfg.trading212_api_key
     else:
         key_id, key = cfg.trading212_demo_api_key_id, cfg.trading212_demo_api_key
@@ -293,7 +382,28 @@ def _get(path: str) -> dict:
     return resp.json()
 
 
+_AUDIT_KEYS = ("ticker", "quantity", "limitPrice", "stopPrice", "timeValidity", "extendedHours")
+
+
+def _audit_write(method: str, path: str, payload: dict | None = None) -> None:
+    """
+    One INFO line per WRITE to the broker, naming the account it is going to.
+
+    With the demo strategy and a live manual position sharing one process,
+    "Order 123 cancelled" no longer says whether real money moved. Every order
+    placement and cancellation now leaves a line saying LIVE or DEMO, written
+    BEFORE the request is sent — so even a request that hangs or crashes the
+    process is on record. Carries no credentials: only the order's own fields.
+    """
+    detail = ""
+    if isinstance(payload, dict):
+        detail = " ".join(f"{k}={payload[k]}" for k in _AUDIT_KEYS if k in payload)
+    logger.info("T212 %s -> %s %s %s", active_account().upper(), method, path, detail)
+
+
 def _post(path: str, payload: dict) -> dict:
+    _guard_order(path, payload)
+    _audit_write("POST", path, payload)
     resp = requests.post(
         f"{_base_url()}{path}",
         headers={**_auth_header(), "Content-Type": "application/json"},
@@ -306,6 +416,7 @@ def _post(path: str, payload: dict) -> dict:
 
 
 def _delete(path: str) -> dict:
+    _audit_write("DELETE", path)
     resp = requests.delete(f"{_base_url()}{path}", headers=_auth_header(), timeout=10)
     if not resp.ok:
         raise T212HTTPError(resp.status_code, resp.text)
@@ -472,15 +583,20 @@ def _fetch_cash(max_age_seconds: float = _CASH_CACHE_TTL_SECONDS) -> dict:
     cause; use _fetch_cash_or_none() where None is the wanted signal.
     """
     global _cash_cache
+    account = active_account()
     with _cash_lock:
         cached = _cash_cache
-        if cached is not None and (time.time() - cached[0]) <= max_age_seconds:
+        # v22: the entry carries the account it was fetched from and is only
+        # served back to that account — one account's balance must never size,
+        # snapshot or kill-switch another's.
+        if (cached is not None and cached[-1] == account
+                and (time.time() - cached[0]) <= max_age_seconds):
             return cached[1]
         last_exc: Exception = RuntimeError("cash fetch made no attempt")
         for attempt in (1, 2):
             try:
                 data = _get("/equity/account/cash")
-                _cash_cache = (time.time(), data)
+                _cash_cache = (time.time(), data, account)
                 return data
             except Exception as exc:
                 last_exc = exc
@@ -541,6 +657,39 @@ def get_broker_positions() -> dict[str, float] | None:
         }
     except Exception as exc:
         logger.warning("get_broker_positions failed: %s — skipping reconciliation", exc)
+        return None
+
+
+def get_broker_portfolio() -> list[dict] | None:
+    """
+    Every open position in the active account as the broker reports it —
+    ticker, quantity, averagePrice, currentPrice, initialFillDate, pieQuantity.
+
+    None on failure, never an empty list: to a caller that adopts and closes
+    positions, "the broker is unreachable" and "you hold nothing" demand
+    opposite actions, and a timeout must never look like a sale.
+    """
+    try:
+        data = _get("/equity/portfolio")
+        positions = data if isinstance(data, list) else data.get("positions", [])
+        return [p for p in positions if isinstance(p, dict)]
+    except Exception as exc:
+        logger.warning("get_broker_portfolio failed: %s", exc)
+        return None
+
+
+def get_pending_orders() -> list[dict] | None:
+    """
+    Orders currently live on the book in the active account, or None on
+    failure. Used to notice sell orders a human placed in the app, so the
+    manual-position manager never fights them for the same shares.
+    """
+    try:
+        data = _get("/equity/orders")
+        items = data if isinstance(data, list) else (data.get("items") or data.get("orders") or [])
+        return [o for o in items if isinstance(o, dict)]
+    except Exception as exc:
+        logger.warning("get_pending_orders failed: %s", exc)
         return None
 
 
@@ -752,7 +901,8 @@ def cancel_order(order_id: str) -> bool:
         return False
 
 
-def place_stop_loss(ticker: str, quantity: float, stop_price: float) -> str | None:
+def place_stop_loss(ticker: str, quantity: float, stop_price: float,
+                    time_validity: str = "DAY") -> str | None:
     """
     Place a resting STOP (stop-market) sell at the broker, immediately after
     a buy fills.
@@ -777,26 +927,48 @@ def place_stop_loss(ticker: str, quantity: float, stop_price: float) -> str | No
     Returns the order id, or None if placement failed — the monitor then
     falls back to polled stop checking for this position, so a failed
     placement degrades gracefully rather than leaving the position unmanaged.
+
+    time_validity: "DAY" for strategy trades (the EOD flatten closes them
+    anyway); "GOOD_TILL_CANCEL" for manual positions held across sessions, so
+    the stop is already resting when the next session opens (v22).
+    """
+    order_id, exc = place_stop_order(ticker, quantity, stop_price, time_validity)
+    if order_id is None:
+        logger.warning(
+            "Could not place resting stop for %s (monitor will poll the stop instead): %s",
+            ticker, exc,
+        )
+    return order_id
+
+
+def place_stop_order(ticker: str, quantity: float, stop_price: float,
+                     time_validity: str = "DAY") -> tuple[str | None, Exception | None]:
+    """
+    place_stop_loss() that also says WHY it failed: (order_id, None) or
+    (None, exception).
+
+    The manual-position manager needs the reason. "The broker rejects this
+    order type" (HTTP 400) and "the broker is busy" (429, 5xx, a timeout) call
+    for opposite responses — fall back to another validity for good, versus try
+    the same order again shortly — and a bare None cannot tell them apart.
     """
     try:
         order = _post("/equity/orders/stop", {
             "quantity": -quantity,           # negative = sell
             "ticker": ticker,
             "stopPrice": _round_price(stop_price),
-            "timeValidity": "DAY",           # EOD flatten covers the close anyway
+            "timeValidity": time_validity,
         })
-        order_id = str(order.get("id", "")) or None
-        logger.info(
-            "Resting STOP placed: %s × %.4f @ $%.4f | order_id=%s",
-            ticker, quantity, stop_price, order_id,
-        )
-        return order_id
     except Exception as exc:
-        logger.warning(
-            "Could not place resting stop for %s (monitor will poll the stop instead): %s",
-            ticker, exc,
-        )
-        return None
+        return None, exc
+    order_id = str(order.get("id", "")) or None
+    if order_id is None:
+        return None, RuntimeError("broker response carried no order id")
+    logger.info(
+        "Resting STOP placed: %s × %.4f @ $%.4f (%s) | order_id=%s",
+        ticker, quantity, stop_price, time_validity, order_id,
+    )
+    return order_id, None
 
 
 def _post_order_with_retry(endpoint: str, payload: dict, ticker: str,
@@ -824,6 +996,9 @@ def _post_order_with_retry(endpoint: str, payload: dict, ticker: str,
     for attempt in range(2):
         try:
             return _post(endpoint, payload), None
+        except OrderBlocked as exc:
+            # Refused locally by design — retrying cannot change the answer.
+            return None, exc
         except Exception as exc:
             retryable = not isinstance(exc, T212HTTPError) or exc.retryable
             if attempt == 0 and retryable:
@@ -851,6 +1026,17 @@ def buy(
     book too thin to cross) — it is cancelled rather than left to execute
     blind at some future price, and the buy reports failure.
     """
+    # v22: refuse BEFORE sizing — sizing reads the account balance, and a buy
+    # that may not happen has no business calling the broker at all. _post()
+    # enforces the same rule again at the HTTP layer.
+    blocked = _buy_block_reason()
+    if blocked:
+        logger.critical("BUY %s REFUSED: %s", ticker, blocked)
+        return OrderResult(
+            success=False, ticker=ticker, quantity=0, price=price,
+            order_id=None, error=f"buy refused: {blocked}",
+        )
+
     size_factor = cfg.extended_size_factor if extended else 1.0
     quantity, err = calculate_quantity(ticker, price, avg_dollar_volume, size_factor)
     if quantity is None:

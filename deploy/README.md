@@ -52,6 +52,7 @@ for the assembled database URL.
 | `DB_HOST` / `DB_PORT` | *Optional* — default to `localhost` / `5432` |
 | `GRAFANA_ADMIN_PASSWORD` | Grafana admin password |
 | Provider API keys | See [`../.env.example`](../.env.example) |
+| `MANUAL_TICKERS` | *Optional* (v22) — hand-opened positions to protect with a trailing stop, e.g. `ACME`. A secret because what you hold is as private as where you host; unset = feature off. With `MANUAL_ACCOUNT=live`, `TRADING212_API_KEY` / `_ID` must be a key created inside that account, and if the key is IP-restricted the allowed address is the host's **public** egress IP — Trading 212 never sees a private-network address. |
 
 The workflow checks all of these are non-empty before it touches the host. A
 missing secret expands to an empty string, which turns `user@host` into `@host`

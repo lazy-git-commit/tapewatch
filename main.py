@@ -94,6 +94,7 @@ from trading.executor import (
     get_portfolio_value, get_account_summary,
 )
 from monitor.position_monitor import monitor_positions
+from monitor.manual_positions import manage_manual_positions, check_manual_account
 from premarket.scanner import in_premarket_window, premarket_scan, evaluate_premarket_candidates
 from analysis.forward_returns import compute_forward_returns
 from reporting.report import generate_report
@@ -582,6 +583,15 @@ def _risk_gates_pass() -> tuple[bool, str]:
     trading) but fail-CLOSED on the kill switch (if we can't verify today's
     P&L, the safe assumption after a losing streak is to stand down).
     """
+    # v22 live-money lock. cfg.validate() already refuses TRADING_MODE=live
+    # without LIVE_ENTRIES_ENABLED, and the executor refuses the order itself
+    # at the HTTP layer; this stops the cycle before it even prices a signal.
+    if cfg.is_live and not cfg.live_entries_enabled:
+        return False, (
+            "LIVE ENTRIES DISABLED: TRADING_MODE=live but LIVE_ENTRIES_ENABLED is "
+            "false — the automated strategy does not trade real money"
+        )
+
     # Daily kill switch — the one control that must never fail open.
     try:
         realized = get_today_realized_pnl()
@@ -1414,6 +1424,22 @@ def setup_scheduler() -> BackgroundScheduler:
         misfire_grace_time=15,
     )
 
+    # v22: trailing-stop management for positions opened BY HAND, in whichever
+    # account MANUAL_ACCOUNT names. Registered only when MANUAL_TICKERS is set,
+    # so a default deployment's job list is exactly what it was. One instance
+    # at a time: two overlapping cycles could both cancel-and-replace the same
+    # stop.
+    if cfg.manual_enabled:
+        scheduler.add_job(
+            manage_manual_positions,
+            trigger=IntervalTrigger(seconds=cfg.monitor_interval_seconds),
+            id="manual_positions",
+            name="Manual positions (trailing stop)",
+            misfire_grace_time=15,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # Nightly eval loop: forward returns for every Claude classification.
     # 22:30 UTC is after the US close year-round (21:00 BST / 20:00 GMT close).
     scheduler.add_job(
@@ -1462,6 +1488,16 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("  MOMENTUM TRADER STARTING")
     logger.info("  Mode: %s", cfg.trading_mode.upper())
+    logger.info(
+        "  Live strategy entries: %s",
+        "ENABLED — the strategy may buy with real money" if cfg.live_entries_enabled
+        else "disabled (LIVE_ENTRIES_ENABLED=false)",
+    )
+    if cfg.manual_enabled:
+        logger.info(
+            "  Manual positions: %s in the %s account (sell-side only)",
+            ",".join(cfg.manual_tickers), (cfg.manual_account or "?").upper(),
+        )
     logger.info("  Blocklist: %s", ", ".join(cfg.blocklist) if cfg.blocklist else "none")
     if version:
         logger.info("  Deployed: %s", version.get("deployed_at", "unknown"))
@@ -1472,6 +1508,9 @@ def main() -> None:
     cfg.validate()
     init_db()
     build_symbol_map()
+    # v22: prove the manual account's API key works NOW, at deploy time — not
+    # at the moment a stop needs placing. Read-only; never blocks startup.
+    check_manual_account()
 
     # Print current report on startup
     print(generate_report())

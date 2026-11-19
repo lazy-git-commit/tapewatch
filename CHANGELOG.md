@@ -7,6 +7,171 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v22 — unreleased (a trailing stop for trades you open by hand; a lock on live money)
+
+The first code in the project that acts on a REAL-MONEY account — and on an
+ISA that also holds investments this system knows nothing about. Two features,
+designed together because each is only safe with the other.
+
+### 1. The live-money lock (`LIVE_ENTRIES_ENABLED`, default `false`)
+
+The automated strategy has no measurable edge (docs/RESULTS.md) and must never
+buy with real money by accident. It is now refused in four independent places:
+
+- `cfg.validate()` refuses `TRADING_MODE=live` unless `LIVE_ENTRIES_ENABLED=true`
+  — arming the strategy for real money takes two deliberate settings, never one;
+- `main._risk_gates_pass()` stands the cycle down before any signal is priced;
+- `executor.buy()` refuses before sizing, so not even the balance is read;
+- **`executor._post()` — the chokepoint.** Whenever buying is blocked, the only
+  request allowed to reach the broker is a SELL order (a finite negative
+  quantity on an `/equity/orders/` endpoint). A positive, missing or unreadable
+  quantity is refused, and so is any non-order write (a Pie can buy
+  indirectly). No code path, present or future, can reach the live account
+  with a buy.
+
+### 2. Manual positions (`monitor/manual_positions.py`)
+
+Buy a stock yourself in the Trading 212 app, list it in `MANUAL_TICKERS`, and
+the system rests a stop under it at the broker and keeps raising that stop as
+the price makes new highs. T212 has no trailing-stop order on Invest/ISA
+accounts (Help Centre: CFD only), so the trail is emulated by moving an
+ordinary stop.
+
+    stop = max(average × (1 − MANUAL_INITIAL_STOP_PCT),
+               highest confirmed price × (1 − MANUAL_TRAIL_PCT),
+               the previous stop)
+
+**Account selection is per execution context, not global.** The strategy keeps
+trading demo while this manages a position in the live account:
+`executor.use_account("live")` routes every call made inside the block, via a
+`ContextVar`. A module global would leak the live account into whichever
+strategy job next ran on the same scheduler worker thread; the job also runs in
+a copied context so even a missed restore cannot leak. **Inside that context
+buying is refused regardless of any setting** — the manager is sell-side only.
+
+Safety properties, each mutation-tested:
+
+- **Only what you list.** Every other holding in the account is invisible:
+  never adopted, never sold, never alerted on. Logs report counts, never the
+  portfolio; a likely mis-typed code (T212's `FLY1_US_EQ` re-used-symbol shape)
+  is named and nothing else is.
+- **Confirmed highs only.** A new high counts once two consecutive readings
+  agree on it (the lower of the two) — one bad print cannot drag the stop up.
+- **The stop only moves up** — in code, and again in SQL (`GREATEST()` in
+  `raise_manual_trail`).
+- **Paced moves.** Raising a stop is cancel + re-place (no "modify order"), with
+  no stop resting in between; it moves only by ≥ `MANUAL_STOP_STEP_PCT` and at
+  most every `MANUAL_STOP_MIN_MOVE_SECONDS` (cf. HOG 2026-07-23: one 429 and 32
+  minutes without a stop).
+- **Never fights a human.** A sell order you placed puts it on stand-by until
+  that order is gone; cancelling the bot's stop in the app means hands-off for
+  10 minutes; removing a ticker from the list releases it (its last stop is
+  left resting).
+- **When unsure, do nothing.** A broker timeout is never read as "you sold it"
+  (a position must be absent on two syncs running), an unknown order state is
+  presumed live, and a price already below the stop at adoption is alerted
+  (`manual_below_stop`, critical), never sold into.
+- **GOOD_TILL_CANCEL stops**, so protection is already resting when the next
+  session opens and survives the VM being down. DAY is used only if the broker
+  refuses GTC, and that is logged loudly.
+- **Crash recovery.** The stop level is persisted BEFORE placement, so an order
+  whose id was lost in a crash is recognised as the bot's own by its exact
+  price rather than parking the manager in stand-by forever.
+
+What a stop cannot do, stated in the module docstring and `.env.example`: it
+does not protect against gaps (a stock opening below it sells at the open), it
+does not execute outside 09:30–16:00 ET, and it does not execute during a halt.
+
+### `trades.origin`
+
+`'strategy' | 'manual'`, `NOT NULL DEFAULT 'strategy'`, so every existing row
+is labelled correctly in one statement. Every query behind a strategy risk gate
+or exit (kill switch, loss streak, position cap, ticker cooldown, drought
+alert, the strategy monitor's open-trade list) and the performance report now
+filter `origin = 'strategy'`. `mode` already separated live from demo — but
+only by coincidence of configuration; a hand-opened trade must never reach the
+strategy's exits or its performance record whatever the modes are set to.
+`trail_high_price` / `trail_stop_price` persist the trail across restarts.
+
+Also: the T212 cash cache is now keyed by account and only served back to the
+account it was fetched from.
+
+### Audit trail
+
+Every WRITE to the broker (order placement or cancellation, from the strategy
+or the manager) now logs one line naming its account — `T212 LIVE -> POST
+/equity/orders/stop ticker=… quantity=… stopPrice=…` — written BEFORE the request
+is sent, so even a request that hangs is on record. A stop move logs its old and
+new level and why; the manager announces each regular session ("watching ACME;
+held: none yet") so silence before a purchase is distinguishable from a dead
+job. Grep the journal for `MANUAL` and `T212 LIVE`.
+
+### Configuration (deploy.yml)
+
+The ticker list comes from an optional `MANUAL_TICKERS` **secret**, not from the
+public workflow file: what an operator holds is as private as the host it runs
+on, and GitHub masks secret values in the public Actions logs. Unset = off.
+Public values: `MANUAL_ACCOUNT=live`, trail 15% / initial stop 15%,
+`MANUAL_MAX_HOLD_DAYS=2`. The 15% was measured, not picked: replaying the
+manager's rules on hourly bars for 14 large 2025 US IPOs, the median worst drop
+from the running high over the first two sessions was 23.7% (middle half
+15–28%), so tighter trails are close to a guaranteed exit on ordinary swings
+(8%: 13 of 14 stopped; 10%: 11; 15%: 8; 20%: 5; 25%: 2). No trail beat simply
+holding over the window in that sample (holding −0.6% mean) — the stop is a
+cap on the loss, not an edge. n=14, one year, hot IPOs only.
+
+### Review fixes (before the first live deploy)
+
+A review of the PR found nine real defects; each is fixed and pinned by a test.
+
+- **A passing blip could cost the overnight stop.** `place_stop_loss()` returns
+  None for every failure, so one 429 on a GOOD_TILL_CANCEL placement (likely
+  right after cancelling the old stop) was read as "GTC unsupported" and
+  latched every later stop to DAY — expiring at 16:00, so nothing rests
+  overnight or at the open. `place_stop_order()` now returns the error, and the
+  switch happens only when the broker REFUSES the GTC order itself (HTTP 400)
+  and accepts DAY.
+- **The de-spike rule could be fooled by one observation read twice.** The
+  broker's price only refreshes with each sync and a frozen feed repeats its
+  quote, so `min(spike, spike)` raised the trail permanently. Readings now carry
+  an observation identity (quote timestamp, or sync epoch) and a repeat is
+  ignored; quotes older than 120 s are not acted on (the upstream 20-minute
+  limit is a coverage check, not a trading one); and prices are read every
+  10 s, not every cycle — ~6 quote calls a minute from the shared budget.
+- **A stop that vanished without visible fill detail was treated as expired**,
+  so a new sell stop was placed on shares that were probably already sold, and
+  the sale was later recorded as yours at an estimate. It is now held as
+  "probably filled" until a sync AFTER the disappearance shows every share
+  still held (then: expired, re-place), or the shares are gone (then: the stop
+  filled — recorded as `trailing_stop`, attributed to its order).
+- **After a restart, an expired DAY stop was read as your cancellation**,
+  leaving ten minutes with no stop at the open. "Cancelled by a person" is now
+  decided by the validity the ORDER was placed with; unknown means expiry.
+- **Fill detail could be fetched twice** (up to 60 s blocked, ~40 rate-limited
+  calls) on the cancel/fill race path.
+- **`MANUAL_ACCOUNT` may no longer equal `TRADING_MODE`.** In one shared
+  account the strategy could buy the same stock, the manager would adopt those
+  shares, read the strategy's stop as yours and stand by for good.
+- **Each listed ticker is masked individually** in the deploy job: GitHub masks
+  a secret's whole value, and the service logs tickers one by one.
+- **Grafana's strategy panels now filter `origin = 'strategy'`** (all but
+  "Open Trades", where a live hand-opened position should be visible).
+
+Not changed: `_num()` duplicates the `_safe_float()` helpers in the market
+modules — a style point, left alone in a real-money change.
+
+### Tests
+
+`tests/test_manual_positions.py` (90 tests). **Mutation-tested: 43 mutations,
+43 caught** — 31 for the original design, 12 for the review fixes. The first
+run caught 28 of 29: removing the previous stop from the target formula broke
+nothing, because a RESTING stop is protected by two other layers — but tracing
+it found the POLLED fallback (no resting order) used the formula directly, so
+widening the trail would have silently lowered the trigger. A test for exactly
+that path closed it.
+
+---
+
 ## Public release — 2026-08-28 (the defaults become the configuration)
 
 Published as open source under Apache 2.0. No algorithm change, but one

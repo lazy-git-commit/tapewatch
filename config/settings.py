@@ -35,6 +35,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _env_float(name: str, fallback: str) -> float:
+    """float(os.getenv(name)) that treats an EMPTY value as unset.
+
+    The deploy workflow writes every key, and `KEY=` with nothing after it is
+    the natural way to leave one unset — but float("") raises at import and
+    crash-loops the service. Used for the manual-position settings, which are
+    the newest and the likeliest to be left blank.
+    """
+    raw = os.getenv(name, "").strip()
+    return float(raw if raw else fallback)
+
+
 @dataclass
 class Settings:
     # ── API Keys ──────────────────────────────────────────────────────────────
@@ -62,6 +74,76 @@ class Settings:
 
     # ── Trading Mode ──────────────────────────────────────────────────────────
     trading_mode: str = field(default_factory=lambda: os.getenv("TRADING_MODE", "demo"))
+
+    # ── Live-money lock for the AUTOMATED strategy (v22) ─────────────────────
+    # The news strategy has no measurable edge (docs/RESULTS.md), and the live
+    # account is a real ISA that also holds positions this system knows nothing
+    # about. So the strategy may only ever place a BUY against the live account
+    # when this is explicitly true — and validate() refuses TRADING_MODE=live
+    # without it, so arming the strategy for real money takes two deliberate
+    # changes, never one.
+    #
+    # Enforced twice: by validate() at startup, and by the executor at the HTTP
+    # layer, where any buy order bound for the live account is refused before
+    # a request is sent (trading/executor.py::_guard_order). The second layer
+    # exists so that no code path — present or future — can reach the live
+    # account with a buy by accident.
+    #
+    # Manual-position management (below) is unaffected: it is SELL-SIDE ONLY by
+    # construction and never needs this.
+    live_entries_enabled: bool = field(
+        default_factory=lambda: os.getenv("LIVE_ENTRIES_ENABLED", "false").lower() in ("1", "true", "yes")
+    )
+
+    # ── Manual positions: trailing stop on trades YOU opened (v22) ───────────
+    # Tickers you bought by hand that the system should protect with a
+    # trailing stop. Empty = feature off. Matched against the broker's
+    # instrument code (e.g. ACME_US_EQ) or its exchange symbol (ACME).
+    #
+    # ONLY these are ever touched: every other holding in the account is
+    # invisible to the manager — never adopted, never sold, never alerted on.
+    manual_tickers: list[str] = field(
+        default_factory=lambda: [
+            t.strip().upper() for t in os.getenv("MANUAL_TICKERS", "").split(",") if t.strip()
+        ]
+    )
+    # Which Trading 212 account holds them: "live" or "demo". No default on
+    # purpose — which account receives real orders is never left implicit.
+    # Independent of TRADING_MODE: the strategy can keep running in demo while
+    # this manages a position in the live account.
+    manual_account: str = field(
+        default_factory=lambda: os.getenv("MANUAL_ACCOUNT", "").strip().lower()
+    )
+    # The stop trails this % below the highest CONFIRMED price since adoption.
+    # Required (no default) when the feature is on: it is the single number
+    # that decides how much of the move you give back, and how much ordinary
+    # volatility you can sit through without being shaken out.
+    manual_trail_pct: float = field(
+        default_factory=lambda: _env_float("MANUAL_TRAIL_PCT", "0")
+    )
+    # Stop below your AVERAGE BUY PRICE before any new high has been made.
+    # Falls back to the trail % when unset.
+    manual_initial_stop_pct: float = field(
+        default_factory=lambda: _env_float(
+            "MANUAL_INITIAL_STOP_PCT", os.getenv("MANUAL_TRAIL_PCT", "").strip() or "0"
+        )
+    )
+    # Raising a stop is cancel + re-place (T212 has no "modify order"), and for
+    # the moment between the two calls no stop rests at all. So the stop moves
+    # only when the new level is at least this % above the old one...
+    manual_stop_step_pct: float = field(
+        default_factory=lambda: _env_float("MANUAL_STOP_STEP_PCT", "0.5")
+    )
+    # ...and no more often than this. HOG (2026-07-23) is what bursts of order
+    # calls cost: one HTTP 429 and 32 minutes with no stop at all.
+    manual_stop_min_move_seconds: int = field(
+        default_factory=lambda: int(_env_float("MANUAL_STOP_MIN_MOVE_SECONDS", "30"))
+    )
+    # Sell at market once the position has been held this many CALENDAR days
+    # (first regular session, 15 min after the open). 0 = no time limit.
+    manual_max_hold_days: int = field(
+        default_factory=lambda: int(_env_float("MANUAL_MAX_HOLD_DAYS", "0"))
+    )
 
     # ── Entry filters (signal confirmation) ───────────────────────────────────
     # Minimum Claude confidence (1–10 scale) required to act on a positive
@@ -634,16 +716,47 @@ class Settings:
         errors = []
         if self.trading_mode.lower() not in ("demo", "live"):
             errors.append("TRADING_MODE must be either 'demo' or 'live'")
-        if self.is_live:
+        # v22: pointing the automated strategy at real money takes TWO
+        # deliberate settings. With only TRADING_MODE=live the strategy would
+        # also manage and reconcile against the live account — an ISA holding
+        # positions this system does not own — while being unable to buy.
+        if self.is_live and not self.live_entries_enabled:
+            errors.append(
+                "TRADING_MODE=live requires LIVE_ENTRIES_ENABLED=true (the automated "
+                "strategy must be armed for real money explicitly). To protect a "
+                "position you opened by hand, keep TRADING_MODE=demo and use "
+                "MANUAL_TICKERS with MANUAL_ACCOUNT=live instead"
+            )
+        need_live_keys = self.is_live or (self.manual_enabled and self.manual_account == "live")
+        need_demo_keys = not self.is_live or (self.manual_enabled and self.manual_account == "demo")
+        if need_live_keys:
             if not self.trading212_api_key:
                 missing.append("TRADING212_API_KEY")
             if not self.trading212_api_key_id:
                 missing.append("TRADING212_API_KEY_ID")
-        else:
+        if need_demo_keys:
             if not self.trading212_demo_api_key:
                 missing.append("TRADING212_DEMO_API_KEY")
             if not self.trading212_demo_api_key_id:
                 missing.append("TRADING212_DEMO_API_KEY_ID")
+        if self.manual_enabled and self.manual_account not in ("demo", "live"):
+            errors.append(
+                "MANUAL_ACCOUNT must be 'live' or 'demo' when MANUAL_TICKERS is set "
+                "— which account receives real orders is never left implicit"
+            )
+        # The two managers' isolation rests on owning DIFFERENT accounts. In one
+        # shared account the strategy's ticker cooldown cannot see a manual
+        # position (it filters origin='strategy'), so it can buy the same
+        # stock; the manager would then adopt those shares into its own stop,
+        # read the strategy's resting stop as "your sell order" and stand by
+        # for good, while the strategy's reconciliation flags the manual
+        # holding as an orphan every minute.
+        elif self.manual_enabled and self.manual_account == self.trading_mode.strip().lower():
+            errors.append(
+                "MANUAL_ACCOUNT must be a different account from TRADING_MODE — in one "
+                "shared account the strategy and the manual manager can act on the same "
+                "shares"
+            )
         if not self.benzinga_api_key:
             missing.append("MASSIVE_BENZINGA_API_KEY")
         if not self.finnhub_api_key:
@@ -733,6 +846,19 @@ class Settings:
             # sell + at least one monitor-cycle retry before the venue change.
             ("EXTENDED_FLATTEN_BUFFER_MINUTES", self.extended_flatten_buffer_minutes >= 5),
         ]
+        if self.manual_enabled:
+            numeric_checks += [
+                # Required, no default: a 0% trail would rest the stop AT the
+                # high and sell on the first downtick. 50% is a sanity ceiling,
+                # not advice — past it the "stop" protects almost nothing.
+                ("MANUAL_TRAIL_PCT (must be set, 0–50)", 0 < self.manual_trail_pct <= 50),
+                ("MANUAL_INITIAL_STOP_PCT (0–50)", 0 < self.manual_initial_stop_pct <= 50),
+                ("MANUAL_STOP_STEP_PCT", self.manual_stop_step_pct >= 0),
+                # Each move is two order calls; a floor keeps the account well
+                # inside the broker's per-endpoint rate limits.
+                ("MANUAL_STOP_MIN_MOVE_SECONDS (>= 5)", self.manual_stop_min_move_seconds >= 5),
+                ("MANUAL_MAX_HOLD_DAYS", self.manual_max_hold_days >= 0),
+            ]
         errors.extend(name for name, ok in numeric_checks if not ok)
         if errors:
             raise ValueError("Invalid trading configuration: " + "; ".join(errors))
@@ -740,6 +866,11 @@ class Settings:
     @property
     def is_live(self) -> bool:
         return self.trading_mode.lower() == "live"
+
+    @property
+    def manual_enabled(self) -> bool:
+        """True when at least one hand-opened ticker is listed for management."""
+        return bool(self.manual_tickers)
 
 
 cfg = Settings()

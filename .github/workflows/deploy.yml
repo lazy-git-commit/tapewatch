@@ -108,6 +108,21 @@ jobs:
           esac
           echo "All required secrets present."
 
+      # GitHub masks a secret's WHOLE value. The service logs each listed ticker
+      # on its own, upper-cased and as a broker code (X_US_EQ), and the health
+      # check below prints the journal to this public log when a restart fails.
+      # A list like "abc, xyz" would therefore leak entry by entry, so register
+      # every entry as its own mask — in this job, before anything can print it.
+      - name: Mask hand-opened tickers in this job's logs
+        env:
+          MANUAL_TICKERS: ${{ secrets.MANUAL_TICKERS }}
+        run: |
+          IFS=',' read -ra entries <<< "${MANUAL_TICKERS:-}"
+          for entry in "${entries[@]}"; do
+            entry="$(printf '%s' "${entry}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+            if [ -n "${entry}" ]; then echo "::add-mask::${entry}"; fi
+          done
+
       # Joins the runner to the private network so it can reach the host.
       #
       # An OAuth client, not a plain auth key (changed 2026-08-11). Auth keys
@@ -258,6 +273,12 @@ jobs:
           # would crash-loop the service.
           QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
           QWEN_BASE_URL: ${{ secrets.QWEN_BASE_URL }}
+          # v22 — OPTIONAL. Which hand-opened positions the manager protects.
+          # A SECRET rather than a value in this file because this file is
+          # public: what an operator holds is as private as the host it runs
+          # on, and GitHub masks secret values in the public Actions logs.
+          # Unset = feature off (the safe default).
+          MANUAL_TICKERS: ${{ secrets.MANUAL_TICKERS }}
           DB_NAME: ${{ secrets.DB_NAME }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
@@ -295,6 +316,34 @@ jobs:
           QWEN_BASE_URL=${QWEN_BASE_URL}
           DB_URL=${DB_URL}
           TRADING_MODE=demo
+          # v22: the automated strategy may NEVER buy in the live account unless
+          # this is true. cfg.validate() refuses TRADING_MODE=live without it, and
+          # the executor refuses any live buy at the HTTP layer regardless.
+          LIVE_ENTRIES_ENABLED=false
+          # v22: trailing-stop protection for positions opened BY HAND. Only the
+          # tickers listed are ever touched (sell-side only); every other holding
+          # in the account is invisible to it. The list comes from the
+          # MANUAL_TICKERS secret (see the env block above); empty = off.
+          # MANUAL_ACCOUNT=live needs TRADING212_API_KEY / TRADING212_API_KEY_ID
+          # to be a key created INSIDE that account (for an ISA: in the ISA).
+          MANUAL_TICKERS=${MANUAL_TICKERS}
+          MANUAL_ACCOUNT=live
+          # How far below the highest confirmed price the stop trails, and how
+          # far below your average price it starts. 15/15 from a replay of 14
+          # large 2025 US IPOs on hourly bars: the median worst drop from the
+          # running high over the first two sessions was 23.7% (middle half
+          # 15-28%), so a trail under ~15% is close to a guaranteed exit on
+          # ordinary early swings (8%: 13/14 stopped; 15%: 8/14). No trail beat
+          # simply holding over the window in that sample — this is a cap on the
+          # loss, not an edge.
+          MANUAL_TRAIL_PCT=15
+          MANUAL_INITIAL_STOP_PCT=15
+          MANUAL_STOP_STEP_PCT=0.5
+          MANUAL_STOP_MIN_MOVE_SECONDS=30
+          # Sell at market after this many CALENDAR days (0 = no time limit).
+          # Counted from the first fill: two days from a Thursday purchase ends
+          # on Saturday, so the exit is Monday, 15 minutes after the open.
+          MANUAL_MAX_HOLD_DAYS=2
           BLOCKLIST=
           MIN_SENTIMENT_CONFIDENCE=7
           MIN_CATALYST_MAGNITUDE=2
