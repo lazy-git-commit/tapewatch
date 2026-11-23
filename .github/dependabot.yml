@@ -8,6 +8,15 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 5
     labels: ["dependencies"]
+    # One PR for all minor/patch bumps. main requires an up-to-date branch, so
+    # separate PRs can only merge one at a time — each needing a rebase, a CI
+    # run and its own production deploy (seven of them piled up by 2026-11).
+    # Major versions stay separate on purpose: a breaking change (see the
+    # anthropic note below) deserves a PR, a review and a deploy of its own.
+    groups:
+      python-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     ignore:
       # anthropic 1.0.0 removed `temperature` (and top_p/top_k) from
       # messages.create, and the method takes no **kwargs to absorb it:
@@ -36,3 +45,7 @@ updates:
     schedule:
       interval: "monthly"
     labels: ["dependencies", "ci"]
+    groups:
+      actions-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
