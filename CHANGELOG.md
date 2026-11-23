@@ -7,6 +7,78 @@ Format: `## v<N> — YYYY-MM-DD`
 
 ---
 
+## v22.2 — unreleased (the classifier is told which company it is scoring)
+
+Four fixes from a review of the 51 demo trades taken 2026-08-20 → 11-20. None of
+them creates an edge — the same review confirmed the August "no measurable edge"
+result out of sample (predicted −0.39%/trade, 32% win, 48% stopped; observed
+−0.56%, 25%, 49%). They make the system do what it already claimed to do.
+
+**1. Ticker attribution.** The classifier was sent only each article's id,
+headline and teaser — never its tagged tickers — and its one verdict per article
+was then copied to every tagged ticker. The rubric's STEP 2 ("is the tagged
+ticker the actual subject?") could not work, because the model was never told
+which ticker was tagged. Trade #61 bought AMZN on "Estée Lauder Turns Up the
+Glamour With Strong Earnings, Higher Outlook"; trade #45 bought NVDA on a Super
+Micro guidance article also tagged SMCI and WDC (SMCI and WDC were stopped by the
+price gates, so the copied verdict reached the one that passed).
+
+- Each batch entry carries its tags, shown on a `Tagged: COR (Cencora), …` line.
+  The symbol is the exchange symbol and the name comes from T212's instrument
+  catalogue (`executor.instrument_name()`, built with the symbol map), because
+  T212 keeps legacy codes — Cencora is `ABC_US_EQ` — and a bare unfamiliar
+  small-cap symbol would make the model drop the very names that move most.
+- New required output field `subject_tickers`, placed before the verdict in the
+  schema so the model commits to which company it is scoring before it scores.
+  Validated against the entry's own tags (case, the `SYM (Name)` echo and the
+  T212 code all accepted); the model cannot nominate an untagged ticker.
+- Only a named subject inherits the verdict. Every other tagged ticker is stored
+  in `sentiment_scores` as neutral, with the new `is_subject` column saying why
+  (TRUE / FALSE / NULL = no attribution given, and every pre-v22.2 row). A
+  missing or malformed `subject_tickers` **fails closed**: the article is kept
+  for the eval loop but never traded, with a WARNING per batch so a model that
+  stopped emitting the field cannot pass for a quiet news day.
+- The shadow classifier applies the same rule to its representative ticker, and
+  `classifier_compare` pairs attributed rows on (article_id, ticker) — legacy
+  rows, whose legs all carried one copied verdict, still borrow a measured leg.
+- The legacy Benzinga replay (`backtest/backtest.py`) passes its tags too.
+
+**2. Analyst forecast recaps filtered before Claude.** Benzinga's "<Company>
+Analysts Boost/Increase/Raise/Cut/Slash/Revise Their Forecasts Following …" and
+"… Most Accurate Analysts …" templates summarise sell-side estimate changes
+after the results; they are never the company's own news. The classifier scored
+them inconsistently, including as tradeable guidance_raise (MMM #46, WMT #82).
+Against every scored headline to 2026-11-23: 665 of 1,083 distinct headlines
+mentioning analysts match, every one analyst content; 95 had been scored
+positive, 11 as positive guidance_raise. Company guidance that uses the word
+("UnitedHealth Exec Sees … 2027 EPS Forecast", "Acme Raises FY26 Forecast")
+does not match.
+
+**3. Liquidity floor back to $5M.** The 2026-09-07 experiment lowered
+`MIN_DAILY_DOLLAR_VOLUME` to $2M to collect trades in $2M–$5M names. In eleven
+weeks it collected none — every stock traded had a 20-day dollar volume of
+roughly $57M or more — so it was only a widened gate.
+
+**4. Zero-trade alert once per drought.** `zero_trade_session` (critical) fired
+on 21 days between 2026-08-26 and 11-12, every one a quiet stretch between
+earnings seasons, and a real `orphan_position` alert sat among them. It now
+fires on the FIRST day a drought crosses the threshold; later days of the same
+drought record `zero_trade_session_ongoing` (warning). Six alerts instead of 21
+over the same period. It stays critical rather than being demoted, because it
+is the only tripwire for a failure nothing else detects (June 2026: nine silent
+sessions); if the earlier-alert lookup fails, it stays loud.
+
+`tests/test_v22_2.py`, 43 tests. **Mutation-tested: 31 mutations, 31 caught.**
+The first run caught 29; both misses were weak assertions — the attribution
+check was safe only by accident of the fan-out, and the INSERT check found
+`is_subject` in VALUES rather than in the column list.
+
+Not verified here: the real model's attribution behaviour. The tests fake Claude.
+After deploy, check that attributed rows appear and that genuine single-ticker
+raises keep `is_subject = TRUE` (query in docs/algorithm.md §3.2).
+
+---
+
 ## v22.1 — 2026-11-19 (a fractional holding could not be re-stopped)
 
 Found on the first live position, within three minutes of its first stop move.

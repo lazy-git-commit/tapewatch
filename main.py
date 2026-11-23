@@ -78,8 +78,8 @@ from storage.database import (
     is_article_seen, set_rejection_reason, clear_rejection, set_stop_order_id,
     touch_heartbeat, count_open_trades, count_trades_today, get_today_realized_pnl,
     update_premarket_candidate, save_snapshot,
-    trading_days_since_last_trade, record_system_event,
-    get_loss_streak, get_drawdown_from_peak,
+    trading_days_since_last_trade, drought_alerted_on_earlier_day,
+    record_system_event, get_loss_streak, get_drawdown_from_peak,
 )
 from news.fetcher import fetch_all_news, NewsItem
 from market.price_check import (
@@ -1324,8 +1324,16 @@ def check_zero_trade_drought() -> None:
     nothing traded and nothing alerted.
 
     It only RAISES AN ALERT — it never stands the system down. A multi-day drought
-    can be a legitimately bad tape, so a human looks and decides; record_system_event
-    de-dupes to one row per day so this won't spam.
+    can be a legitimately bad tape, so a human looks and decides.
+
+    v22.2 — ONCE per drought, not once per day. The critical event used to fire
+    every day of a drought: 21 days between 2026-08-26 and 2026-11-12, every one
+    a quiet stretch between earnings seasons (this strategy trades guidance
+    raises, which arrive with earnings), and a real orphan-position alert sat in
+    the middle of them. So the first day records the critical
+    `zero_trade_session`; every later day of the SAME drought records the
+    warning `zero_trade_session_ongoing`, which keeps it visible without paging.
+    A new entry ends the drought, and the next one alerts again.
     """
     try:
         idle = trading_days_since_last_trade()
@@ -1333,6 +1341,25 @@ def check_zero_trade_drought() -> None:
         logger.warning("zero-trade drought check failed: %s", exc)
         return
     if idle is None or idle < cfg.zero_trade_alert_sessions:
+        return
+    try:
+        already_alerted = drought_alerted_on_earlier_day()
+    except Exception as exc:
+        # Cannot tell → stay loud. A duplicate page is cheap; a silent drought
+        # is the failure this tripwire exists for.
+        logger.warning("zero-trade drought: could not check for an earlier alert (%s)", exc)
+        already_alerted = False
+    if already_alerted:
+        logger.warning(
+            "Zero-trade drought continues: %d consecutive trading sessions with no "
+            "trades (already alerted for this drought; threshold %d).",
+            idle, cfg.zero_trade_alert_sessions,
+        )
+        record_system_event(
+            "zero_trade_session_ongoing",
+            f"{idle} consecutive trading sessions with no trades — "
+            f"already alerted for this drought",
+        )
         return
     logger.critical(
         "ZERO-TRADE DROUGHT: %d consecutive trading sessions with no trades "

@@ -324,6 +324,10 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
                 "headline": html.unescape(a.get("title", "")),
                 "teaser": html.unescape(a.get("teaser") or a.get("body", "")[:200]),
                 "ticker": (a.get("_tickers") or [""])[0],
+                # v22.2: the classifier must be shown the tags to say which
+                # company an article is about; without them every replayed
+                # article would come back unattributed and never "trade".
+                "tagged": [{"symbol": t.upper()} for t in a["_tickers"]],
             }
             for a in pre_filtered
         ]
@@ -360,8 +364,12 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
                 continue
             sentiment = score["sentiment"]
             confidence = float(score.get("confidence") or 0.0)
+            # Same attribution rule as production (v22.2): only the tickers
+            # named as the article's subject inherit a positive verdict.
+            subjects = score.get("subject_tickers") or []
         else:
             sentiment, confidence = "positive", 1.0
+            subjects = None
 
         try:
             published_at = datetime.fromisoformat(
@@ -371,6 +379,8 @@ def run_backtest(date: datetime, use_sentiment: bool = True) -> list[TradeResult
             continue
 
         for ticker in a["_tickers"]:
+            if subjects is not None and ticker.upper() not in subjects:
+                continue
             key = (article_id, ticker)
             if key in seen_article_tickers:
                 continue

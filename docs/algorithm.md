@@ -102,7 +102,7 @@ trades, forward returns on all classified articles, and costed replay.
 | Dedup | `(article_id, ticker)` already in DB | Never re-score the same pair |
 | Scored-once | `_scored_articles` session set (v18) | With the 3-min freshness window an article appears in ~3 consecutive fetches; this guarantees exactly one Claude scoring per article per session (failed batches stay eligible for retry) |
 | Roundup | >3 tickers tagged → skip | Market digests have no per-stock catalyst (v11) |
-| Analyst action | headline matches `_ANALYST_ACTION_RE` → skip | `analyst_action` is never in `TRADEABLE_CATALYSTS`. A regex on the raw headline is far cheaper than a Claude call. Catches "reiterates buy", "price target", "upgrades to overweight", "initiates coverage" etc. Added v17.4. |
+| Analyst action | headline matches `_ANALYST_ACTION_RE` → skip | `analyst_action` is never in `TRADEABLE_CATALYSTS`. A regex on the raw headline is far cheaper than a Claude call. Catches "reiterates buy", "price target", "upgrades to overweight", "initiates coverage" etc. Added v17.4. **v22.2** adds Benzinga's analyst-roundup templates — *"<Company> Analysts Boost/Increase/Raise/Cut/Slash/Revise Their Forecasts Following …"* and *"… Most Accurate Analysts …"* — which summarise sell-side estimate changes after the results and are never the company's own news, yet were scored as tradeable `guidance_raise` (MMM #46, WMT #82). Validated against every scored headline to 2026-11-23: 665 of 1,083 distinct analyst headlines match, all analyst content (95 had been scored positive, 11 as positive guidance_raise); company guidance using the word "forecast" does not match. |
 | Digest/preview | headline matches `_DIGEST_RE` → skip | v20. Compilations ("Market-Moving News for July 10th", "Stocks To Watch", "Premarket Movers", "Earnings Scheduled For…", listicles) are written ABOUT the market with tickers tagged incidentally. One slid under the >3-ticker roundup filter with exactly 3 tickers on 2026-07-10 and was classified "earnings_beat, 80% conf" for THREE unrelated companies at once — the fabricated catalyst that bought the top of CRCL's 13% parabolic spike (−3.97%). Deterministic title check; no digest reaches Claude. The prompt also gained a "digests are never catalysts" rule as defense in depth (a digest classified fda_approval would still pass the catalyst gate — the regex is the reliable layer). |
 | Explainer/recap | headline matches `_EXPLAINER_RE` → skip | **v21.12.** An article ABOUT a price move that already happened is not the catalyst that caused it, and the primary newswire item arrives separately, so nothing tradeable is lost. Trade #25 (BE, 2026-08-04, −2.82%, the only trade that day) came from *"Bloom Energy Stock Charges Higher Tuesday: What's Driving the Post-Earnings Rally?"* — scored `guidance_raise`/positive/conf 0.75 with **`already_moved` = False**, while the headline states in its own words that the rally was underway; the stock was already +3.99% on the day at entry, and `already_moved` is the single field that would have blocked it. Covers *"What's Driving/Behind/Going On With…"*, *"Here's Why…"*, *"…Stock Charges/Climbs/Slides Higher\|Lower"*, *"…Shares Are Trading Higher\|Lower"*, *"…Stock Is Surging/Sinking/Rallying"*, *"post-earnings rally/selloff/reset"*. Claude usually gets these right (it spent `catalyst_type=recap_explainer` on 140 articles that same day) — this covers the case where the template names a real earnings/guidance event and drags the classification toward the catalyst. **Validated against 2,415 real scored headlines (2026-07-25 → 2026-08-04): 49 matches (2.0%), zero false positives, and exactly one of the 49 had scored positive** — the Bloom Energy article. Pattern hygiene is inherited from `_DIGEST_RE`: every phrase must be one that cannot plausibly appear in a genuine single-stock catalyst headline, because a false positive is a silently-missed trade with no eval-loop trace. These qualify because companies never issue a PR commenting on their own share price. |
 
@@ -118,6 +118,29 @@ batched call** per cycle:
 - **Forced tool use** (`tool_choice`) — output is schema-validated JSON; no
   string parsing. It does **not** guarantee a complete answer: see the
   truncation note below, which is the actual cause of the "empty batch" outages.
+- **Ticker attribution (v22.2)** — each article is sent with a
+  `Tagged: COR (Cencora), AMZN (Amazon.com)` line (exchange symbol plus the
+  company name from T212's catalogue), and the model must return
+  `subject_tickers`: the tagged symbols whose OWN company the news is about.
+  Only those inherit the verdict; every other tagged ticker is stored neutral
+  with `sentiment_scores.is_subject = FALSE`. Before v22.2 the model saw no tags
+  at all, its one verdict per article was copied to every tagged ticker, and
+  the rubric's "is the tagged ticker the subject?" step could not work: trade
+  #61 bought AMZN on an Estée Lauder headline, and #45 bought NVDA on a Super
+  Micro article also tagged SMCI and WDC. A missing or malformed
+  `subject_tickers` fails closed (stored, `is_subject` NULL, never traded) with
+  a WARNING per batch. **Post-deploy check** — the tests fake Claude, so the
+  real model's behaviour is verified from the data:
+
+  ```sql
+  SELECT is_subject, count(*) FILTER (WHERE sentiment = 'positive') AS positive,
+         count(*) AS rows
+  FROM sentiment_scores WHERE scored_at >= '<deploy date>' GROUP BY 1;
+  ```
+
+  Expect mostly TRUE, a minority FALSE (multi-ticker and mis-tagged legs) and
+  almost no NULL. Many NULLs mean the model is not emitting the field and the
+  system has gone quiet for that reason, not for lack of news.
 - **Bounded batch size (v21.15.1)** — `_batch_score_sentiment` chunks into calls
   of at most `_MAX_ARTICLES_PER_BATCH` (25). This is what makes the output
   budget a constant instead of a function of news volume, and it is the reason
@@ -1341,7 +1364,7 @@ most partnership news produces no intraday price action at all.
 | DB down | 3 retries on OperationalError; eval-loop writes never block the trading path |
 | T212 symbol map 429 at startup | retries with 30s backoff + daily 08:00 UTC rebuild (a single startup 429 used to poison the whole session) |
 | Service crash | systemd `Restart=always` + deploy-time config validation + post-restart health check + **heartbeat table** (below) |
-| Silent zero-trade drought | **v17: tripwire** — `check_zero_trade_drought` (startup + daily 21:30 UTC) fires CRITICAL + `system_events` after `ZERO_TRADE_ALERT_SESSIONS` (3) consecutive NYSE sessions with no trades while up and scoring. Alerts only; never stands the system down (a drought can be a legitimately bad tape) |
+| Silent zero-trade drought | **v17: tripwire** — `check_zero_trade_drought` (startup + daily 21:30 UTC) fires CRITICAL + `system_events` after `ZERO_TRADE_ALERT_SESSIONS` (3) consecutive NYSE sessions with no trades while up and scoring. Alerts only; never stands the system down (a drought can be a legitimately bad tape). **v22.2: once per drought** — the critical `zero_trade_session` is recorded on the first day only; later days of the same drought record `zero_trade_session_ongoing` (warning), via `drought_alerted_on_earlier_day()`. It had fired on 21 days in three months, every one a quiet stretch between earnings seasons (guidance raises arrive with earnings), with a real `orphan_position` alert among them — six alerts under the new rule. Kept critical rather than demoted because it is the only tripwire for failures nothing else detects; an unanswerable lookup stays loud |
 
 **Scheduler collisions on a rate-limited endpoint (v21.11, 2026-07-31):**
 `/equity/account/cash` had three callers on independent schedules — the daily
@@ -1388,9 +1411,11 @@ degraded-but-up system is visible. One row per `(event_type, event_day)`,
 de-duped atomically by a UNIQUE index + `ON CONFLICT DO NOTHING` (safe under the
 8-worker pre-market pool). Critical types:
 `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`,
-`zero_trade_session`, `claude_truncated_batch` (v21.15 — our output budget cut
+`zero_trade_session` (v22.2: first day of a drought only),
+`claude_truncated_batch` (v21.15 — our output budget cut
 the answer off; no scores, and it cannot self-heal without a code change);
-warning: `claude_outage`, `benzinga_outage` (v19.1 — these can self-heal),
+warning: `zero_trade_session_ongoing` (v22.2 — later days of the same drought),
+`claude_outage`, `benzinga_outage` (v19.1 — these can self-heal),
 `exit_stuck` (v19.2 — a position's limit exits failed repeatedly and the monitor
 escalated to a market order), `claude_empty_batch` (v21.12),
 `twelvedata_prepost_unavailable` (v21.6), `finnhub_outage` / `stale_quote_feed`
