@@ -22,8 +22,9 @@ side effects. Pure reporting over two tables:
 
     classifier_calls  one row per API call, BOTH providers  → latency, liveness
     qwen_scores       one row per article Qwen classified   → prediction quality
-                      (joined to sentiment_scores on article_id, which already
-                       carries the measured forward returns)
+                      (joined to sentiment_scores on article_id — and ticker,
+                       for rows attributed since v22.2 — which already carries
+                       the measured forward returns)
 
 USAGE
     python -m analysis.classifier_compare
@@ -226,21 +227,27 @@ def prediction(days: int) -> dict:
     """
     # DISTINCT ON (article_id) is load-bearing, not tidiness.
     #
-    # sentiment_scores holds one row per (article, TICKER) — the same Claude
-    # classification fanned out across up to 3 tagged tickers — while
-    # qwen_scores is UNIQUE per ARTICLE. A plain join therefore emits one pair
-    # per ticker, so a 3-ticker article would contribute its single
-    # classification THREE times and triple-weight itself in every agreement
-    # percentage and forward-return mean below. Both models classify per
-    # article, so the comparison must be per article too.
+    # sentiment_scores holds one row per (article, TICKER), while qwen_scores
+    # is UNIQUE per ARTICLE. A plain join therefore emits one pair per ticker,
+    # so a 3-ticker article would contribute THREE times and triple-weight
+    # itself in every agreement percentage and forward-return mean below.
     #
-    # Which ticker's row is kept matters, so it is NOT chosen alphabetically.
-    # forward_returns.py measures per (article, ticker) ROW, and yfinance
-    # regularly has no bars for one leg of a multi-ticker article — so an
-    # alphabetical pick can land on a leg whose returns are all NULL and
-    # silence an article that DID have a measured outcome. Rows with a measured
-    # 60m return sort first; s.id breaks the remaining tie deterministically so
-    # repeated runs give identical numbers.
+    # WHICH leg is paired depends on whether the legs can differ (v22.2):
+    #
+    #   * is_subject IS NULL — rows written before v22.2, or rows the model gave
+    #     no attribution for. Every leg of the article carries the SAME Claude
+    #     verdict (copied, or uniformly neutral), so any leg can stand in for
+    #     the article, and the one with a measured outcome is preferred:
+    #     forward_returns.py measures per ROW, yfinance regularly has no bars
+    #     for one leg, and an alphabetical pick could silence an article that
+    #     DID have a measured outcome.
+    #   * is_subject set — each leg stores the verdict it INHERITS (neutral
+    #     unless named the subject), so legs differ, and Qwen's row is
+    #     attributed to one ticker. Pairing it with another leg would compare
+    #     two different questions, so the tickers must match.
+    #
+    # s.id breaks the remaining tie deterministically so repeated runs give
+    # identical numbers.
     pairs = _rows(
         """SELECT DISTINCT ON (s.article_id)
                   s.article_id, s.ticker, s.headline,
@@ -253,6 +260,7 @@ def prediction(days: int) -> dict:
                   s.fwd_return_120m, s.fwd_return_eod
            FROM sentiment_scores s
            JOIN qwen_scores q ON q.article_id = s.article_id
+                             AND (s.is_subject IS NULL OR q.ticker = s.ticker)
            WHERE s.scored_at >= to_char(now() - (%s || ' days')::interval,
                                         'YYYY-MM-DD"T"HH24:MI:SS')
            ORDER BY s.article_id, (s.fwd_return_60m IS NULL), s.id""",

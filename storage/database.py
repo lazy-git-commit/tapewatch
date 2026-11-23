@@ -369,6 +369,17 @@ def init_db() -> None:
                 ALTER TABLE sentiment_scores
                 ADD COLUMN IF NOT EXISTS fwd_return_eod REAL
             """)
+            # v22.2 ticker attribution: was this row's ticker the SUBJECT of the
+            # article (TRUE), merely tagged on it (FALSE), or did the model give
+            # no attribution (NULL — also every row written before v22.2)? The
+            # stored `sentiment` is already the verdict this ticker inherits
+            # (neutral unless TRUE), so existing studies stay correct; this
+            # column explains WHY a leg is neutral and lets mis-tagging be
+            # measured. Two demo trades bought the wrong company before it.
+            cur.execute("""
+                ALTER TABLE sentiment_scores
+                ADD COLUMN IF NOT EXISTS is_subject BOOLEAN
+            """)
             # ── Classifier shadow mode (v21.14) ───────────────────────────────
             # Qwen-Flash runs alongside EVERY Claude batch. Claude's verdict is
             # the only one that ever reaches a trading decision; Qwen's is
@@ -820,6 +831,38 @@ def trading_days_since_last_trade() -> int | None:
     return int(len(closed))
 
 
+def drought_alerted_on_earlier_day() -> bool:
+    """
+    Has the CURRENT zero-trade drought already raised its critical alert on an
+    earlier day? (v22.2)
+
+    "Current drought" = every day after the most recent strategy entry. Today is
+    excluded on purpose: a second check later the same day must re-attempt the
+    critical row (which the per-day UNIQUE index then de-dupes), not downgrade
+    to the daily warning on the very day the drought was first reported.
+
+    Lets check_zero_trade_drought() alert ONCE per drought instead of once per
+    day. Between 2026-08-26 and 2026-11-12 the critical event fired on 21 days;
+    every one was a quiet stretch between earnings seasons, and a real
+    orphan-position alert sat among them. Raises on a DB error — the caller
+    treats an unanswerable question as "not yet alerted", i.e. it stays loud.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT 1 FROM system_events
+                   WHERE event_type = 'zero_trade_session'
+                     AND event_day < %s
+                     AND event_day > COALESCE((
+                         SELECT MAX((buy_time::timestamptz AT TIME ZONE 'Europe/London')::date)::text
+                         FROM trades WHERE mode = %s AND origin = 'strategy'
+                           AND buy_time IS NOT NULL), '')
+                   LIMIT 1""",
+                (_now_london()[:10], cfg.trading_mode),
+            )
+            return cur.fetchone() is not None
+
+
 def get_loss_streak() -> tuple[int, str | None]:
     """
     Consecutive LOSING closed trades counting back from the most recent one,
@@ -1076,12 +1119,14 @@ def save_sentiment_scores(rows: list[dict]) -> None:
                 """INSERT INTO sentiment_scores
                    (article_id, ticker, headline, sentiment, confidence,
                     catalyst_type, already_moved, catalyst_magnitude,
-                    published_at, scored_at)
+                    published_at, scored_at, is_subject)
                    VALUES (%(article_id)s, %(ticker)s, %(headline)s, %(sentiment)s,
                            %(confidence)s, %(catalyst_type)s, %(already_moved)s,
-                           %(catalyst_magnitude)s, %(published_at)s, %(scored_at)s)""",
+                           %(catalyst_magnitude)s, %(published_at)s, %(scored_at)s,
+                           %(is_subject)s)""",
                 [{**r, "already_moved": int(r.get("already_moved", False)),
                   "catalyst_magnitude": r.get("catalyst_magnitude"),
+                  "is_subject": r.get("is_subject"),
                   "scored_at": now}
                  for r in rows],
             )
@@ -1332,6 +1377,13 @@ _CRITICAL_EVENT_TYPES = {
     "twelvedata_credits_exhausted",
     "claude_billing_error",
     "claude_auth_error",
+    # Raised ONCE per drought (v22.2) — on the first day it crosses
+    # ZERO_TRADE_ALERT_SESSIONS. Every later day of the same drought records
+    # `zero_trade_session_ongoing` instead, deliberately NOT in this set: the
+    # drought stays visible in the events panel without paging every day. It
+    # stays critical at all because it is the tripwire for failures nothing
+    # else detects (June 2026: nine silent sessions behind a data collapse);
+    # demoting it outright would make that failure silent again.
     "zero_trade_session",
     # Truncation produces the identical operational state to a billing error —
     # no scores, therefore no signals, therefore no trades — and unlike an empty

@@ -207,6 +207,7 @@ and prompt changes measurable (see `docs/algorithm.md` §9 for the queries).
 | `fwd_return_eod` | REAL | **(v21.3)** % price change from publication to that session's close — the upper bound on what a same-day hold could have captured. |
 | `catalyst_magnitude` | INTEGER | Claude's 1–5 size rating for the catalyst. Gated by `MIN_CATALYST_MAGNITUDE`. |
 | `returns_computed_at` | TEXT | When the nightly job processed this row. NULL = pending. |
+| `is_subject` | BOOLEAN | **(v22.2)** Was this ticker the SUBJECT of the article (TRUE), merely tagged on it (FALSE), or did the model give no attribution (NULL — also every row written before v22.2)? `sentiment` is already the verdict this ticker inherits — neutral unless TRUE — so existing queries on `sentiment = 'positive'` keep meaning "what the system would act on". Before v22.2 every leg carried the article's one verdict, which is how AMZN was bought on an Estée Lauder headline. |
 
 ---
 
@@ -352,6 +353,12 @@ Two things make the obvious query wrong, and both are easy to miss:
    arbitrary pick can keep an all-NULL leg and silence an article that *did*
    have a measured outcome. The tool orders by `(s.fwd_return_60m IS NULL)`
    first.
+3. **(v22.2) Attributed rows must pair on the ticker.** Since v22.2 each leg
+   stores the verdict it inherits (neutral unless `is_subject`), and both
+   providers' rows for a ticker are attributed the same way, so the legs of one
+   article differ. The tool joins on `q.ticker = s.ticker` for those rows and
+   keeps the measured-leg preference only where `s.is_subject IS NULL`. The
+   illustrative query below predates this; use the tool.
 
 ```sql
 -- The deciding metric: forward returns of each model's OWN tradeable set.
@@ -401,7 +408,7 @@ automatically from `event_type`.
 | Column | Type | Description |
 |---|---|---|
 | `id` | SERIAL PK | Auto-incrementing primary key. |
-| `event_type` | TEXT | Machine-readable event key. Critical: `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`, `zero_trade_session`, `claude_truncated_batch` (v21.15 — our `max_tokens` cut the answer off; same operational state as a billing error and cannot self-heal without a code change). Warning: `claude_outage`, `claude_empty_batch` (v21.12), `twelvedata_prepost_unavailable` (v21.6), `finnhub_outage` (v21.10), `stale_quote_feed` (v21.10 — a provider serving a run of frozen quotes; fired for real on its first live day, 2026-07-31, four minutes before the NVT entry), `exit_stuck` (v19.2), `entry_slippage_high` (v21.13), `claude_cache_ineffective` (v21.16 — 25 consecutive Claude calls with zero cached tokens, i.e. `cache_control` is being silently ignored because the cached prefix fell below the model's 4096-token minimum. **Warning by design**: it is a cost regression, not a trading outage — nothing stops being scored and no trade is affected — so it must not page a human or dilute the critical set. Read it on the *Classifier Prompt Cache* panel). ⚠️ Severity comes from `_CRITICAL_EVENT_TYPES` in `storage/database.py`, and the documented Grafana alert queries `severity = 'critical'` — an event type omitted from that set is recorded but **never alerts**. |
+| `event_type` | TEXT | Machine-readable event key. Critical: `twelvedata_credits_exhausted`, `claude_billing_error`, `claude_auth_error`, `zero_trade_session` (v22.2: first day of a drought only — later days record the warning `zero_trade_session_ongoing`), `claude_truncated_batch` (v21.15 — our `max_tokens` cut the answer off; same operational state as a billing error and cannot self-heal without a code change). Warning: `claude_outage`, `claude_empty_batch` (v21.12), `twelvedata_prepost_unavailable` (v21.6), `finnhub_outage` (v21.10), `stale_quote_feed` (v21.10 — a provider serving a run of frozen quotes; fired for real on its first live day, 2026-07-31, four minutes before the NVT entry), `exit_stuck` (v19.2), `entry_slippage_high` (v21.13), `claude_cache_ineffective` (v21.16 — 25 consecutive Claude calls with zero cached tokens, i.e. `cache_control` is being silently ignored because the cached prefix fell below the model's 4096-token minimum. **Warning by design**: it is a cost regression, not a trading outage — nothing stops being scored and no trade is affected — so it must not page a human or dilute the critical set. Read it on the *Classifier Prompt Cache* panel). ⚠️ Severity comes from `_CRITICAL_EVENT_TYPES` in `storage/database.py`, and the documented Grafana alert queries `severity = 'critical'` — an event type omitted from that set is recorded but **never alerts**. |
 | `severity` | TEXT | `"critical"` or `"warning"`. |
 | `detail` | TEXT | Human-readable context (e.g. credits used at exhaustion, drought session count). |
 | `created_at` | TIMESTAMPTZ | When the event was first recorded. |

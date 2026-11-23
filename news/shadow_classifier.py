@@ -182,7 +182,9 @@ def _run(articles: list[dict], user_message: str) -> None:
     # Imported here rather than at module scope to avoid a circular import
     # (fetcher imports this module).
     from news.fetcher import (CATALYST_TYPES, _CLASSIFY_TOOL, _SYSTEM_PROMPT,
-                              _output_budget)
+                              _effective_sentiment, _is_subject,
+                              _output_budget, _parse_subject_tickers,
+                              _tag_aliases)
     from storage.database import record_classifier_call, save_qwen_scores
 
     client = _get_client()
@@ -337,6 +339,19 @@ def _run(articles: list[dict], user_message: str) -> None:
             continue
         if not (0.0 <= conf <= 1.0) or not (1 <= mag <= 5):
             continue
+        # v22.2 attribution parity. The row is attributed to ONE representative
+        # ticker (the entry's first tag), and Claude's row for that same ticker
+        # now stores the verdict that ticker INHERITS — neutral unless it was
+        # named the subject. Storing Qwen's raw article verdict instead would
+        # make every mis-tagged article look like a disagreement, and pairs are
+        # now joined on (article_id, ticker) precisely so this comparison is
+        # like-for-like. Same helpers as the live path, so they cannot drift.
+        tagged = art.get("tagged")
+        if isinstance(tagged, list) and tagged and isinstance(tagged[0], dict):
+            subjects = _parse_subject_tickers(rec.get("subject_tickers"),
+                                              _tag_aliases(art))
+            sentiment = _effective_sentiment(
+                sentiment, _is_subject(subjects, str(tagged[0].get("symbol", ""))))
         rows.append({
             "article_id": str(rec.get("id")),
             "ticker": art.get("ticker") or "",
