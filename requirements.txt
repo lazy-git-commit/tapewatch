@@ -12,12 +12,12 @@ anthropic==0.125.0
 # Offline classifier comparison only (analysis/qwen_eval.py). Alibaba Model
 # Studio speaks the OpenAI protocol, so the OpenAI SDK is the client for it.
 # The live trading path does NOT import this.
-openai==3.16.2
+openai==3.29.0
 
 # Market data & price confirmation
 yfinance==1.7.0
-pandas==3.0.5
-pandas_market_calendars==5.4.0
+pandas==3.0.6
+pandas_market_calendars==5.5.0
 
 # Order execution — Trading 212 REST API called directly via requests
 
@@ -28,5 +28,5 @@ APScheduler==3.11.3
 psycopg2-binary==2.9.13
 
 # Utilities
-python-dotenv==1.2.3
-pytz==2026.3.post1
+python-dotenv==1.2.4
+pytz==2026.5
