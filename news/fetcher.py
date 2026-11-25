@@ -60,7 +60,7 @@ import pytz
 from config.settings import cfg
 from storage.database import is_article_seen, save_sentiment_scores
 from news.shadow_classifier import shadow_score
-from trading.executor import resolve_t212_ticker
+from trading.executor import instrument_name, resolve_t212_ticker, t212_to_symbol
 
 _LONDON = pytz.timezone("Europe/London")
 
@@ -144,6 +144,21 @@ def _prior_ticker_context(ticker: str) -> str | None:
 # in TRADEABLE_CATALYSTS). Catching them by headline regex before the Claude call
 # avoids spending tokens on articles code gates will always reject. The pattern
 # is conservative — only unambiguous analyst-action language.
+#
+# v22.2 — Benzinga's analyst-ROUNDUP templates. "<Company> Analysts Boost Their
+# Forecasts Following Strong Q3 Earnings" (and Increase/Raise/Cut/Slash/Revise
+# variants), plus the "Wall Street's Most Accurate Analysts ..." family, are
+# written after the results by summarising sell-side estimate changes. They are
+# never the company's own news, yet the classifier scored them inconsistently —
+# sometimes analyst_action, sometimes earnings_beat, and sometimes TRADEABLE
+# guidance_raise. Two demo trades came from this template: MMM #46 and WMT #82
+# ("Walmart Analysts Raise Their Forecasts Following Strong Q3 Earnings").
+# Checked against every scored headline to 2026-11-23: 665 of 1,083 distinct
+# headlines mentioning analysts match, every one analyst content (95 had been
+# scored positive, 11 as positive guidance_raise); the "analyst ... forecast"
+# headlines it leaves alone include company guidance such as "UnitedHealth Exec
+# Sees ... 2027 EPS Forecast". The verb list is closed on purpose — "Acme Raises
+# FY26 Forecast" has no "analysts" and must stay a candidate.
 _ANALYST_ACTION_RE = re.compile(
     r"\b("
     r"price target|pt (raise|cut|increase|decrease|hike|lowered?)"
@@ -155,6 +170,8 @@ _ANALYST_ACTION_RE = re.compile(
     r"|starts? (coverage|with|at)"
     r"|resumes? (coverage|with|at)"
     r"|assumed? (coverage|with|at)"
+    r"|analysts? (boost|increase|raise|lift|hike|cut|slash|lower|trim|reduce|revise)s? (their )?forecasts?"
+    r"|most accurate analysts"
     r")\b",
     re.IGNORECASE,
 )
@@ -545,7 +562,7 @@ CATALYST_TYPES = [
 # ── System prompt (cached) ────────────────────────────────────────────────────
 # Static across calls → eligible for prompt caching. Keep ALL per-cycle
 # content (the articles) in the user message so the cache prefix never varies.
-_SYSTEM_PROMPT = """You are an expert US equity day trader evaluating breaking news for 5–15 minute momentum trades. For each article you receive, decide whether the news will cause IMMEDIATE intraday buying in the tagged stock.
+_SYSTEM_PROMPT = """You are an expert US equity day trader evaluating breaking news for 5–15 minute momentum trades. For each article you receive, decide which of its tagged stocks the news is actually about, and whether the news will cause IMMEDIATE intraday buying in that stock.
 
 Work through this decision tree for every article, in order:
 
@@ -577,11 +594,24 @@ confidence and set already_moved=true — UNLESS the new article describes a
 genuinely NEW, separate fact (a new number, a new deal, a new filing) rather
 than just a different spin on the same news.
 
-STEP 2 — Is the tagged ticker the actual SUBJECT of the news?
+STEP 2 — Which tagged company is the news actually ABOUT?
+Every article has a "Tagged:" line listing its tickers, each with the company
+name where known. The news vendor applies these tags, and they are often
+incidental or simply wrong: a supplier, customer or competitor named in
+passing, an index heavyweight the story is compared against, or a mis-tag.
+Put in subject_tickers ONLY the symbols, written exactly as they appear on the
+Tagged line, whose OWN company is the subject of the news — the company that
+announced, reported or received the catalyst. Then score sentiment,
+confidence, catalyst_type and catalyst_magnitude FOR THAT COMPANY. Every
+classification MUST include subject_tickers. If the headline is about a
+company that is not tagged, or it is a digest, subject_tickers=[] and
+sentiment=neutral: nothing on that article will be traded, whatever it says.
 In "Company B acquires Company A", the TARGET (A) spikes; the ACQUIRER (B)
-drops or stays flat. If the tagged ticker is the acquirer → sentiment=neutral,
-catalyst_type=ma_acquirer. If the article is primarily about a different
-company than the tagged ticker → neutral.
+drops or stays flat. If only the acquirer is tagged → subject_tickers=[B],
+sentiment=neutral, catalyst_type=ma_acquirer. If both are tagged, score the
+target: subject_tickers=[A].
+(The examples further down omit subject_tickers wherever the company in the
+headline is the one tagged; they show it where attribution is the point.)
 
 STEP 3 — Is the catalyst binding and material?
 - Binding: definitive merger agreement, firm buyout offer, signed contract
@@ -712,11 +742,28 @@ WHY: same routing, but the number is unanchored — with no prior guidance or
 estimate stated, $412M could be a raise or a cut. Correct type, neutral
 sentiment. Never infer the direction of a bare figure.
 
-Headline: "Beta Industries To Acquire Acme Corp For $28 Per Share In Cash" [tagged ticker: BETA, the acquirer]
-→ {"sentiment": "neutral", "confidence": 0.3, "catalyst_type": "ma_acquirer", "already_moved": false, "catalyst_magnitude": 1}
+Headline: "Beta Industries To Acquire Acme Corp For $28 Per Share In Cash"
+   Tagged: BETA (Beta Industries)
+→ {"subject_tickers": ["BETA"], "sentiment": "neutral", "confidence": 0.3, "catalyst_type": "ma_acquirer", "already_moved": false, "catalyst_magnitude": 1}
 WHY: the target re-prices to the offer instantly; the acquirer typically falls
 on deal risk and dilution. Always check which side the TAGGED ticker is on
 before calling M&A positive.
+
+Headline: "Glamour Cosmetics Turns Up The Shine With Strong Earnings, Higher Outlook"
+   Tagged: AMZN (Amazon.com)
+→ {"subject_tickers": [], "sentiment": "neutral", "confidence": 0.2, "catalyst_type": "other", "already_moved": false, "catalyst_magnitude": 1}
+WHY: the news is about a cosmetics company that is not tagged at all; the tag
+is Amazon, presumably because the article mentions it. The real headline (about
+Estée Lauder) was scored positive guidance_raise, and the system BOUGHT AMAZON.
+A verdict belongs only to the company the article is about.
+
+Headline: "Acme Computer Raises Revenue Guidance, Margins Widen"
+   Tagged: ACME (Acme Computer), NVDA (NVIDIA), WDC (Western Digital)
+→ {"subject_tickers": ["ACME"], "sentiment": "positive", "confidence": 0.8, "catalyst_type": "guidance_raise", "already_moved": false, "catalyst_magnitude": 3}
+WHY: NVIDIA and Western Digital are suppliers named in the story — the guidance
+is Acme's. The real case tagged Super Micro, NVIDIA and Western Digital on a
+Super Micro guidance article; the one verdict was copied to all three, and the
+system bought NVIDIA on Super Micro's guidance.
 
 Headline: "Acme Corp Announces $75M Registered Direct Offering Priced At-The-Market"
 → {"sentiment": "negative", "confidence": 0.8, "catalyst_type": "offering_dilution", "already_moved": false, "catalyst_magnitude": 4}
@@ -800,6 +847,16 @@ _CLASSIFY_TOOL = {
                     "type": "object",
                     "properties": {
                         "id": {"type": "string", "description": "The article id exactly as given"},
+                        # v22.2. Deliberately placed BEFORE the verdict fields:
+                        # the model writes properties in schema order, so it
+                        # commits to WHICH company it is scoring before it
+                        # scores — rather than scoring the headline and then
+                        # rationalising an attribution.
+                        "subject_tickers": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Symbols from this article's Tagged line whose OWN company the news is about, written exactly as tagged. [] when no tagged company is the subject.",
+                        },
                         "sentiment": {"type": "string", "enum": ["positive", "neutral", "negative"]},
                         "confidence": {"type": "number", "description": "0.0 to 1.0"},
                         "catalyst_type": {"type": "string", "enum": CATALYST_TYPES},
@@ -814,7 +871,7 @@ _CLASSIFY_TOOL = {
                             "maximum": 5,
                         },
                     },
-                    "required": ["id", "sentiment", "confidence", "catalyst_type", "already_moved", "catalyst_magnitude"],
+                    "required": ["id", "subject_tickers", "sentiment", "confidence", "catalyst_type", "already_moved", "catalyst_magnitude"],
                 },
             }
         },
@@ -930,6 +987,99 @@ def _fetch(lookback_minutes: int) -> list[dict]:
         return []
 
 
+# ── Ticker attribution (v22.2) ────────────────────────────────────────────────
+# Until v22.2 the classifier was sent only id/headline/teaser and its ONE verdict
+# per article was then copied to every tagged ticker. STEP 2 of the rubric ("is
+# the tagged ticker the subject?") could not work, because the model was never
+# told which ticker was tagged. Two demo trades bought the wrong company: AMZN
+# (#61) on an Estée Lauder headline, and NVDA (#45) on a Super Micro article
+# also tagged SMCI and WDC. Now each batch entry carries its tags, the model
+# names the subject company in `subject_tickers`, and only those tickers inherit
+# the verdict.
+
+def _tagged_entries(t212_codes: list[str]) -> list[dict]:
+    """Batch-entry `tagged` list: display symbol, company name and T212 code."""
+    return [
+        {"symbol": t212_to_symbol(code).upper(), "name": instrument_name(code),
+         "t212": code}
+        for code in t212_codes
+    ]
+
+
+def _tagged_line(tagged: list[dict]) -> str:
+    """`COR (Cencora), AMZN (Amazon.com)` — the symbol alone when no name is known."""
+    return ", ".join(
+        f'{t["symbol"]} ({t["name"]})' if t.get("name") else t["symbol"]
+        for t in tagged
+    )
+
+
+def _tag_aliases(article: dict) -> dict[str, str] | None:
+    """
+    Upper-cased alias → display symbol for an entry's tags, or None when the
+    entry carries no tag information at all (a caller that predates v22.2).
+
+    The T212 code is accepted as an alias of its symbol because the
+    PRIOR ARTICLE(S) line is written with T212 codes, so the model may echo one.
+    """
+    tagged = article.get("tagged")
+    if not isinstance(tagged, list):
+        return None
+    aliases: dict[str, str] = {}
+    for t in tagged:
+        if not isinstance(t, dict) or not t.get("symbol"):
+            continue
+        sym = str(t["symbol"]).upper()
+        aliases[sym] = sym
+        if t.get("t212"):
+            aliases[str(t["t212"]).upper()] = sym
+    return aliases
+
+
+def _parse_subject_tickers(raw, aliases: dict[str, str] | None) -> list[str] | None:
+    """
+    Validate a classification's `subject_tickers`.
+
+    Returns display symbols, restricted to the entry's own tags — the model
+    cannot nominate a ticker that was not tagged — or None when the field is
+    missing or is not a list. None means "attribution unknown", and the caller
+    treats it as "not a subject": a verdict nobody attributed is never traded.
+    Tolerates `"COR (Cencora)"` (the Tagged-line form echoed back) and case.
+    """
+    if not isinstance(raw, list):
+        return None
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        token = item.strip().split("(")[0].strip().upper()
+        if not token:
+            continue
+        sym = aliases.get(token) if aliases is not None else token
+        if sym and sym not in out:
+            out.append(sym)
+    return out
+
+
+def _is_subject(subjects: list[str] | None, symbol: str) -> bool | None:
+    """True/False for a tagged symbol; None when the model gave no attribution."""
+    if subjects is None:
+        return None
+    return symbol.upper() in subjects
+
+
+def _effective_sentiment(sentiment: str, is_subject: bool | None) -> str:
+    """
+    The verdict a TICKER inherits from its article's classification.
+
+    Only a confirmed subject inherits it; every other tagged ticker is neutral.
+    Stored this way in sentiment_scores (with `is_subject` alongside), so every
+    existing study that filters on sentiment='positive' keeps meaning "what the
+    system would act on" without having to learn about attribution.
+    """
+    return sentiment if is_subject is True else "neutral"
+
+
 def _output_budget(n_articles: int) -> int:
     """
     max_tokens for a batch of n_articles.
@@ -969,8 +1119,10 @@ def _score_one_batch(articles: list[dict],
     """
     Score sentiment for one bounded batch of articles in a single Claude call.
 
-    articles: list of dicts with keys 'id', 'headline', 'teaser', 'ticker', and
-              optionally 'prior_context' (see _prior_ticker_context).
+    articles: list of dicts with keys 'id', 'headline', 'teaser', 'ticker',
+              'tagged' (see _tagged_entries — without it the model is shown
+              no tags and cannot attribute the article), and optionally
+              'prior_context' (see _prior_ticker_context).
     live:     this batch is production traffic. Governs BOTH shadow dispatch
               and `classifier_calls` recording, because both write production
               observability datasets. OFFLINE callers (backtest replays) MUST
@@ -986,8 +1138,11 @@ def _score_one_batch(articles: list[dict],
                   `_MIN_CALLS_FOR_VERDICT` and invite a verdict on data that
                   never came from the live path.
     Returns: dict mapping article id → {sentiment, confidence, catalyst_type,
-             already_moved}. Empty dict on failure (fail-closed: unscored
-             articles are never traded).
+             already_moved, catalyst_magnitude, subject_tickers}. The verdict
+             describes the article's SUBJECT company; subject_tickers is a list
+             of display symbols, or None when the model gave no usable
+             attribution (never traded). Empty dict on failure (fail-closed:
+             unscored articles are never traded).
     """
     global _consecutive_empty_batches
 
@@ -998,7 +1153,12 @@ def _score_one_batch(articles: list[dict],
     # the cached system block.
     lines = []
     for a in articles:
-        line = f'ID {a["id"]}: {a["headline"]}\n   Teaser: {a["teaser"]}'
+        line = f'ID {a["id"]}: {a["headline"]}'
+        # v22.2: without this line the rubric's attribution step had nothing to
+        # work on — see _tagged_entries.
+        if isinstance(a.get("tagged"), list) and a["tagged"]:
+            line += f'\n   Tagged: {_tagged_line(a["tagged"])}'
+        line += f'\n   Teaser: {a["teaser"]}'
         prior = a.get("prior_context")
         if prior:
             line += f'\n   PRIOR ARTICLE(S) TODAY ON THIS TICKER: {prior}'
@@ -1245,6 +1405,8 @@ def _score_one_batch(articles: list[dict],
             time.sleep(_EMPTY_BATCH_BACKOFF_SECONDS)
 
         results: dict[str, dict] = {}
+        aliases_by_id = {str(a.get("id")): _tag_aliases(a) for a in articles}
+        unattributed = 0
         for r in classifications:
             # Per-record validation, fail-closed per record: one malformed
             # entry (confidence="high", magnitude "big", a stray string in
@@ -1271,13 +1433,29 @@ def _score_one_batch(articles: list[dict],
                     confidence, magnitude, str(r)[:120],
                 )
                 continue
+            subjects = _parse_subject_tickers(
+                r.get("subject_tickers"), aliases_by_id.get(str(r["id"])))
+            if subjects is None:
+                unattributed += 1
             results[str(r["id"])] = {
                 "sentiment": str(r.get("sentiment", "neutral")).lower(),
                 "confidence": confidence,
                 "catalyst_type": str(r.get("catalyst_type", "other")),
                 "already_moved": bool(r.get("already_moved", False)),
                 "catalyst_magnitude": magnitude,
+                "subject_tickers": subjects,
             }
+        if unattributed:
+            # Kept, not discarded: the verdict still goes to sentiment_scores
+            # (as neutral, is_subject NULL) for the eval loop. It is just never
+            # traded — see _parse_subject_tickers. Logged as a WARNING because a
+            # model that stopped emitting the field would otherwise look like a
+            # quiet news day.
+            logger.warning(
+                "Batch sentiment: %d/%d classification(s) carried no usable "
+                "subject_tickers — those articles cannot be traded this cycle",
+                unattributed, len(results),
+            )
         if len(results) < len(articles):
             logger.warning(
                 "Batch sentiment: %d/%d articles scored (missing ids are skipped)",
@@ -1388,6 +1566,7 @@ def fetch_all_news(
 
     Gates applied to POSITIVE classifications before they become NewsItems
     (every gate's outcome is visible in sentiment_scores for the eval loop):
+      0. subject    — only tickers the model named in subject_tickers (v22.2)
       1. confidence — must be ≥ cfg.min_sentiment_confidence (1–10 scale)
       2. catalyst   — catalyst_type must be in cfg.tradeable_catalysts
       3. timing     — already_moved must be False
@@ -1531,6 +1710,9 @@ def fetch_all_news(
             # `eligible` is only appended to when eligible_tickers is non-empty,
             # so the list is never empty here.
             "ticker": tickers[0],
+            # v22.2: the tags themselves, shown to the model on a "Tagged:"
+            # line so it can say which company the article is about.
+            "tagged": _tagged_entries(tickers),
         }
         # Surface today's already-scored articles for the same ticker(s) so a
         # reversal/respin of the same story gets read with that context
@@ -1560,21 +1742,28 @@ def fetch_all_news(
             continue
         headline = html.unescape(article.get("title") or "")
         for ticker in tickers:
+            is_subject = _is_subject(s.get("subject_tickers"), t212_to_symbol(ticker))
             score_rows.append({
                 "article_id": article_id,
                 "ticker": ticker,
                 "headline": headline,
-                "sentiment": s["sentiment"],
+                # The verdict THIS ticker inherits (v22.2): neutral unless the
+                # model named it as the article's subject.
+                "sentiment": _effective_sentiment(s["sentiment"], is_subject),
                 "confidence": s["confidence"],
                 "catalyst_type": s["catalyst_type"],
                 "already_moved": s["already_moved"],
                 "catalyst_magnitude": s["catalyst_magnitude"],
                 "published_at": article.get("published", ""),
+                "is_subject": is_subject,
             })
             # Feeds _prior_ticker_context for this ticker's NEXT article today
             # (including neutrals/negatives — the negative "tumbles despite
             # beat" read is exactly the context a later bullish respin needs).
-            _record_ticker_history(ticker, headline, s["sentiment"], scored_at_now)
+            # Skipped for a ticker the model said the article is NOT about:
+            # Super Micro's guidance is no context for NVIDIA's next headline.
+            if is_subject is not False:
+                _record_ticker_history(ticker, headline, s["sentiment"], scored_at_now)
     if score_rows:
         try:
             save_sentiment_scores(score_rows)
@@ -1591,6 +1780,29 @@ def fetch_all_news(
             continue
 
         headline = html.unescape(article.get("title") or "")
+
+        # Gate 0 (v22.2): attribution. A positive verdict is only ever for the
+        # company the article is ABOUT — every other tagged ticker is dropped
+        # here, and an article the model did not attribute at all trades
+        # nothing. Logged at INFO because a withheld ticker is a decision the
+        # eval loop needs to be able to see, not noise.
+        subject_codes = [
+            t for t in tickers
+            if _is_subject(s.get("subject_tickers"), t212_to_symbol(t)) is True
+        ]
+        withheld = [t for t in tickers if t not in subject_codes]
+        if withheld:
+            named = s.get("subject_tickers")
+            about = ("(no attribution given)" if named is None
+                     else ",".join(named) or "no tagged company")
+            logger.info(
+                "Gate [subject]: positive verdict withheld from %s — the article "
+                "is about %s, not them: %s",
+                ",".join(withheld), about, headline[:70],
+            )
+        if not subject_codes:
+            continue
+        tickers = subject_codes
 
         # Gate 1: confidence threshold (1–10 scale, cfg.min_sentiment_confidence).
         # Previously this setting existed but was never enforced anywhere.

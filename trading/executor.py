@@ -149,6 +149,13 @@ _extended_limit_supported: bool | None = None
 # Inverse of the above (T212 code → exchange shortName), rebuilt together with
 # it. Used by t212_to_symbol() so price checks query the real exchange symbol.
 _t212_to_symbol: dict[str, str] = {}
+# T212 code → company name ("Cencora", "Howmet Aerospace"), rebuilt together
+# with the maps above. v22.2: the classifier is told WHICH company each tagged
+# ticker is, so it can say whether the article is actually about it. A bare
+# symbol is not enough — T212 keeps legacy codes (Cencora is ABC_US_EQ,
+# Viatris MYL_US_EQ), and an unfamiliar small-cap symbol means nothing to the
+# model, which would then wrongly drop the very names that move most.
+_t212_to_name: dict[str, str] = {}
 
 
 def _base_url() -> str:
@@ -201,6 +208,7 @@ def build_symbol_map(retries: int = 3) -> bool:
             resp.raise_for_status()
             instruments = resp.json()
             mapping = {}
+            names = {}
             for inst in instruments:
                 if not isinstance(inst, dict):
                     continue
@@ -208,7 +216,12 @@ def build_symbol_map(retries: int = 3) -> bool:
                 short = inst.get("shortName", "")
                 if ticker and short and inst.get("currencyCode") == "USD":
                     mapping[short.upper()] = ticker
+                    name = inst.get("name")
+                    if isinstance(name, str) and name.strip():
+                        names[ticker] = name.strip()
             _symbol_to_t212 = mapping
+            global _t212_to_name
+            _t212_to_name = names
             # Inverse map: T212 code → exchange shortName. Market-data lookups
             # (Finnhub/Twelvedata) need the EXCHANGE symbol; deriving it by
             # stripping "_US_EQ" is lossy whenever T212's code differs from the
@@ -346,6 +359,11 @@ def t212_to_symbol(t212_ticker: str) -> str:
     if mapped:
         return mapped
     return t212_ticker.split("_")[0]
+
+
+def instrument_name(t212_ticker: str) -> str | None:
+    """Company name for a T212 code, or None before the instrument map is built."""
+    return _t212_to_name.get(t212_ticker) if t212_ticker else None
 
 
 class T212HTTPError(Exception):
